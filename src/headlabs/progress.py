@@ -26,13 +26,13 @@ from typing import Optional, TextIO
 
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
-_ICONS = {
-    "tool_use": "🔧",
-    "thinking": "💭",
-    "step": "›",
-    "status": "•",
-    "error": "✗",
-    "warn": "⚠",
+_MARKERS = {
+    "tool_use": "-",
+    "thinking": "~",
+    "step": ">",
+    "status": "·",
+    "error": "x",
+    "warn": "!",
 }
 
 _DIM = "\033[2m"
@@ -100,28 +100,65 @@ class ProgressReporter:
             self._println(f"  {label}")
 
     def event(self, ev: dict) -> None:
-        """Render one streamed event."""
+        """Render one streamed event.
+
+        ``tool_use`` events render as a primary line plus indented sub-detail
+        (tool id, elapsed, and any ``detail`` fields the backend provides) —
+        Kiro-style. Other event types render as a single marked line.
+        """
         etype = ev.get("type", "")
         level = ev.get("level", "info")
         label = ev.get("label") or ev.get("tool") or etype
         self._event_count += 1
         if etype == "tool_use":
             self._tool_count += 1
-
-        # Keep the spinner label tracking the latest meaningful action.
-        if etype in ("tool_use", "step", "thinking"):
+            self._label = label
+        elif etype in ("step", "thinking"):
             self._label = label
 
         if level == "error":
-            self._emit_line(f"    {_ICONS['error']} {label}")
+            self._emit_block(f"  {_MARKERS['error']} {label}", self._detail_lines(ev))
             return
         if self.quiet:
             return
         # By default surface status/step/tool_use/thinking; verbose adds the rest.
-        if etype not in _ICONS and not self.verbose:
+        if etype not in _MARKERS and not self.verbose:
             return
-        icon = _ICONS.get(etype, "·")
-        self._emit_line(f"    {icon} {label}")
+        marker = _MARKERS.get(etype, ".")
+        sub = self._detail_lines(ev) if etype == "tool_use" else []
+        self._emit_block(f"  {marker} {label}", sub)
+
+    def _detail_lines(self, ev: dict) -> list[str]:
+        """Build indented sub-detail lines for a tool call."""
+        lines: list[str] = []
+        head: list[str] = []
+        tool = ev.get("tool")
+        if tool and tool != ev.get("label"):
+            head.append(tool)
+        if self._start_ts is not None:
+            head.append(f"+{_fmt_elapsed(time.time() - self._start_ts)}")
+        if head:
+            seg = " · ".join(head)
+            lines.append(f"      {_DIM}{seg}{_RESET}" if self.tty else f"      {seg}")
+
+        detail = ev.get("detail")
+        if isinstance(detail, dict) and detail:
+            # Free-text summary of the tool result, if present.
+            for key in ("summary", "result", "text", "message"):
+                val = detail.get(key)
+                if val:
+                    lines.append(f"      -> {str(val)[:160]}")
+                    break
+            # Compact key=value for small scalar fields (args, counts, etc.).
+            kv = [
+                f"{k}={v}" for k, v in detail.items()
+                if k not in ("summary", "result", "text", "message")
+                and isinstance(v, (str, int, float, bool)) and len(str(v)) <= 40
+            ]
+            if kv:
+                seg = " · ".join(kv[:6])
+                lines.append(f"      {_DIM}{seg}{_RESET}" if self.tty else f"      {seg}")
+        return lines
 
     def finish(self, status: str, summary: Optional[str] = None) -> None:
         """Stop the spinner and print a terminal status line."""
@@ -138,9 +175,9 @@ class ProgressReporter:
         if status in ("succeeded", "partial"):
             self._println(f"  ✓ Concluído em {elapsed}{tools}")
         elif status == "timeout":
-            self._println(f"  ✗ Tempo esgotado após {elapsed}")
+            self._println(f"  x Tempo esgotado após {elapsed}")
         else:
-            self._println(f"  ✗ {status} após {elapsed}{tools}")
+            self._println(f"  x {status} após {elapsed}{tools}")
 
     # ── internals ────────────────────────────────────────────────────────────
 
@@ -153,13 +190,13 @@ class ProgressReporter:
                 self.out.flush()
             time.sleep(0.1)
 
-    def _emit_line(self, line: str) -> None:
+    def _emit_block(self, primary: str, sublines: list[str]) -> None:
         with self._lock:
             if self.tty:
                 self.out.write(_CLEAR_LINE)
-                self.out.write(line + "\n")
-            else:
-                self.out.write(line + "\n")
+            self.out.write(primary + "\n")
+            for sl in sublines:
+                self.out.write(sl + "\n")
             self.out.flush()
 
     def _println(self, line: str) -> None:

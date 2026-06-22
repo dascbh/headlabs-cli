@@ -40,10 +40,10 @@ def cmd_run(args):
     result = client.run(agent_id, args.profile, reporter=reporter, **kwargs)
 
     if result.status == "timeout":
-        print("❌ Agent timed out. Try again or check headlabs.ai dashboard.")
+        print("Error: agent timed out. Try again or check headlabs.ai dashboard.")
         sys.exit(1)
     if result.status == "failed":
-        print(f"❌ Agent failed: {result.summary[:150] if result.summary else 'unknown'}")
+        print(f"Error: agent failed: {result.summary[:150] if result.summary else 'unknown'}")
         sys.exit(1)
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -112,11 +112,11 @@ def cmd_agents_create(args):
     )
     status = result.get("status", "?")
     rid = result.get("runtime_id", "")
-    print(f"✅ Agent '{args.id}' created (status={status})")
+    print(f"✓ Agent '{args.id}' created (status={status})")
     if rid:
         print(f"   Runtime: {rid} — agent is immediately invocable")
     if result.get("activation_error"):
-        print(f"   ⚠️  Activation: {result['activation_error']}")
+        print(f"   ! Activation: {result['activation_error']}")
 
 
 def cmd_skills(args):
@@ -145,7 +145,7 @@ def cmd_skills_create(args):
     name = args.name or args.id
     client = HeadLabsClient()
     client.create_skill(skill_id=args.id, name=name, content=content)
-    print(f"✅ Skill '{args.id}' created/updated ({len(content)} chars)")
+    print(f"✓ Skill '{args.id}' created/updated ({len(content)} chars)")
 
 
 def cmd_tools(args):
@@ -189,7 +189,7 @@ def cmd_chat(args):
         agent_input["aws_region"] = session.region_name or "us-east-1"
         identity = session.client("sts").get_caller_identity()
         agent_input["account_id"] = identity["Account"]
-        print(f"📊 Account: {identity['Account']} (profile: {args.profile})")
+        print(f"Account: {identity['Account']} (profile: {args.profile})")
 
         # Pick the collector for this agent and gather data with the client's
         # session. Agents without a dedicated collector use GenericCollector.
@@ -199,7 +199,7 @@ def cmd_chat(args):
             days=getattr(args, "days", 30)
         )
     except Exception as exc:
-        print(f"⚠️  Could not resolve AWS profile '{args.profile}': {exc}")
+        print(f"! Could not resolve AWS profile '{args.profile}': {exc}")
 
     context = {"input": agent_input}
     history = []  # client-side conversation history (user + assistant turns)
@@ -209,7 +209,7 @@ def cmd_chat(args):
     from headlabs.config import get_tenant
     tenant_id = getattr(args, "tenant", None) or get_tenant()
 
-    print(f"💬 Chat with '{agent_id}' (session: {session_id[:8]}...)")
+    print(f"Chat with '{agent_id}' (session: {session_id[:8]}...)")
     print("   Type /exit or Ctrl+C to quit.\n")
 
     try:
@@ -236,12 +236,12 @@ def cmd_chat(args):
                         sys.stdout.flush()
                         answer_parts.append(event.get("content", ""))
                     elif ev_type == "tool_use":
-                        sys.stdout.write(f"\n  🔧 {event.get('tool', '?')}")
+                        sys.stdout.write(f"\n  - {event.get('tool', '?')}")
                         sys.stdout.flush()
                     elif ev_type == "status":
                         msg = event.get("message", "")
                         if msg:
-                            sys.stdout.write(f"\n  • {msg}")
+                            sys.stdout.write(f"\n  · {msg}")
                             sys.stdout.flush()
                     elif ev_type == "done":
                         msg = event.get("message", "")
@@ -251,7 +251,7 @@ def cmd_chat(args):
                         sys.stdout.write("\n")
                         sys.stdout.flush()
                     elif ev_type == "error":
-                        sys.stdout.write(f"\n❌ Error: {event.get('error', '?')}\n")
+                        sys.stdout.write(f"\n  x Error: {event.get('error', '?')}\n")
                         sys.stdout.flush()
                 print()
                 # Persist the turn so the next message has conversation context
@@ -264,10 +264,10 @@ def cmd_chat(args):
                 print("\n")
                 continue
             except Exception as exc:
-                print(f"\n❌ {exc}")
+                print(f"\n  x {exc}")
     except KeyboardInterrupt:
         pass
-    print("\n👋 Chat ended.")
+    print("\nChat ended.")
 
 
 def cmd_config(args):
