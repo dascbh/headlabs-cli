@@ -129,12 +129,16 @@ class ProgressReporter:
         marker = _MARKERS.get(etype, ".")
         if etype == "tool_use":
             name = tool or label
-            if self._start_ts is not None:
-                el = _fmt_elapsed(time.time() - self._start_ts)
-                suffix = f"   {_DIM}+{el}{_RESET}" if self.tty else f"   +{el}"
+            el = _fmt_elapsed(time.time() - self._start_ts) if self._start_ts is not None else None
+            if self.tty:
+                # Whole line dimmed (gray), matching the elapsed style.
+                line = f"  {_DIM}{marker} {name}"
+                if el:
+                    line += f"   +{el}"
+                line += _RESET
             else:
-                suffix = ""
-            self._emit_block(f"  {marker} {name}{suffix}", self._detail_lines(ev))
+                line = f"  {marker} {name}" + (f"   +{el}" if el else "")
+            self._emit_block(line, self._detail_lines(ev))
         else:
             self._emit_block(f"  {marker} {label}", [])
 
