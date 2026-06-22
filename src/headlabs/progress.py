@@ -102,17 +102,19 @@ class ProgressReporter:
     def event(self, ev: dict) -> None:
         """Render one streamed event.
 
-        ``tool_use`` events render as a primary line plus indented sub-detail
-        (tool id, elapsed, and any ``detail`` fields the backend provides) —
-        Kiro-style. Other event types render as a single marked line.
+        ``tool_use`` renders as a single line — ``- {tool} · +{elapsed}`` —
+        with indented sub-lines only when the backend supplies a ``detail``
+        dict (summary / key=value args). Other event types render as one
+        marked line.
         """
         etype = ev.get("type", "")
         level = ev.get("level", "info")
-        label = ev.get("label") or ev.get("tool") or etype
+        tool = ev.get("tool")
+        label = ev.get("label") or tool or etype
         self._event_count += 1
         if etype == "tool_use":
             self._tool_count += 1
-            self._label = label
+            self._label = tool or label
         elif etype in ("step", "thinking"):
             self._label = label
 
@@ -125,22 +127,22 @@ class ProgressReporter:
         if etype not in _MARKERS and not self.verbose:
             return
         marker = _MARKERS.get(etype, ".")
-        sub = self._detail_lines(ev) if etype == "tool_use" else []
-        self._emit_block(f"  {marker} {label}", sub)
+        if etype == "tool_use":
+            name = tool or label
+            if self._start_ts is not None:
+                el = _fmt_elapsed(time.time() - self._start_ts)
+                suffix = f"   {_DIM}+{el}{_RESET}" if self.tty else f"   +{el}"
+            else:
+                suffix = ""
+            self._emit_block(f"  {marker} {name}{suffix}", self._detail_lines(ev))
+        else:
+            self._emit_block(f"  {marker} {label}", [])
 
     def _detail_lines(self, ev: dict) -> list[str]:
-        """Build indented sub-detail lines for a tool call."""
+        """Indented sub-lines for a tool call — only when the backend provides
+        a ``detail`` dict (the tool id and elapsed already live on the primary
+        line, so nothing is repeated here)."""
         lines: list[str] = []
-        head: list[str] = []
-        tool = ev.get("tool")
-        if tool and tool != ev.get("label"):
-            head.append(tool)
-        if self._start_ts is not None:
-            head.append(f"+{_fmt_elapsed(time.time() - self._start_ts)}")
-        if head:
-            seg = " · ".join(head)
-            lines.append(f"      {_DIM}{seg}{_RESET}" if self.tty else f"      {seg}")
-
         detail = ev.get("detail")
         if isinstance(detail, dict) and detail:
             # Free-text summary of the tool result, if present.
