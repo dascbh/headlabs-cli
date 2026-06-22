@@ -11,6 +11,16 @@ import requests
 from headlabs.config import get_api_key, get_api_url
 from headlabs.result import Result
 from headlabs.agents.registry import AGENT_REGISTRY
+from headlabs.collectors.finops import FinOpsCollector
+from headlabs.collectors.generic import GenericCollector
+
+
+# Maps an agent's `collector` name (from AGENT_REGISTRY) to the collector class
+# that gathers data LOCALLY using the client's AWS profile. Agents without a
+# dedicated collector fall back to GenericCollector (account identity only).
+COLLECTOR_MAP = {
+    "finops": FinOpsCollector,
+}
 
 
 class HeadLabsClient:
@@ -79,20 +89,39 @@ class HeadLabsClient:
         return Result(status="timeout")
 
     def run(self, agent_id: str, aws_profile: str, **kwargs: Any) -> Result:
-        """Run an agent. Resolves account from profile, invokes, polls."""
+        """Run an agent against the CLIENT's account.
+
+        Data is collected LOCALLY using the client's AWS profile (credentials
+        never leave the machine), then the collected summary is sent to the
+        agent for analysis. This is the documented security model.
+        """
         import boto3
 
-        # Resolve account ID from profile
+        # Open a session with the client's profile — credentials stay local.
         session = boto3.Session(profile_name=aws_profile)
+
+        # Resolve account ID from the client's profile (or explicit override).
         sts = session.client("sts")
         identity = sts.get_caller_identity()
         account_id = kwargs.pop("account_id", None) or identity["Account"]
 
-        # Build input in the format the agent expects
+        # Pick the collector for this agent and gather data with the client's
+        # credentials. Agents without a dedicated collector use GenericCollector.
+        agent_cfg = next(
+            (cfg for cfg in AGENT_REGISTRY.values() if cfg.get("agent_id") == agent_id),
+            None,
+        )
+        collector_name = agent_cfg.get("collector") if agent_cfg else None
+        collector_cls = COLLECTOR_MAP.get(collector_name, GenericCollector)
+        collected = collector_cls(session).collect(**kwargs)
+
+        # Build input in the format the agent expects, INCLUDING the data
+        # collected locally against the client's account.
         input_data = {
             "tenant_id": "ALL",
             "lookback_days": kwargs.get("days", 30),
             "aws_region": session.region_name or "us-east-1",
+            "collected_data": collected,
         }
         if kwargs.get("question"):
             input_data["question"] = kwargs["question"]
