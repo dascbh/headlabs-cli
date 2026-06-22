@@ -150,25 +150,22 @@ class HeadLabsClient:
         """Resolve the tenant that owns the configured API key.
 
         The tenant is a property of the key itself, so it must never be
-        guessed. Looks up ``GET /api-keys`` and matches the configured public
-        key (the ``pk_...`` part). The result is cached for the client's
-        lifetime. Returns ``None`` only when it genuinely cannot be determined
-        (e.g. an admin key with no tenant, or the endpoint is unavailable).
+        guessed. Uses ``GET /api-keys/me``, which returns the tenant for the
+        calling key only (no listing, no cross-tenant exposure). The result is
+        cached for the client's lifetime. Returns ``None`` only when it
+        genuinely cannot be determined (endpoint unavailable, or an admin key
+        with no bound tenant).
         """
         cached = getattr(self, "_tenant_cache", "unset")
         if cached != "unset":
             return cached
         tenant = None
         try:
-            pub = (self.api_key or "").split(":")[0]
             resp = requests.get(
-                f"{self.api_url}/api-keys", headers=self._headers(), timeout=15
+                f"{self.api_url}/api-keys/me", headers=self._headers(), timeout=15
             )
             if resp.status_code == 200:
-                for item in resp.json():
-                    if item.get("public_key") == pub:
-                        tenant = item.get("tenant") or None
-                        break
+                tenant = resp.json().get("tenant") or None
         except Exception:
             tenant = None
         self._tenant_cache = tenant
