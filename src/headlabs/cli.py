@@ -17,11 +17,12 @@ def cmd_run(args):
     from headlabs.client import HeadLabsClient
 
     agent_name = args.agent
-    if agent_name not in AGENT_REGISTRY:
-        print(f"Error: unknown agent '{agent_name}'. Use 'headlabs agents' to list.", file=sys.stderr)
-        sys.exit(1)
+    # Accept either a friendly registry name (e.g. "finops") or a platform
+    # agent id (e.g. "finops-advisor"), mirroring `chat`. Unknown names are
+    # passed through to the platform, which validates them.
+    agent_cfg = AGENT_REGISTRY.get(agent_name)
+    agent_id = agent_cfg["agent_id"] if agent_cfg else agent_name
 
-    agent_cfg = AGENT_REGISTRY[agent_name]
     client = HeadLabsClient()
 
     kwargs = {"days": args.days}
@@ -31,7 +32,7 @@ def cmd_run(args):
         kwargs["account_id"] = args.account_id
 
     print(f"Running {agent_name} agent (profile: {args.profile}, days: {args.days})...")
-    result = client.run(agent_cfg["agent_id"], args.profile, **kwargs)
+    result = client.run(agent_id, args.profile, **kwargs)
 
     if result.status == "timeout":
         print("❌ Agent timed out (>5 min). Try again or check headlabs.ai dashboard.")
