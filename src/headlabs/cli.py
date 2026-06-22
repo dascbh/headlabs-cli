@@ -27,26 +27,39 @@ def cmd_run(args):
     kwargs = {"days": args.days}
     if args.question:
         kwargs["question"] = args.question
+    if args.account_id:
+        kwargs["account_id"] = args.account_id
 
     print(f"Running {agent_name} agent (profile: {args.profile}, days: {args.days})...")
     result = client.run(agent_cfg["agent_id"], args.profile, **kwargs)
 
+    if result.status == "timeout":
+        print("❌ Agent timed out (>5 min). Try again or check headlabs.ai dashboard.")
+        sys.exit(1)
+    if result.status == "failed":
+        print(f"❌ Agent failed: {result.summary[:150] if result.summary else 'unknown'}")
+        sys.exit(1)
+
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
-    if args.output == "json":
-        path = str(REPORTS_DIR / f"{agent_name}_{ts}.json")
-        result.to_json(path)
-    elif args.output == "md":
-        print(result.to_markdown())
-        return
-    else:
-        path = str(REPORTS_DIR / f"{agent_name}_{ts}.html")
-        result.to_html(path)
+    # Always save both HTML + JSON
+    html_path = str(REPORTS_DIR / f"{agent_name}_{ts}.html")
+    json_path = str(REPORTS_DIR / f"{agent_name}_{ts}.json")
+    result.to_html(html_path)
+    result.to_json(json_path)
 
-    print(f"Report saved: {path}")
-    if not args.no_browser and args.output == "html":
-        webbrowser.open(f"file://{path}")
+    # Print summary
+    n_insights = len(result.insights)
+    saving = result.total_saving_usd
+    print(f"Report saved: {html_path}")
+    print(f"  JSON: {json_path}")
+    if result.status == "failed":
+        print(f"  ⚠️  Agent failed: {result.summary[:100] if result.summary else 'unknown error'}")
+    elif n_insights:
+        print(f"  {n_insights} findings | ${saving:,.0f}/mo potential savings")
+    if not args.no_browser:
+        pass  # Reports saved locally; open manually if needed
 
 
 def cmd_agents(args):
@@ -146,6 +159,90 @@ def cmd_tools(args):
         print(f"{t['id']:<30} {t['type']:<8} {t['name']}")
 
 
+def cmd_chat(args):
+    """Interactive chat with an agent. Same credential model as `run`:
+    the AWS profile resolves the account locally; the agent uses its tools
+    (with cross-account handshake) to fetch real data."""
+    import uuid
+    from headlabs.client import HeadLabsClient
+
+    client = HeadLabsClient()
+    session_id = str(uuid.uuid4())
+
+    # Resolve friendly name → platform agent id (finops → finops-chat)
+    agent_cfg = AGENT_REGISTRY.get(args.agent)
+    agent_id = agent_cfg["chat_agent_id"] if agent_cfg and "chat_agent_id" in agent_cfg else args.agent
+
+    # Resolve account + region from the AWS profile (credentials stay local)
+    agent_input = {"tenant_id": "ALL", "aws_region": "us-east-1"}
+    try:
+        import boto3
+        session = boto3.Session(profile_name=args.profile)
+        agent_input["aws_region"] = session.region_name or "us-east-1"
+        identity = session.client("sts").get_caller_identity()
+        agent_input["account_id"] = identity["Account"]
+        print(f"📊 Account: {identity['Account']} (profile: {args.profile})")
+    except Exception as exc:
+        print(f"⚠️  Could not resolve AWS profile '{args.profile}': {exc}")
+
+    context = {"input": agent_input}
+    history = []  # client-side conversation history (user + assistant turns)
+
+    print(f"💬 Chat with '{agent_id}' (session: {session_id[:8]}...)")
+    print("   Type /exit or Ctrl+C to quit.\n")
+
+    try:
+        while True:
+            try:
+                user_input = input("You: ").strip()
+            except EOFError:
+                break
+            if not user_input:
+                continue
+            if user_input in ("/exit", "/quit"):
+                break
+
+            sys.stdout.write("Agent: ")
+            sys.stdout.flush()
+            answer_parts = []
+            try:
+                for event in client.chat_stream(agent_id, session_id, user_input,
+                                                 context=context, history=history):
+                    ev_type = event.get("type", "")
+                    if ev_type == "token":
+                        sys.stdout.write(event.get("content", ""))
+                        sys.stdout.flush()
+                        answer_parts.append(event.get("content", ""))
+                    elif ev_type == "tool_use":
+                        sys.stdout.write(f"\n  🔧 {event.get('tool', '?')}...")
+                        sys.stdout.flush()
+                    elif ev_type == "done":
+                        msg = event.get("message", "")
+                        if msg:
+                            sys.stdout.write(msg)
+                            answer_parts.append(msg)
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                    elif ev_type == "error":
+                        sys.stdout.write(f"\n❌ Error: {event.get('error', '?')}\n")
+                        sys.stdout.flush()
+                print()
+                # Persist the turn so the next message has conversation context
+                answer = "".join(answer_parts).strip()
+                if answer:
+                    history.append({"role": "user", "content": user_input})
+                    history.append({"role": "assistant", "content": answer})
+                    history = history[-20:]  # cap context window
+            except KeyboardInterrupt:
+                print("\n")
+                continue
+            except Exception as exc:
+                print(f"\n❌ {exc}")
+    except KeyboardInterrupt:
+        pass
+    print("\n👋 Chat ended.")
+
+
 def cmd_config(args):
     """Save configuration."""
     config = load_config()
@@ -175,6 +272,7 @@ def main():
     p_run = sub.add_parser("run", help="Run an AI agent")
     p_run.add_argument("agent", help="Agent name (e.g. finops)")
     p_run.add_argument("--profile", required=True, help="AWS profile name")
+    p_run.add_argument("--account-id", help="Target AWS account ID (defaults to profile's account)")
     p_run.add_argument("--days", type=int, default=30, help="Days of data to analyze")
     p_run.add_argument("--question", help="Ask a specific question")
     p_run.add_argument("--output", choices=["json", "html", "md"], default="html", help="Output format")
@@ -210,6 +308,12 @@ def main():
     # tools
     p_tools = sub.add_parser("tools", help="List available tools and MCPs")
     p_tools.set_defaults(func=cmd_tools)
+
+    # chat
+    p_chat = sub.add_parser("chat", help="Interactive chat with an agent")
+    p_chat.add_argument("agent", help="Agent ID")
+    p_chat.add_argument("--profile", default="default", help="AWS profile name")
+    p_chat.set_defaults(func=cmd_chat)
 
     # config
     p_config = sub.add_parser("config", help="Configure HeadLabs CLI")

@@ -2,21 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Any
 
-import boto3
 import requests
 
 from headlabs.config import get_api_key, get_api_url
 from headlabs.result import Result
 from headlabs.agents.registry import AGENT_REGISTRY
-from headlabs.collectors.finops import FinOpsCollector
-
-
-COLLECTOR_MAP = {
-    "finops": FinOpsCollector,
-}
 
 
 class HeadLabsClient:
@@ -37,58 +31,80 @@ class HeadLabsClient:
         """Invoke an agent and return execution ID."""
         resp = requests.post(
             f"{self.api_url}/agents/{agent_id}/invoke",
-            json=input_data,
+            json={"input": input_data},
             headers=self._headers(),
             timeout=30,
         )
         resp.raise_for_status()
-        return resp.json()["execution_id"]
+        return resp.json()["exec_id"]
 
-    def poll(self, exec_id: str, timeout: int = 300) -> Result:
+    def poll(self, exec_id: str, timeout: int = 600) -> Result:
         """Poll for execution result."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             resp = requests.get(
-                f"{self.api_url}/executions/{exec_id}",
+                f"{self.api_url}/executions/{exec_id}?tenant_id=platform",
                 headers=self._headers(),
                 timeout=15,
             )
             resp.raise_for_status()
             data = resp.json()
-            if data.get("status") in ("completed", "failed"):
+            status = data.get("status")
+            # Terminal states: succeeded plus the failure family (failed/dlq/timed_out/cancelled/rejected).
+            if status in ("succeeded", "failed", "dlq", "timed_out", "cancelled", "rejected"):
+                raw = data.get("output", "{}")
+                output = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                norm = "succeeded" if status == "succeeded" else "failed"
+                default_summary = "" if status == "succeeded" else f"Execution {status}"
+                if status == "dlq":
+                    default_summary = "Execution sent to dead-letter queue after retries"
+                elif status == "timed_out":
+                    default_summary = "Execution timed out"
+                elif status == "cancelled":
+                    default_summary = "Execution cancelled by operator"
+                elif status == "rejected":
+                    default_summary = "Execution rejected at approval gate"
                 return Result(
-                    status=data["status"],
-                    raw_output=data.get("output", {}),
-                    insights=data.get("output", {}).get("insights", []),
-                    summary=data.get("output", {}).get("summary", ""),
-                    total_saving_usd=data.get("output", {}).get("total_saving_usd", 0.0),
-                    account_id=data.get("output", {}).get("account_id", ""),
-                    cost_summary=data.get("output", {}).get("cost_summary", {}),
+                    status=norm,
+                    raw_output=output,
+                    insights=output.get("insights", []) if isinstance(output, dict) else [],
+                    summary=(output.get("summary") if isinstance(output, dict) else None) or default_summary,
+                    total_saving_usd=output.get("total_saving_usd", 0.0) if isinstance(output, dict) else 0.0,
+                    account_id=output.get("account_id", "") if isinstance(output, dict) else "",
+                    cost_summary=output.get("cost_summary", {}) if isinstance(output, dict) else {},
                 )
             time.sleep(5)
+            print(".", end="", flush=True)
+        print()
         return Result(status="timeout")
 
     def run(self, agent_id: str, aws_profile: str, **kwargs: Any) -> Result:
-        """High-level: collect data locally, invoke agent, poll for result."""
-        agent_cfg = None
-        for cfg in AGENT_REGISTRY.values():
-            if cfg["agent_id"] == agent_id:
-                agent_cfg = cfg
-                break
-        if not agent_cfg:
-            raise ValueError(f"Unknown agent: {agent_id}")
+        """Run an agent. Resolves account from profile, invokes, polls."""
+        import boto3
 
-        collector_cls = COLLECTOR_MAP.get(agent_cfg["collector"])
-        if not collector_cls:
-            raise ValueError(f"No collector for: {agent_cfg['collector']}")
-
+        # Resolve account ID from profile
         session = boto3.Session(profile_name=aws_profile)
-        collector = collector_cls(session)
-        collected = collector.collect(**kwargs)
+        sts = session.client("sts")
+        identity = sts.get_caller_identity()
+        account_id = kwargs.pop("account_id", None) or identity["Account"]
 
-        input_data = {"collected_data": collected, **kwargs}
+        # Build input in the format the agent expects
+        input_data = {
+            "tenant_id": "ALL",
+            "lookback_days": kwargs.get("days", 30),
+            "aws_region": session.region_name or "us-east-1",
+        }
+        if kwargs.get("question"):
+            input_data["question"] = kwargs["question"]
+        if account_id:
+            input_data["account_id"] = account_id
+
+        print(f"  Account: {account_id}")
         exec_id = self.invoke(agent_id, input_data)
-        return self.poll(exec_id)
+        print(f"  Exec: {exec_id[:8]}...")
+        result = self.poll(exec_id)
+        result.account_id = result.account_id or account_id
+        return result
 
     def list_agents(self) -> list[dict]:
         """List available agents."""
@@ -132,7 +148,7 @@ class HeadLabsClient:
 
     def list_skills(self) -> list[dict]:
         """List skills on the platform."""
-        resp = requests.get(f"{self.api_url}/resources?rtype=skill", headers=self._headers(), timeout=15)
+        resp = requests.get(f"{self.api_url}/resources/skill", headers=self._headers(), timeout=15)
         if resp.status_code == 200:
             data = resp.json()
             return data if isinstance(data, list) else data.get("items", data.get("resources", []))
@@ -151,7 +167,7 @@ class HeadLabsClient:
     def list_tools(self) -> list[dict]:
         """List tools and MCPs on the platform."""
         tools = []
-        resp = requests.get(f"{self.api_url}/resources?rtype=tool", headers=self._headers(), timeout=15)
+        resp = requests.get(f"{self.api_url}/resources/tool", headers=self._headers(), timeout=15)
         if resp.status_code == 200:
             data = resp.json()
             items = data if isinstance(data, list) else data.get("items", data.get("resources", []))
@@ -162,3 +178,48 @@ class HeadLabsClient:
             for m in resp2.json():
                 tools.append({"id": m.get("id"), "type": "mcp", "name": m.get("display_name", m.get("id"))})
         return tools
+
+    def chat_stream(self, agent_id: str, session_id: str, message: str,
+                    context: dict | None = None, history: list | None = None):
+        """Send chat message, poll for result, yield done event."""
+        import sys
+        import time as _time
+
+        resp = requests.post(
+            f"{self.api_url}/chat/{agent_id}",
+            json={"session_id": session_id, "message": message,
+                  "context": context or {}, "history": history or []},
+            headers=self._headers(),
+            timeout=30,
+        )
+        resp.raise_for_status()
+        exec_id = resp.json().get("exec_id")
+        if not exec_id:
+            yield {"type": "error", "error": "No exec_id returned"}
+            return
+
+        # Poll for result
+        deadline = _time.time() + 480
+        while _time.time() < deadline:
+            r = requests.get(
+                f"{self.api_url}/executions/{exec_id}?tenant_id=platform",
+                headers=self._headers(), timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("status") == "succeeded":
+                    raw = data.get("output", "{}")
+                    output = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                    msg = output.get("answer") or output.get("response") or output.get("message") or str(output)
+                    yield {"type": "done", "message": msg}
+                    return
+                elif data.get("status") in ("failed", "dlq", "timed_out"):
+                    status = data.get("status")
+                    raw = data.get("output", "{}")
+                    output = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                    err = output.get("error") if isinstance(output, dict) else None
+                    yield {"type": "error", "error": err or f"Agent {status}"}
+                    return
+            _time.sleep(2)
+            sys.stdout.write(".")
+            sys.stdout.flush()
+        yield {"type": "error", "error": "Timeout waiting for response"}

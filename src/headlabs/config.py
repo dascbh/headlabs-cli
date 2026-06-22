@@ -5,9 +5,9 @@ from pathlib import Path
 
 CONFIG_DIR = Path.home() / ".headlabs"
 CONFIG_FILE = CONFIG_DIR / "config.json"
-REPORTS_DIR = CONFIG_DIR / "reports"
+REPORTS_DIR = Path("./reports")
 
-DEFAULT_API_URL = "https://t5midz2jua.execute-api.us-east-1.amazonaws.com/prod"
+DEFAULT_API_URL = "https://api.headlabs.ai/api/v1"
 
 
 def load_config() -> dict:

@@ -3,6 +3,7 @@
 AGENT_REGISTRY: dict[str, dict] = {
     "finops": {
         "agent_id": "finops-advisor",
+        "chat_agent_id": "finops-advisor",
         "collector": "finops",
         "description": "Analyzes AWS costs and recommends optimizations",
     },
