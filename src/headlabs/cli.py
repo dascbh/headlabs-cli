@@ -77,6 +77,8 @@ def cmd_agents(args):
 
     client = HeadLabsClient()
     remote = client.list_remote_agents()
+    # The architect is an internal engine behind `agents create`, not a user-facing agent.
+    remote = [a for a in (remote or []) if a.get("id") != _ARCHITECT_AGENT_ID]
 
     if remote:
         print(f"{'ID':<28} {'Status':<10} {'Type':<12} Description")
@@ -92,9 +94,21 @@ def cmd_agents(args):
 
 
 def cmd_agents_create(args):
-    """Create a declarative agent."""
+    """Create a declarative agent.
+
+    With no --prompt/--prompt-file/--id: launch the AGENTIC creation wizard, where
+    an assistant conducts the whole creation (asks purpose, conversational vs
+    invocation vs both, description, proposes the design, and creates it).
+    With flags: one-shot programmatic creation (for scripts/power users).
+    """
+    if not getattr(args, "prompt", None) and not getattr(args, "prompt_file", None) and not getattr(args, "id", None):
+        return cmd_agent_create_interactive(args)
+
     from headlabs.client import HeadLabsClient
 
+    if not args.id:
+        print("Error: --id required for non-interactive create (or omit all flags for the wizard)", file=sys.stderr)
+        sys.exit(1)
     prompt = args.prompt
     if args.prompt_file:
         prompt = Path(args.prompt_file).read_text()
@@ -119,6 +133,86 @@ def cmd_agents_create(args):
         print(f"   Runtime: {rid} — agent is immediately invocable")
     if result.get("activation_error"):
         print(f"   ! Activation: {result['activation_error']}")
+
+
+# Backend agent that powers the agentic creation wizard (not a user-facing agent).
+_ARCHITECT_AGENT_ID = "agent-architect"
+
+
+def cmd_agent_create_interactive(args):
+    """Agentic agent-creation wizard: an assistant conducts the whole creation
+    interview in the terminal — it greets, asks the purpose, whether the agent is
+    conversational / invocation / both, the description, proposes a design, and
+    creates the agent on your approval. Powered by a backend architect agent."""
+    import uuid
+    from headlabs.client import HeadLabsClient
+    from headlabs.progress import ProgressReporter
+    from headlabs.config import get_tenant
+
+    client = HeadLabsClient()
+    session_id = str(uuid.uuid4())
+    tenant_id = getattr(args, "tenant", None) or get_tenant()
+    history: list[dict] = []
+
+    print("HeadLabs · criação de agente assistida")
+    print("   O assistente vai conduzir a criação. Digite /exit para sair.\n")
+
+    # Kickoff: the assistant speaks first and runs the interview.
+    pending = (
+        "Inicie agora a criação de um novo agente comigo. Conduza a entrevista, "
+        "uma pergunta por vez: apresente-se em uma linha e pergunte primeiro o "
+        "propósito do agente; em seguida pergunte se ele será CONVERSACIONAL, de "
+        "INVOCAÇÃO (estruturado) ou AMBOS, e peça uma descrição curta. Quando tiver "
+        "o necessário, proponha o design (id, nome, prompt, tools, schema se aplicável) "
+        "e crie ao receber meu aceite."
+    )
+    show_pending = False  # don't echo the internal kickoff as a user line
+
+    try:
+        while True:
+            reporter = ProgressReporter(quiet=False, verbose=getattr(args, "verbose", False))
+            reporter.begin_wait("Pensando…")
+            answer, err = None, None
+            try:
+                for event in client.chat_stream(_ARCHITECT_AGENT_ID, session_id, pending,
+                                                 context={}, history=history, tenant_id=tenant_id):
+                    et = event.get("type", "")
+                    if et == "progress":
+                        reporter.event(event["event"])
+                    elif et == "done":
+                        answer = event.get("message", "")
+                    elif et == "error":
+                        err = event.get("error", "?")
+                reporter.finish("failed" if err else "succeeded")
+            except KeyboardInterrupt:
+                reporter.finish("cancelled")
+                break
+            except Exception as exc:
+                reporter.finish("failed")
+                print(f"  x {exc}")
+                break
+
+            if err:
+                print(f"  x {err}")
+                break
+            print(f"\n{answer}\n")
+            history.append({"role": "user", "content": pending})
+            history.append({"role": "assistant", "content": answer})
+            history = history[-24:]
+
+            try:
+                user_input = input("Você: ").strip()
+            except EOFError:
+                break
+            if user_input in ("/exit", "/quit"):
+                break
+            if not user_input:
+                continue
+            pending = user_input
+            show_pending = True
+    except KeyboardInterrupt:
+        pass
+    print("\nEncerrado.")
 
 
 def cmd_skills(args):
@@ -304,19 +398,21 @@ def main():
     p_run.add_argument("--no-browser", action="store_true", help="Don't open browser")
     p_run.set_defaults(func=cmd_run)
 
-    # agents
-    p_agents = sub.add_parser("agents", help="List or create agents")
+    # agents (alias: agent)
+    p_agents = sub.add_parser("agents", aliases=["agent"], help="List or create agents")
     p_agents_sub = p_agents.add_subparsers(dest="subcmd")
     p_agents.set_defaults(func=cmd_agents)
-    # agents create
-    p_ac = p_agents_sub.add_parser("create", help="Create a declarative agent")
-    p_ac.add_argument("--id", required=True, help="Agent ID (lowercase, hyphens)")
+    # agents create — no flags launches the agentic creation wizard
+    p_ac = p_agents_sub.add_parser("create", help="Create an agent (no flags = guided agentic wizard)")
+    p_ac.add_argument("--id", help="Agent ID (lowercase, hyphens). Omit for the guided wizard.")
     p_ac.add_argument("--name", help="Display name (defaults to id)")
     p_ac.add_argument("--prompt", help="System prompt (inline)")
     p_ac.add_argument("--prompt-file", help="System prompt from file")
     p_ac.add_argument("--model", default="us.anthropic.claude-sonnet-4-5-20250929-v1:0", help="Model ID")
     p_ac.add_argument("--tools", help="Native tools (comma-separated)")
     p_ac.add_argument("--description", help="Description")
+    p_ac.add_argument("--tenant", help="Tenant ID for polling the wizard session")
+    p_ac.add_argument("--verbose", action="store_true", help="Show every progress event")
     p_ac.set_defaults(func=cmd_agents, subcmd="create")
 
     # skills
