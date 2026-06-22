@@ -26,18 +26,17 @@ from typing import Optional, TextIO
 
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
-_MARKERS = {
-    "tool_use": "-",
-    "thinking": "~",
-    "step": ">",
-    "status": "·",
-    "error": "x",
-    "warn": "!",
-}
-
 _DIM = "\033[2m"
 _RESET = "\033[0m"
+_GREEN = "\033[32m"
+_RED = "\033[31m"
+_CYAN = "\033[36m"
+_YELLOW = "\033[33m"
 _CLEAR_LINE = "\r\033[K"
+
+# Kiro-style status dot. `●` is a monochrome geometric glyph (not an emoji);
+# colour is applied via ANSI on a TTY only.
+_DOT = "●"
 
 
 def _fmt_elapsed(seconds: float) -> str:
@@ -69,6 +68,10 @@ class ProgressReporter:
 
     # ── local pipeline phases ────────────────────────────────────────────────
 
+    def _dot(self, color: str) -> str:
+        """Colored status dot on a TTY, plain `●` otherwise."""
+        return f"{color}{_DOT}{_RESET}" if self.tty else _DOT
+
     def header(self, text: str) -> None:
         if self.quiet:
             return
@@ -76,10 +79,10 @@ class ProgressReporter:
         self._println(f"{_DIM}{text}{_RESET}" if self.tty else text)
 
     def phase(self, text: str, detail: Optional[str] = None) -> None:
-        """A completed local step (checklist line)."""
+        """A completed local step (green dot)."""
         if self.quiet:
             return
-        line = f"  ✓ {text}"
+        line = f"  {self._dot(_GREEN)} {text}"
         if detail:
             line += f"   {_DIM}{detail}{_RESET}" if self.tty else f"   ({detail})"
         self._println(line)
@@ -100,12 +103,14 @@ class ProgressReporter:
             self._println(f"  {label}")
 
     def event(self, ev: dict) -> None:
-        """Render one streamed event.
+        """Render one streamed event, Kiro-style.
 
-        ``tool_use`` renders as a single line — ``- {tool} · +{elapsed}`` —
-        with indented sub-lines only when the backend supplies a ``detail``
-        dict (summary / key=value args). Other event types render as one
-        marked line.
+        - ``status`` / ``step``: a coloured dot milestone line.
+        - ``tool_use``: a single dimmed line ``- {tool}   +{elapsed}`` plus
+          indented sub-lines when the backend supplies a ``detail`` dict.
+        - ``thinking``: ``● Thought for Ns`` with the reasoning as a ``╰``
+          continuation (shown only when the backend emits thinking events).
+        - ``error`` (or level=error): a red dot line.
         """
         etype = ev.get("type", "")
         level = ev.get("level", "info")
@@ -118,29 +123,47 @@ class ProgressReporter:
         elif etype in ("step", "thinking"):
             self._label = label
 
-        if level == "error":
-            self._emit_block(f"  {_MARKERS['error']} {label}", self._detail_lines(ev))
+        if level == "error" or etype == "error":
+            self._emit_block(f"  {self._dot(_RED)} {label}", self._detail_lines(ev))
             return
         if self.quiet:
             return
-        # By default surface status/step/tool_use/thinking; verbose adds the rest.
-        if etype not in _MARKERS and not self.verbose:
-            return
-        marker = _MARKERS.get(etype, ".")
+
         if etype == "tool_use":
             name = tool or label
             el = _fmt_elapsed(time.time() - self._start_ts) if self._start_ts is not None else None
             if self.tty:
-                # Whole line dimmed (gray), matching the elapsed style.
-                line = f"  {_DIM}{marker} {name}"
-                if el:
-                    line += f"   +{el}"
-                line += _RESET
+                line = f"  {_DIM}- {name}" + (f"   +{el}" if el else "") + _RESET
             else:
-                line = f"  {marker} {name}" + (f"   +{el}" if el else "")
+                line = f"  - {name}" + (f"   +{el}" if el else "")
             self._emit_block(line, self._detail_lines(ev))
-        else:
-            self._emit_block(f"  {marker} {label}", [])
+        elif etype == "thinking":
+            self._emit_block(self._thinking_line(ev), self._thinking_detail(ev))
+        elif etype in ("status", "step"):
+            self._emit_block(f"  {self._dot(_CYAN)} {label}", [])
+        elif self.verbose:
+            self._emit_block(f"  {self._dot(_CYAN)} {label}", [])
+
+    def _thinking_line(self, ev: dict) -> str:
+        """Primary line for a thinking event: '● Thought for Ns' (dimmed)."""
+        detail = ev.get("detail") if isinstance(ev.get("detail"), dict) else {}
+        secs = detail.get("seconds") or detail.get("duration_s")
+        if secs is None and isinstance(detail.get("ms"), (int, float)):
+            secs = round(detail["ms"] / 1000)
+        head = f"Thought for {int(secs)}s" if isinstance(secs, (int, float)) else "Thinking"
+        dot = self._dot(_DIM) if self.tty else _DOT
+        return f"  {dot} {_DIM}{head}{_RESET}" if self.tty else f"  {_DOT} {head}"
+
+    def _thinking_detail(self, ev: dict) -> list[str]:
+        """The reasoning text as a '╰' continuation, if the event carries it."""
+        detail = ev.get("detail") if isinstance(ev.get("detail"), dict) else {}
+        text = detail.get("text") or detail.get("reasoning") or detail.get("summary")
+        if not text and ev.get("label") not in (None, "thinking"):
+            text = ev.get("label")
+        if not text:
+            return []
+        text = str(text).strip().replace("\n", " ")[:240]
+        return [f"      {_DIM}╰ {text}{_RESET}" if self.tty else f"      ╰ {text}"]
 
     def _detail_lines(self, ev: dict) -> list[str]:
         """Indented sub-lines for a tool call — only when the backend provides
@@ -179,11 +202,13 @@ class ProgressReporter:
         elapsed = _fmt_elapsed(time.time() - self._start_ts) if self._start_ts else ""
         tools = f" · {self._tool_count} tool calls" if self._tool_count else ""
         if status in ("succeeded", "partial"):
-            self._println(f"  ✓ Concluído em {elapsed}{tools}")
+            self._println(f"  {self._dot(_GREEN)} Concluído em {elapsed}{tools}")
         elif status == "timeout":
-            self._println(f"  x Tempo esgotado após {elapsed}")
+            self._println(f"  {self._dot(_RED)} Tempo esgotado após {elapsed}")
+        elif status == "cancelled":
+            self._println(f"  {self._dot(_YELLOW)} Cancelado após {elapsed}")
         else:
-            self._println(f"  x {status} após {elapsed}{tools}")
+            self._println(f"  {self._dot(_RED)} {status} após {elapsed}{tools}")
 
     # ── internals ────────────────────────────────────────────────────────────
 
@@ -192,7 +217,7 @@ class ProgressReporter:
         while not self._stop.is_set():
             with self._lock:
                 elapsed = _fmt_elapsed(time.time() - (self._start_ts or time.time()))
-                self.out.write(f"{_CLEAR_LINE}  {next(frames)} {self._label}   {_DIM}{elapsed}{_RESET}")
+                self.out.write(f"{_CLEAR_LINE}  {_CYAN}{next(frames)}{_RESET} {self._label}   {_DIM}{elapsed}{_RESET}")
                 self.out.flush()
             time.sleep(0.1)
 
