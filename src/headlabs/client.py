@@ -146,6 +146,34 @@ class HeadLabsClient:
         result.account_id = result.account_id or account_id
         return result
 
+    def resolve_tenant(self) -> str | None:
+        """Resolve the tenant that owns the configured API key.
+
+        The tenant is a property of the key itself, so it must never be
+        guessed. Looks up ``GET /api-keys`` and matches the configured public
+        key (the ``pk_...`` part). The result is cached for the client's
+        lifetime. Returns ``None`` only when it genuinely cannot be determined
+        (e.g. an admin key with no tenant, or the endpoint is unavailable).
+        """
+        cached = getattr(self, "_tenant_cache", "unset")
+        if cached != "unset":
+            return cached
+        tenant = None
+        try:
+            pub = (self.api_key or "").split(":")[0]
+            resp = requests.get(
+                f"{self.api_url}/api-keys", headers=self._headers(), timeout=15
+            )
+            if resp.status_code == 200:
+                for item in resp.json():
+                    if item.get("public_key") == pub:
+                        tenant = item.get("tenant") or None
+                        break
+        except Exception:
+            tenant = None
+        self._tenant_cache = tenant
+        return tenant
+
     def list_agents(self) -> list[dict]:
         """List available agents."""
         return [
@@ -242,9 +270,16 @@ class HeadLabsClient:
         resp_json = resp.json()
         exec_id = resp_json.get("exec_id")
         # Tenant priority: explicit override (config/--tenant) > value echoed
-        # by the server > platform. The /chat endpoint may omit tenant_id, and
-        # polling with the wrong tenant returns 404.
-        poll_tenant = tenant_id or resp_json.get("tenant_id") or "platform"
+        # by the server > tenant resolved from the API key > platform. The
+        # /chat endpoint does not echo tenant_id, so we resolve it from the
+        # key itself instead of blindly defaulting to platform (which would
+        # query the wrong tenant's executions and 404).
+        poll_tenant = (
+            tenant_id
+            or resp_json.get("tenant_id")
+            or self.resolve_tenant()
+            or "platform"
+        )
         if not exec_id:
             yield {"type": "error", "error": "No exec_id returned"}
             return
