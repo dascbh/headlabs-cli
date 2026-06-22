@@ -387,11 +387,8 @@ class HeadLabsClient:
             try:
                 body = self.get_events(stream, since, poll_tenant)
                 for ev in body.get("events", []):
-                    etype = ev.get("type")
-                    if etype == "tool_use":
-                        yield {"type": "tool_use", "tool": ev.get("label") or ev.get("tool")}
-                    elif etype in ("status", "step", "thinking"):
-                        yield {"type": "status", "message": ev.get("label", "")}
+                    if ev.get("type") in ("tool_use", "status", "step", "thinking"):
+                        yield {"type": "progress", "event": ev}
                 since = body.get("last_seq", since)
                 status = body.get("status")
             except Exception:

@@ -170,6 +170,7 @@ def cmd_chat(args):
     CLIENT's account — not the HeadLabs platform account."""
     import uuid
     from headlabs.client import HeadLabsClient
+    from headlabs.progress import ProgressReporter
 
     client = HeadLabsClient()
     session_id = str(uuid.uuid4())
@@ -223,48 +224,42 @@ def cmd_chat(args):
             if user_input in ("/exit", "/quit"):
                 break
 
-            sys.stdout.write("Agent: ")
-            sys.stdout.flush()
-            answer_parts = []
+            # Reuse the same live renderer as `run`: dimmed tool lines with
+            # elapsed time, detail sub-items, spinner — TTY-aware.
+            reporter = ProgressReporter(
+                quiet=getattr(args, "quiet", False),
+                verbose=getattr(args, "verbose", False),
+            )
+            reporter.begin_wait("Pensando…")
+            answer, err = None, None
             try:
                 for event in client.chat_stream(agent_id, session_id, user_input,
                                                  context=context, history=history,
                                                  tenant_id=tenant_id):
-                    ev_type = event.get("type", "")
-                    if ev_type == "token":
-                        sys.stdout.write(event.get("content", ""))
-                        sys.stdout.flush()
-                        answer_parts.append(event.get("content", ""))
-                    elif ev_type == "tool_use":
-                        sys.stdout.write(f"\n  - {event.get('tool', '?')}")
-                        sys.stdout.flush()
-                    elif ev_type == "status":
-                        msg = event.get("message", "")
-                        if msg:
-                            sys.stdout.write(f"\n  · {msg}")
-                            sys.stdout.flush()
-                    elif ev_type == "done":
-                        msg = event.get("message", "")
-                        if msg:
-                            sys.stdout.write(("\n" if answer_parts else "") + msg)
-                            answer_parts.append(msg)
-                        sys.stdout.write("\n")
-                        sys.stdout.flush()
-                    elif ev_type == "error":
-                        sys.stdout.write(f"\n  x Error: {event.get('error', '?')}\n")
-                        sys.stdout.flush()
-                print()
-                # Persist the turn so the next message has conversation context
-                answer = "".join(answer_parts).strip()
-                if answer:
-                    history.append({"role": "user", "content": user_input})
-                    history.append({"role": "assistant", "content": answer})
-                    history = history[-20:]  # cap context window
+                    etype = event.get("type", "")
+                    if etype == "progress":
+                        reporter.event(event["event"])
+                    elif etype == "done":
+                        answer = event.get("message", "")
+                    elif etype == "error":
+                        err = event.get("error", "?")
+                reporter.finish("failed" if err else "succeeded")
             except KeyboardInterrupt:
-                print("\n")
+                reporter.finish("cancelled")
+                print()
                 continue
             except Exception as exc:
-                print(f"\n  x {exc}")
+                reporter.finish("failed")
+                print(f"  x {exc}")
+                continue
+
+            if err:
+                print(f"  x Error: {err}")
+            elif answer:
+                print(f"\nAgent: {answer}\n")
+                history.append({"role": "user", "content": user_input})
+                history.append({"role": "assistant", "content": answer})
+                history = history[-20:]  # cap context window
     except KeyboardInterrupt:
         pass
     print("\nChat ended.")
