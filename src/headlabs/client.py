@@ -243,18 +243,18 @@ class HeadLabsClient:
         result.account_id = result.account_id or account_id
         return result
 
-    def resolve_tenant(self) -> str | None:
+    def resolve_tenant(self, refresh: bool = False) -> str | None:
         """Resolve the tenant that owns the configured API key.
 
         The tenant is a property of the key itself, so it must never be
         guessed. Uses ``GET /api-keys/me``, which returns the tenant for the
         calling key only (no listing, no cross-tenant exposure). The result is
-        cached for the client's lifetime. Returns ``None`` only when it
-        genuinely cannot be determined (endpoint unavailable, or an admin key
-        with no bound tenant).
+        cached for the client's lifetime (``refresh=True`` re-queries). Returns
+        ``None`` only when it genuinely cannot be determined (endpoint
+        unavailable, or an admin key with no bound tenant).
         """
         cached = getattr(self, "_tenant_cache", "unset")
-        if cached != "unset":
+        if cached != "unset" and not refresh:
             return cached
         tenant = None
         try:
@@ -380,8 +380,12 @@ class HeadLabsClient:
 
         # Consume the live event stream: yield tool_use/status progress as it
         # arrives, then the final answer from the execution output.
+        terminal = ("succeeded", "partial", "failed", "dlq",
+                    "timed_out", "cancelled", "rejected")
         since = 0
         deadline = _time.time() + 480
+        notfound = 0
+        retried_tenant = False
         while _time.time() < deadline:
             status = None
             try:
@@ -391,26 +395,43 @@ class HeadLabsClient:
                         yield {"type": "progress", "event": ev}
                 since = body.get("last_seq", since)
                 status = body.get("status")
+                notfound = 0
+            except requests.HTTPError as exc:
+                if getattr(exc.response, "status_code", None) == 404:
+                    # Almost always a tenant mismatch: the execution lives under
+                    # a different tenant than we're polling. Recover by
+                    # re-resolving the key's tenant once; otherwise fail fast
+                    # with a clear message instead of silently timing out.
+                    if not retried_tenant:
+                        retried_tenant = True
+                        fresh = self.resolve_tenant(refresh=True)
+                        if fresh and fresh != poll_tenant:
+                            poll_tenant = fresh
+                            continue
+                    notfound += 1
+                    if notfound >= 3:
+                        yield {"type": "error",
+                               "error": (f"Execução não encontrada no tenant "
+                                         f"'{poll_tenant}'. Passe --tenant <id> "
+                                         f"ou configure 'tenant' no config.")}
+                        return
+                    _time.sleep(1.5)
+                    continue
+                status = None
             except Exception:
                 status = None
-            if status is None:
-                try:
-                    status = self._get_execution(exec_id, poll_tenant).get("status")
-                except Exception:
-                    status = None
-            if status == "succeeded":
+
+            if status in terminal:
                 data = self._get_execution(exec_id, poll_tenant)
                 raw = data.get("output", "{}")
                 output = json.loads(raw) if isinstance(raw, str) else (raw or {})
-                msg = output.get("answer") or output.get("response") or output.get("message") or str(output)
-                yield {"type": "done", "message": msg}
-                return
-            if status in ("failed", "dlq", "timed_out", "cancelled", "rejected"):
-                data = self._get_execution(exec_id, poll_tenant)
-                raw = data.get("output", "{}")
-                output = json.loads(raw) if isinstance(raw, str) else (raw or {})
-                err = output.get("error") if isinstance(output, dict) else None
-                yield {"type": "error", "error": err or f"Agent {status}"}
+                if status in ("succeeded", "partial"):
+                    msg = (output.get("answer") or output.get("response")
+                           or output.get("message") or str(output))
+                    yield {"type": "done", "message": msg}
+                else:
+                    err = output.get("error") if isinstance(output, dict) else None
+                    yield {"type": "error", "error": err or f"Agent {status}"}
                 return
             _time.sleep(1.5)
-        yield {"type": "error", "error": "Timeout waiting for response"}
+        yield {"type": "error", "error": "Timeout waiting for response (>480s)"}
