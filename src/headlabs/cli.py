@@ -15,6 +15,7 @@ from headlabs.agents.registry import AGENT_REGISTRY
 def cmd_run(args):
     """Run an agent."""
     from headlabs.client import HeadLabsClient
+    from headlabs.progress import ProgressReporter
 
     agent_name = args.agent
     # Accept either a friendly registry name (e.g. "finops") or a platform
@@ -31,11 +32,15 @@ def cmd_run(args):
     if args.account_id:
         kwargs["account_id"] = args.account_id
 
-    print(f"Running {agent_name} agent (profile: {args.profile}, days: {args.days})...")
-    result = client.run(agent_id, args.profile, **kwargs)
+    reporter = ProgressReporter(
+        quiet=getattr(args, "quiet", False),
+        verbose=getattr(args, "verbose", False),
+    )
+    reporter.header(f"{agent_id}  ·  {args.profile}  ·  {args.days}d")
+    result = client.run(agent_id, args.profile, reporter=reporter, **kwargs)
 
     if result.status == "timeout":
-        print("❌ Agent timed out (>5 min). Try again or check headlabs.ai dashboard.")
+        print("❌ Agent timed out. Try again or check headlabs.ai dashboard.")
         sys.exit(1)
     if result.status == "failed":
         print(f"❌ Agent failed: {result.summary[:150] if result.summary else 'unknown'}")
@@ -55,9 +60,7 @@ def cmd_run(args):
     saving = result.total_saving_usd
     print(f"Report saved: {html_path}")
     print(f"  JSON: {json_path}")
-    if result.status == "failed":
-        print(f"  ⚠️  Agent failed: {result.summary[:100] if result.summary else 'unknown error'}")
-    elif n_insights:
+    if n_insights:
         print(f"  {n_insights} findings | ${saving:,.0f}/mo potential savings")
     if not args.no_browser:
         pass  # Reports saved locally; open manually if needed
@@ -233,12 +236,17 @@ def cmd_chat(args):
                         sys.stdout.flush()
                         answer_parts.append(event.get("content", ""))
                     elif ev_type == "tool_use":
-                        sys.stdout.write(f"\n  🔧 {event.get('tool', '?')}...")
+                        sys.stdout.write(f"\n  🔧 {event.get('tool', '?')}")
                         sys.stdout.flush()
+                    elif ev_type == "status":
+                        msg = event.get("message", "")
+                        if msg:
+                            sys.stdout.write(f"\n  • {msg}")
+                            sys.stdout.flush()
                     elif ev_type == "done":
                         msg = event.get("message", "")
                         if msg:
-                            sys.stdout.write(msg)
+                            sys.stdout.write(("\n" if answer_parts else "") + msg)
                             answer_parts.append(msg)
                         sys.stdout.write("\n")
                         sys.stdout.flush()
@@ -294,6 +302,8 @@ def main():
     p_run.add_argument("--account-id", help="Target AWS account ID (defaults to profile's account)")
     p_run.add_argument("--days", type=int, default=30, help="Days of data to analyze")
     p_run.add_argument("--question", help="Ask a specific question")
+    p_run.add_argument("--quiet", action="store_true", help="Suppress progress output")
+    p_run.add_argument("--verbose", action="store_true", help="Show every progress event")
     p_run.add_argument("--output", choices=["json", "html", "md"], default="html", help="Output format")
     p_run.add_argument("--no-browser", action="store_true", help="Don't open browser")
     p_run.set_defaults(func=cmd_run)

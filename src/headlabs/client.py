@@ -23,6 +23,23 @@ COLLECTOR_MAP = {
 }
 
 
+def _collected_summary(collected: dict) -> str:
+    """Short human summary of locally-collected data for the progress line."""
+    if not isinstance(collected, dict):
+        return ""
+    parts = []
+    svcs = collected.get("top_services")
+    if isinstance(svcs, dict) and svcs:
+        parts.append(f"{len(svcs)} serviços")
+    accts = collected.get("by_account")
+    if isinstance(accts, dict) and accts:
+        parts.append(f"{len(accts)} contas")
+    total = collected.get("total_usd")
+    if isinstance(total, (int, float)):
+        parts.append(f"${total:,.0f}")
+    return " · ".join(parts)
+
+
 class HeadLabsClient:
     """Client for the HeadLabs AI Platform API."""
 
@@ -37,13 +54,17 @@ class HeadLabsClient:
             "Content-Type": "application/json",
         }
 
-    def invoke(self, agent_id: str, input_data: dict) -> tuple[str, str]:
-        """Invoke an agent. Returns (exec_id, tenant_id).
+    # Terminal execution states: succeeded plus the failure family.
+    _TERMINAL = ("succeeded", "failed", "dlq", "timed_out", "cancelled", "rejected", "partial")
+
+    def invoke(self, agent_id: str, input_data: dict) -> tuple[str, str, str]:
+        """Invoke an agent. Returns (exec_id, tenant_id, stream_id).
 
         The execution is created under the tenant that owns the API key; the
         server echoes that tenant in the response, and it MUST be supplied as
-        the ``tenant_id`` query param when polling the execution. Defaults to
-        ``platform`` only if the server omits it.
+        the ``tenant_id`` query param when polling. ``stream_id`` is the id to
+        poll for progress events (``root_trace_id``, which equals ``exec_id``
+        for non-map executions).
         """
         resp = requests.post(
             f"{self.api_url}/agents/{agent_id}/invoke",
@@ -53,58 +74,127 @@ class HeadLabsClient:
         )
         resp.raise_for_status()
         data = resp.json()
-        return data["exec_id"], data.get("tenant_id", "platform")
+        exec_id = data["exec_id"]
+        tenant_id = data.get("tenant_id", "platform")
+        stream_id = data.get("root_trace_id") or exec_id
+        return exec_id, tenant_id, stream_id
 
-    def poll(self, exec_id: str, timeout: int = 600, tenant_id: str = "platform") -> Result:
+    def get_events(self, stream_id: str, since: int = 0,
+                   tenant_id: str = "platform") -> dict:
+        """Fetch progress events for an execution stream since ``since`` seq.
+
+        Returns ``{exec_id, status, events: [...], last_seq}``. Each event has
+        ``seq, ts, type, label, tool?, level``.
+        """
+        resp = requests.get(
+            f"{self.api_url}/executions/{stream_id}/events"
+            f"?since={since}&tenant_id={tenant_id}",
+            headers=self._headers(),
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def _get_execution(self, exec_id: str, tenant_id: str) -> dict:
+        resp = requests.get(
+            f"{self.api_url}/executions/{exec_id}?tenant_id={tenant_id}",
+            headers=self._headers(),
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    @staticmethod
+    def _result_from_execution(data: dict) -> Result:
+        status = data.get("status")
+        raw = data.get("output", "{}")
+        output = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        norm = "succeeded" if status == "succeeded" else "failed"
+        default_summary = "" if status == "succeeded" else f"Execution {status}"
+        if status == "dlq":
+            default_summary = "Execution sent to dead-letter queue after retries"
+        elif status == "timed_out":
+            default_summary = "Execution timed out"
+        elif status == "cancelled":
+            default_summary = "Execution cancelled by operator"
+        elif status == "rejected":
+            default_summary = "Execution rejected at approval gate"
+        return Result(
+            status=norm,
+            raw_output=output,
+            insights=output.get("insights", []) if isinstance(output, dict) else [],
+            summary=(output.get("summary") if isinstance(output, dict) else None) or default_summary,
+            total_saving_usd=output.get("total_saving_usd", 0.0) if isinstance(output, dict) else 0.0,
+            account_id=output.get("account_id", "") if isinstance(output, dict) else "",
+            cost_summary=output.get("cost_summary", {}) if isinstance(output, dict) else {},
+        )
+
+    def poll(self, exec_id: str, timeout: int = 600, tenant_id: str = "platform",
+             stream_id: str | None = None, reporter=None) -> Result:
         """Poll for execution result.
 
         ``tenant_id`` must match the tenant the execution was created under
-        (returned by :meth:`invoke`). Using the wrong tenant returns 404.
+        (returned by :meth:`invoke`); the wrong tenant returns 404. When a
+        ``reporter`` is supplied, live progress events are consumed from the
+        event stream and rendered as they arrive; otherwise this falls back to
+        plain status polling (with ``.`` heartbeat) for SDK/library use.
         """
+        stream = stream_id or exec_id
+        since = 0
         deadline = time.time() + timeout
+        if reporter is not None:
+            reporter.begin_wait()
+        final_status = None
         while time.time() < deadline:
-            resp = requests.get(
-                f"{self.api_url}/executions/{exec_id}?tenant_id={tenant_id}",
-                headers=self._headers(),
-                timeout=15,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            status = data.get("status")
-            # Terminal states: succeeded plus the failure family (failed/dlq/timed_out/cancelled/rejected).
-            if status in ("succeeded", "failed", "dlq", "timed_out", "cancelled", "rejected"):
-                raw = data.get("output", "{}")
-                output = json.loads(raw) if isinstance(raw, str) else (raw or {})
-                norm = "succeeded" if status == "succeeded" else "failed"
-                default_summary = "" if status == "succeeded" else f"Execution {status}"
-                if status == "dlq":
-                    default_summary = "Execution sent to dead-letter queue after retries"
-                elif status == "timed_out":
-                    default_summary = "Execution timed out"
-                elif status == "cancelled":
-                    default_summary = "Execution cancelled by operator"
-                elif status == "rejected":
-                    default_summary = "Execution rejected at approval gate"
-                return Result(
-                    status=norm,
-                    raw_output=output,
-                    insights=output.get("insights", []) if isinstance(output, dict) else [],
-                    summary=(output.get("summary") if isinstance(output, dict) else None) or default_summary,
-                    total_saving_usd=output.get("total_saving_usd", 0.0) if isinstance(output, dict) else 0.0,
-                    account_id=output.get("account_id", "") if isinstance(output, dict) else "",
-                    cost_summary=output.get("cost_summary", {}) if isinstance(output, dict) else {},
-                )
-            time.sleep(5)
-            print(".", end="", flush=True)
-        print()
-        return Result(status="timeout")
+            status = None
+            if reporter is not None:
+                # Drive both rendering and terminal detection off the event
+                # stream (it returns status alongside the events).
+                try:
+                    body = self.get_events(stream, since, tenant_id)
+                    for ev in body.get("events", []):
+                        reporter.event(ev)
+                    since = body.get("last_seq", since)
+                    status = body.get("status")
+                except Exception:
+                    status = None
+            if status is None:
+                # No reporter, or events unavailable: read execution status.
+                try:
+                    status = self._get_execution(exec_id, tenant_id).get("status")
+                except Exception:
+                    status = None
+            if status in self._TERMINAL:
+                final_status = status
+                break
+            time.sleep(1.5 if reporter is not None else 5)
+            if reporter is None:
+                print(".", end="", flush=True)
 
-    def run(self, agent_id: str, aws_profile: str, **kwargs: Any) -> Result:
+        if final_status is None:
+            if reporter is not None:
+                reporter.finish("timeout")
+            else:
+                print()
+            return Result(status="timeout")
+
+        data = self._get_execution(exec_id, tenant_id)
+        result = self._result_from_execution(data)
+        if reporter is not None:
+            reporter.finish(final_status, result.summary)
+        else:
+            print()
+        return result
+
+    def run(self, agent_id: str, aws_profile: str, reporter=None, **kwargs: Any) -> Result:
         """Run an agent against the CLIENT's account.
 
         Data is collected LOCALLY using the client's AWS profile (credentials
         never leave the machine), then the collected summary is sent to the
         agent for analysis. This is the documented security model.
+
+        When ``reporter`` is provided, local phases and the agent's live
+        progress events are rendered as the run proceeds.
         """
         import boto3
 
@@ -115,6 +205,8 @@ class HeadLabsClient:
         sts = session.client("sts")
         identity = sts.get_caller_identity()
         account_id = kwargs.pop("account_id", None) or identity["Account"]
+        if reporter is not None:
+            reporter.phase("Perfil AWS resolvido", account_id)
 
         # Pick the collector for this agent and gather data with the client's
         # credentials. Agents without a dedicated collector use GenericCollector.
@@ -125,6 +217,8 @@ class HeadLabsClient:
         collector_name = agent_cfg.get("collector") if agent_cfg else None
         collector_cls = COLLECTOR_MAP.get(collector_name, GenericCollector)
         collected = collector_cls(session).collect(**kwargs)
+        if reporter is not None:
+            reporter.phase("Dados coletados", _collected_summary(collected))
 
         # Build input in the format the agent expects, INCLUDING the data
         # collected locally against the client's account.
@@ -139,10 +233,13 @@ class HeadLabsClient:
         if account_id:
             input_data["account_id"] = account_id
 
-        print(f"  Account: {account_id}")
-        exec_id, tenant_id = self.invoke(agent_id, input_data)
-        print(f"  Exec: {exec_id[:8]}...")
-        result = self.poll(exec_id, tenant_id=tenant_id)
+        exec_id, tenant_id, stream_id = self.invoke(agent_id, input_data)
+        if reporter is not None:
+            reporter.invoked(exec_id)
+        else:
+            print(f"  Account: {account_id}")
+            print(f"  Exec: {exec_id[:8]}...")
+        result = self.poll(exec_id, tenant_id=tenant_id, stream_id=stream_id, reporter=reporter)
         result.account_id = result.account_id or account_id
         return result
 
@@ -253,7 +350,6 @@ class HeadLabsClient:
         /chat endpoint may not echo the tenant, so callers can pass it
         explicitly (e.g. from config/--tenant) for non-platform tenants.
         """
-        import sys
         import time as _time
 
         resp = requests.post(
@@ -277,32 +373,47 @@ class HeadLabsClient:
             or self.resolve_tenant()
             or "platform"
         )
+        stream = resp_json.get("root_trace_id") or exec_id
         if not exec_id:
             yield {"type": "error", "error": "No exec_id returned"}
             return
 
-        # Poll for result
+        # Consume the live event stream: yield tool_use/status progress as it
+        # arrives, then the final answer from the execution output.
+        since = 0
         deadline = _time.time() + 480
         while _time.time() < deadline:
-            r = requests.get(
-                f"{self.api_url}/executions/{exec_id}?tenant_id={poll_tenant}",
-                headers=self._headers(), timeout=15)
-            if r.status_code == 200:
-                data = r.json()
-                if data.get("status") == "succeeded":
-                    raw = data.get("output", "{}")
-                    output = json.loads(raw) if isinstance(raw, str) else (raw or {})
-                    msg = output.get("answer") or output.get("response") or output.get("message") or str(output)
-                    yield {"type": "done", "message": msg}
-                    return
-                elif data.get("status") in ("failed", "dlq", "timed_out"):
-                    status = data.get("status")
-                    raw = data.get("output", "{}")
-                    output = json.loads(raw) if isinstance(raw, str) else (raw or {})
-                    err = output.get("error") if isinstance(output, dict) else None
-                    yield {"type": "error", "error": err or f"Agent {status}"}
-                    return
-            _time.sleep(2)
-            sys.stdout.write(".")
-            sys.stdout.flush()
+            status = None
+            try:
+                body = self.get_events(stream, since, poll_tenant)
+                for ev in body.get("events", []):
+                    etype = ev.get("type")
+                    if etype == "tool_use":
+                        yield {"type": "tool_use", "tool": ev.get("label") or ev.get("tool")}
+                    elif etype in ("status", "step", "thinking"):
+                        yield {"type": "status", "message": ev.get("label", "")}
+                since = body.get("last_seq", since)
+                status = body.get("status")
+            except Exception:
+                status = None
+            if status is None:
+                try:
+                    status = self._get_execution(exec_id, poll_tenant).get("status")
+                except Exception:
+                    status = None
+            if status == "succeeded":
+                data = self._get_execution(exec_id, poll_tenant)
+                raw = data.get("output", "{}")
+                output = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                msg = output.get("answer") or output.get("response") or output.get("message") or str(output)
+                yield {"type": "done", "message": msg}
+                return
+            if status in ("failed", "dlq", "timed_out", "cancelled", "rejected"):
+                data = self._get_execution(exec_id, poll_tenant)
+                raw = data.get("output", "{}")
+                output = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                err = output.get("error") if isinstance(output, dict) else None
+                yield {"type": "error", "error": err or f"Agent {status}"}
+                return
+            _time.sleep(1.5)
         yield {"type": "error", "error": "Timeout waiting for response"}
