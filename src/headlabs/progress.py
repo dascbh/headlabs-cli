@@ -28,6 +28,7 @@ _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 _DIM = "\033[2m"
 _RESET = "\033[0m"
+_BOLD = "\033[1m"
 _GREEN = "\033[32m"
 _RED = "\033[31m"
 _CYAN = "\033[36m"
@@ -209,6 +210,56 @@ class ProgressReporter:
             self._println(f"  {self._dot(_YELLOW)} Cancelado após {elapsed}")
         else:
             self._println(f"  {self._dot(_RED)} {status} após {elapsed}{tools}")
+
+    def summary(self, *, text: Optional[str] = None, findings: Optional[list] = None,
+                savings: Optional[float] = None, reports: Optional[list] = None,
+                max_findings: int = 10) -> None:
+        """Render a final summary block after completion: executive summary,
+        top findings (by savings) with severity dot, total savings, reports."""
+        if self.quiet:
+            return
+        import textwrap
+
+        def b(s: str) -> str:
+            return f"{_BOLD}{s}{_RESET}" if self.tty else s
+
+        def dim(s: str) -> str:
+            return f"{_DIM}{s}{_RESET}" if self.tty else s
+
+        self._println("")
+        if text:
+            self._println(f"  {b('Resumo')}")
+            for ln in textwrap.wrap(str(text).strip(), width=78):
+                self._println(f"    {ln}")
+            self._println("")
+
+        findings = findings or []
+        if findings:
+            def sv(f):
+                try:
+                    return float(f.get("saving_usd") or 0)
+                except (TypeError, ValueError):
+                    return 0.0
+            ordered = sorted(findings, key=sv, reverse=True)
+            shown = ordered[:max_findings]
+            self._println(f"  {b('Principais achados')} ({len(findings)})")
+            sev_color = {"critical": _RED, "high": _YELLOW, "medium": _YELLOW, "low": _DIM}
+            for f in shown:
+                sev = (f.get("severity") or "info").lower()
+                title = f.get("title") or f.get("finding") or f.get("description") or ""
+                dot = self._dot(sev_color.get(sev, _CYAN))
+                s = sv(f)
+                tail = dim(f"   ${s:,.0f}/mo") if s else ""
+                self._println(f"  {dot} [{sev.upper()}] {title}{tail}")
+            if len(findings) > len(shown):
+                self._println(f"    {dim(f'+{len(findings) - len(shown)} mais')}")
+            self._println("")
+
+        if savings:
+            line = f"Economia potencial: ${savings:,.0f}/mês"
+            self._println(f"  {_GREEN}{line}{_RESET}" if self.tty else f"  {line}")
+        for r in (reports or []):
+            self._println(f"  {dim('Relatório: ' + r)}")
 
     # ── internals ────────────────────────────────────────────────────────────
 

@@ -55,15 +55,17 @@ def cmd_run(args):
     result.to_html(html_path)
     result.to_json(json_path)
 
-    # Print summary
-    n_insights = len(result.insights)
-    saving = result.total_saving_usd
-    print(f"Report saved: {html_path}")
-    print(f"  JSON: {json_path}")
-    if n_insights:
-        print(f"  {n_insights} findings | ${saving:,.0f}/mo potential savings")
-    if not args.no_browser:
-        pass  # Reports saved locally; open manually if needed
+    # Final summary block (suppressed under --quiet, where we just emit paths).
+    if getattr(args, "quiet", False):
+        print(html_path)
+        print(json_path)
+    else:
+        reporter.summary(
+            text=result.summary,
+            findings=result.insights,
+            savings=result.total_saving_usd,
+            reports=[html_path, json_path],
+        )
 
 
 def cmd_agents(args):
