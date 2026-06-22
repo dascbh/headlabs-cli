@@ -104,14 +104,20 @@ Reports are saved to `~/.headlabs/reports/`:
 
 ## Security
 
-Your AWS credentials **never leave your machine**. The CLI:
+The analysis always runs against **your** account, never HeadLabs' own. Per run, the CLI:
 
-1. Authenticates locally with your AWS profile (SSO/credentials)
-2. Collects aggregated cost data via Cost Explorer
-3. Sends only the summary to HeadLabs API for AI analysis
-4. Receives the report and renders it locally
+1. Authenticates locally with your AWS profile (SSO/credentials).
+2. Derives **short-lived session credentials** from that profile — existing
+   temporary credentials (SSO/assumed role) are forwarded as-is; static IAM
+   keys are exchanged for a fresh STS session token.
+3. Sends those ephemeral credentials plus your account ID to the HeadLabs
+   agent, which runs the analysis against your account and **stores nothing**.
+4. Receives the report and renders it locally.
 
-No access keys, secrets, or session tokens are transmitted.
+**Long-lived access keys are never transmitted** — only short-lived session
+credentials scoped to the run. Credentials are never logged or persisted by
+the platform. If no credentials are available, the agent **fails closed** (no
+analysis) rather than touching any other account.
 
 ## SDK Usage (Python)
 

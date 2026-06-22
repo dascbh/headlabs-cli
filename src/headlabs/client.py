@@ -40,6 +40,52 @@ def _collected_summary(collected: dict) -> str:
     return " · ".join(parts)
 
 
+def _ephemeral_credentials(session) -> dict | None:
+    """Short-lived AWS credentials for the agent to read the CLIENT's account.
+
+    Option B: the agent runs on HeadLabs infrastructure but accesses the
+    client's account using these credentials, then stores nothing. We never
+    transmit long-lived keys:
+
+    - SSO / assumed-role profiles already carry a session token (temporary) —
+      forward as-is.
+    - Static IAM-user keys: mint a short-lived session via STS GetSessionToken
+      so the long-lived key never leaves the machine.
+
+    Returns ``{aws_access_key_id, aws_secret_access_key, aws_session_token?}``
+    or ``None`` if no credentials are available.
+    """
+    try:
+        creds = session.get_credentials()
+        if creds is None:
+            return None
+        frozen = creds.get_frozen_credentials()
+        if frozen.token:
+            return {
+                "aws_access_key_id": frozen.access_key,
+                "aws_secret_access_key": frozen.secret_key,
+                "aws_session_token": frozen.token,
+            }
+        # Static long-lived keys: exchange for a short-lived session token.
+        try:
+            tok = session.client("sts").get_session_token(
+                DurationSeconds=3600
+            )["Credentials"]
+            return {
+                "aws_access_key_id": tok["AccessKeyId"],
+                "aws_secret_access_key": tok["SecretAccessKey"],
+                "aws_session_token": tok["SessionToken"],
+            }
+        except Exception:
+            # Best effort: forward static keys (no token). Caller should warn.
+            return {
+                "aws_access_key_id": frozen.access_key,
+                "aws_secret_access_key": frozen.secret_key,
+            }
+    except Exception:
+        return None
+
+
 class HeadLabsClient:
     """Client for the HeadLabs AI Platform API."""
 
@@ -189,9 +235,11 @@ class HeadLabsClient:
     def run(self, agent_id: str, aws_profile: str, reporter=None, **kwargs: Any) -> Result:
         """Run an agent against the CLIENT's account.
 
-        Data is collected LOCALLY using the client's AWS profile (credentials
-        never leave the machine), then the collected summary is sent to the
-        agent for analysis. This is the documented security model.
+        Option B (client-side credential management): short-lived session
+        credentials are derived from the operator's LOCAL AWS profile and sent
+        to the ephemeral agent, which reads the client's account and stores
+        nothing. Long-lived keys never leave the machine. Without credentials
+        the agent fails closed server-side (it never touches another account).
 
         When ``reporter`` is provided, local phases and the agent's live
         progress events are rendered as the run proceeds.
@@ -208,30 +256,29 @@ class HeadLabsClient:
         if reporter is not None:
             reporter.phase("Perfil AWS resolvido", account_id)
 
-        # Pick the collector for this agent and gather data with the client's
-        # credentials. Agents without a dedicated collector use GenericCollector.
-        agent_cfg = next(
-            (cfg for cfg in AGENT_REGISTRY.values() if cfg.get("agent_id") == agent_id),
-            None,
-        )
-        collector_name = agent_cfg.get("collector") if agent_cfg else None
-        collector_cls = COLLECTOR_MAP.get(collector_name, GenericCollector)
-        collected = collector_cls(session).collect(**kwargs)
+        # Derive short-lived credentials for the agent to read this account.
+        creds = _ephemeral_credentials(session)
         if reporter is not None:
-            reporter.phase("Dados coletados", _collected_summary(collected))
+            if creds and creds.get("aws_session_token"):
+                reporter.phase("Credenciais temporárias preparadas")
+            elif creds:
+                reporter.phase("Credenciais preparadas", "estáticas (sem session token)")
+            else:
+                reporter.phase("Sem credenciais AWS", "a execução pode ser bloqueada")
 
-        # Build input in the format the agent expects, INCLUDING the data
-        # collected locally against the client's account.
+        # Build the agent input: account + short-lived credentials. The agent
+        # fetches live data itself using these (no local collection needed).
         input_data = {
             "tenant_id": "ALL",
             "lookback_days": kwargs.get("days", 30),
             "aws_region": session.region_name or "us-east-1",
-            "collected_data": collected,
         }
-        if kwargs.get("question"):
-            input_data["question"] = kwargs["question"]
         if account_id:
             input_data["account_id"] = account_id
+        if creds:
+            input_data.update(creds)
+        if kwargs.get("question"):
+            input_data["question"] = kwargs["question"]
 
         exec_id, tenant_id, stream_id = self.invoke(agent_id, input_data)
         if reporter is not None:

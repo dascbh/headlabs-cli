@@ -181,26 +181,25 @@ def cmd_chat(args):
     agent_cfg = AGENT_REGISTRY.get(args.agent)
     agent_id = agent_cfg["chat_agent_id"] if agent_cfg and "chat_agent_id" in agent_cfg else args.agent
 
-    # Resolve account + region from the AWS profile, and collect data LOCALLY
-    # with the client's credentials (credentials stay local). The collected
-    # data is sent to the agent so it reasons over the CLIENT's account.
+    # Resolve account + region from the AWS profile and derive short-lived
+    # credentials so the ephemeral agent reads the CLIENT's account (Option B).
+    # Long-lived keys never leave the machine; without creds the agent fails
+    # closed server-side.
     agent_input = {"tenant_id": "ALL", "aws_region": "us-east-1"}
     try:
         import boto3
-        from headlabs.client import COLLECTOR_MAP, GenericCollector
+        from headlabs.client import _ephemeral_credentials
         session = boto3.Session(profile_name=args.profile)
         agent_input["aws_region"] = session.region_name or "us-east-1"
         identity = session.client("sts").get_caller_identity()
         agent_input["account_id"] = identity["Account"]
         print(f"Account: {identity['Account']} (profile: {args.profile})")
 
-        # Pick the collector for this agent and gather data with the client's
-        # session. Agents without a dedicated collector use GenericCollector.
-        collector_name = agent_cfg.get("collector") if agent_cfg else None
-        collector_cls = COLLECTOR_MAP.get(collector_name, GenericCollector)
-        agent_input["collected_data"] = collector_cls(session).collect(
-            days=getattr(args, "days", 30)
-        )
+        creds = _ephemeral_credentials(session)
+        if creds:
+            agent_input.update(creds)
+        else:
+            print("! Sem credenciais AWS resolvidas — a execução pode ser bloqueada pelo agente.")
     except Exception as exc:
         print(f"! Could not resolve AWS profile '{args.profile}': {exc}")
 
