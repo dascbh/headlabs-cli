@@ -1,6 +1,7 @@
 # HeadLabs CLI
 
-Run AI agents on your AWS accounts. Credentials stay local, analysis runs on HeadLabs AI.
+Run AI agents on your AWS accounts. Short-lived session credentials are derived
+locally per run; the analysis runs on HeadLabs AI against **your** account.
 
 ## Prerequisites
 
@@ -27,7 +28,9 @@ pip install -e .
 headlabs config --key YOUR_API_KEY
 ```
 
-This saves to `~/.headlabs/config.json`.
+This saves to `~/.headlabs/config.json`. You can also set optional fields there:
+`api_url` (override the API endpoint) and `tenant` (a default tenant override
+for `chat`).
 
 ## Commands
 
@@ -35,17 +38,63 @@ This saves to `~/.headlabs/config.json`.
 
 ```bash
 headlabs run finops --profile my-aws-profile
-headlabs run finops --profile production --days 60
+headlabs run finops-advisor --profile production --days 60
 headlabs run finops --profile staging --question "por que Lambda está caro?"
-headlabs run finops --profile prod --output json --no-browser
+headlabs run threat-detector --profile prod --quiet
 ```
+
+The agent name accepts a friendly alias (`finops`) or the platform agent id
+(`finops-advisor`).
 
 Options:
 - `--profile` — AWS CLI profile (SSO or credentials)
+- `--account-id` — target AWS account ID (defaults to the profile's account)
 - `--days` — lookback period (default: 30)
 - `--question` — specific question for the analyst
-- `--output` — `html` (default), `json`, or `md`
-- `--no-browser` — don't auto-open the report
+- `--quiet` — suppress live progress (prints only the report paths)
+- `--verbose` — show every progress event
+
+Each run prints **live progress** as the agent works — local phases, the
+agent's reasoning (`● Thought for Ns`), each tool call with elapsed time, and a
+final summary with the top findings and potential savings:
+
+```
+finops-advisor  ·  production  ·  30d
+  ● Perfil AWS resolvido   123456789012
+  ● Credenciais temporárias preparadas
+  ● Agente invocado   exec ea428dd0
+  ● Thought for 7s
+      ╰ Maior gastador: EKS Extended Support em versão antiga do Kubernetes...
+  - discover_dimension_values   +00:12
+  - explore_costs   +00:14
+  ● Concluído em 03:58 · 52 tool calls
+
+  Resumo
+    ...
+
+  Principais achados (14)
+  ● [CRITICAL] EKS Extended Support ativo   $360/mo
+  ...
+  Economia potencial: $1,322/mês
+```
+
+A report (HTML + JSON) is always saved to `./reports/`.
+
+### Chat with an agent
+
+Interactive Q&A against your account, with the same live progress:
+
+```bash
+headlabs chat finops-advisor --profile my-aws-profile
+headlabs chat finops-advisor --profile cactus --tenant cactus-gaming
+```
+
+Options:
+- `--profile` — AWS CLI profile
+- `--tenant` — tenant override (normally resolved automatically from your API
+  key; only needed in edge cases)
+
+Type `/exit` or `/quit` (or Ctrl+C) to leave.
 
 ### List agents on the platform
 
@@ -96,11 +145,15 @@ headlabs report --last
 
 ## Output
 
-Reports are saved to `~/.headlabs/reports/`:
+Each run saves a report to `./reports/` (in the current directory):
 
-- **HTML** — dark theme, opens in browser, includes cost-by-account table and findings
-- **JSON** — structured data with `cost_summary.by_account[]` and `analysis.insights[]`
-- **Markdown** — for terminal/Slack/email
+- **HTML** — dark theme, opens in a browser; executive summary, cost-by-account
+  table, and findings.
+- **JSON** — structured `Result`: `status`, `summary`, `insights[]`
+  (each with `severity`, `title`, `finding`, `action`, `saving_usd`),
+  `total_saving_usd`, `account_id`, and `cost_summary`.
+
+Open the most recent report with `headlabs report --last`.
 
 ## Security
 
