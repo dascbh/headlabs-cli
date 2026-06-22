@@ -29,3 +29,9 @@ def get_api_key() -> str | None:
 
 def get_api_url() -> str:
     return load_config().get("api_url", DEFAULT_API_URL)
+
+
+def get_tenant() -> str | None:
+    """Optional tenant override (used to poll executions on the chat path,
+    where the server may not echo the tenant)."""
+    return load_config().get("tenant")

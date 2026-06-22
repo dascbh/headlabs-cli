@@ -37,8 +37,14 @@ class HeadLabsClient:
             "Content-Type": "application/json",
         }
 
-    def invoke(self, agent_id: str, input_data: dict) -> str:
-        """Invoke an agent and return execution ID."""
+    def invoke(self, agent_id: str, input_data: dict) -> tuple[str, str]:
+        """Invoke an agent. Returns (exec_id, tenant_id).
+
+        The execution is created under the tenant that owns the API key; the
+        server echoes that tenant in the response, and it MUST be supplied as
+        the ``tenant_id`` query param when polling the execution. Defaults to
+        ``platform`` only if the server omits it.
+        """
         resp = requests.post(
             f"{self.api_url}/agents/{agent_id}/invoke",
             json={"input": input_data},
@@ -46,14 +52,19 @@ class HeadLabsClient:
             timeout=30,
         )
         resp.raise_for_status()
-        return resp.json()["exec_id"]
+        data = resp.json()
+        return data["exec_id"], data.get("tenant_id", "platform")
 
-    def poll(self, exec_id: str, timeout: int = 600) -> Result:
-        """Poll for execution result."""
+    def poll(self, exec_id: str, timeout: int = 600, tenant_id: str = "platform") -> Result:
+        """Poll for execution result.
+
+        ``tenant_id`` must match the tenant the execution was created under
+        (returned by :meth:`invoke`). Using the wrong tenant returns 404.
+        """
         deadline = time.time() + timeout
         while time.time() < deadline:
             resp = requests.get(
-                f"{self.api_url}/executions/{exec_id}?tenant_id=platform",
+                f"{self.api_url}/executions/{exec_id}?tenant_id={tenant_id}",
                 headers=self._headers(),
                 timeout=15,
             )
@@ -129,9 +140,9 @@ class HeadLabsClient:
             input_data["account_id"] = account_id
 
         print(f"  Account: {account_id}")
-        exec_id = self.invoke(agent_id, input_data)
+        exec_id, tenant_id = self.invoke(agent_id, input_data)
         print(f"  Exec: {exec_id[:8]}...")
-        result = self.poll(exec_id)
+        result = self.poll(exec_id, tenant_id=tenant_id)
         result.account_id = result.account_id or account_id
         return result
 
@@ -209,8 +220,14 @@ class HeadLabsClient:
         return tools
 
     def chat_stream(self, agent_id: str, session_id: str, message: str,
-                    context: dict | None = None, history: list | None = None):
-        """Send chat message, poll for result, yield done event."""
+                    context: dict | None = None, history: list | None = None,
+                    tenant_id: str | None = None):
+        """Send chat message, poll for result, yield done event.
+
+        ``tenant_id`` overrides the tenant used to poll the execution. The
+        /chat endpoint may not echo the tenant, so callers can pass it
+        explicitly (e.g. from config/--tenant) for non-platform tenants.
+        """
         import sys
         import time as _time
 
@@ -222,7 +239,12 @@ class HeadLabsClient:
             timeout=30,
         )
         resp.raise_for_status()
-        exec_id = resp.json().get("exec_id")
+        resp_json = resp.json()
+        exec_id = resp_json.get("exec_id")
+        # Tenant priority: explicit override (config/--tenant) > value echoed
+        # by the server > platform. The /chat endpoint may omit tenant_id, and
+        # polling with the wrong tenant returns 404.
+        poll_tenant = tenant_id or resp_json.get("tenant_id") or "platform"
         if not exec_id:
             yield {"type": "error", "error": "No exec_id returned"}
             return
@@ -231,7 +253,7 @@ class HeadLabsClient:
         deadline = _time.time() + 480
         while _time.time() < deadline:
             r = requests.get(
-                f"{self.api_url}/executions/{exec_id}?tenant_id=platform",
+                f"{self.api_url}/executions/{exec_id}?tenant_id={poll_tenant}",
                 headers=self._headers(), timeout=15)
             if r.status_code == 200:
                 data = r.json()

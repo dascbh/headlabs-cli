@@ -200,6 +200,11 @@ def cmd_chat(args):
     context = {"input": agent_input}
     history = []  # client-side conversation history (user + assistant turns)
 
+    # Tenant used to poll the chat execution. The /chat endpoint may not echo
+    # the tenant, so resolve it from --tenant or config for non-platform keys.
+    from headlabs.config import get_tenant
+    tenant_id = getattr(args, "tenant", None) or get_tenant()
+
     print(f"💬 Chat with '{agent_id}' (session: {session_id[:8]}...)")
     print("   Type /exit or Ctrl+C to quit.\n")
 
@@ -219,7 +224,8 @@ def cmd_chat(args):
             answer_parts = []
             try:
                 for event in client.chat_stream(agent_id, session_id, user_input,
-                                                 context=context, history=history):
+                                                 context=context, history=history,
+                                                 tenant_id=tenant_id):
                     ev_type = event.get("type", "")
                     if ev_type == "token":
                         sys.stdout.write(event.get("content", ""))
@@ -325,6 +331,7 @@ def main():
     p_chat = sub.add_parser("chat", help="Interactive chat with an agent")
     p_chat.add_argument("agent", help="Agent ID")
     p_chat.add_argument("--profile", default="default", help="AWS profile name")
+    p_chat.add_argument("--tenant", help="Tenant ID for polling (defaults to config 'tenant', then 'platform')")
     p_chat.set_defaults(func=cmd_chat)
 
     # config
