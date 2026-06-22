@@ -364,12 +364,18 @@ class HeadLabsClient:
         return []
 
     def create_skill(self, skill_id: str, name: str, content: str) -> dict:
-        """Create or update a skill on the platform."""
-        resp = requests.put(
-            f"{self.api_url}/resources/skill/{skill_id}",
-            json={"name": name, "content": content},
+        """Create or update a skill on the platform (upsert)."""
+        resp = requests.post(
+            f"{self.api_url}/resources/skill",
+            json={"id": skill_id, "name": name, "content": content},
             headers=self._headers(), timeout=15,
         )
+        if resp.status_code == 409:  # already exists -> update
+            resp = requests.patch(
+                f"{self.api_url}/resources/skill/{skill_id}",
+                json={"name": name, "content": content},
+                headers=self._headers(), timeout=15,
+            )
         resp.raise_for_status()
         return resp.json()
 
