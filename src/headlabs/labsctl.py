@@ -313,6 +313,7 @@ def cmd_loops(args):
         "approve": _loops_approve, "reject": _loops_reject,
         "pause": _loops_pause, "resume": _loops_resume,
         "cancel": _loops_cancel, "retry": _loops_retry, "iterate": _loops_iterate,
+        "review": _loops_review, "panel": _loops_panel,
     }.get(sub, _loops_list)(args)
 
 
@@ -390,6 +391,12 @@ def _loops_status(args):
     if loop.get("pending_gate"):
         print(_c(f"\n⏸  Gate pendente: {loop['pending_gate']} — aprove com: "
                  f"headlabs loops approve {loop.get('loop_id')}", "yellow"))
+    ga = loop.get("gate_assessment")
+    if ga:
+        verds = "  ".join(f"{v.get('role')}={v.get('verdict')}({v.get('score')})" for v in ga.get("verdicts", []))
+        print(f"\n{_c('Banca', 'bold')} ({ga.get('gate')}): {_color_status(ga.get('recommendation',''))} "
+              f"(agg {ga.get('aggregate_score')})  ·  {verds}")
+        print(_c(f"   detalhe: headlabs loops panel {loop.get('loop_id')}", "dim"))
     res = loop.get("resources_created") or []
     if res:
         print(f"\n{_c('Recursos:', 'bold')} {', '.join(str(r) for r in res[:8])}")
@@ -462,6 +469,46 @@ def _loops_iterate(args):
 
 def _loops_watch(args):
     return _follow(HeadLabsClient(), args.job_id, watch=True, args=args)
+
+
+def _loops_review(args):
+    """Convene the senior review panel on the loop's gate artifact (async)."""
+    client = HeadLabsClient()
+    body = {}
+    if getattr(args, "reviewers", None):
+        body["reviewers"] = [r.strip() for r in args.reviewers.split(",") if r.strip()]
+    res = client.request("POST", f"/loops/{args.job_id}/review", json=body)
+    print(_c(f"⚖  Banca convocada · gate {res.get('gate')} · {', '.join(res.get('reviewers', []))}", "cyan"))
+    print(_c(f"   Parecer (assíncrono): headlabs loops panel {args.job_id}", "dim"))
+    if getattr(args, "watch", False):
+        return _follow(client, args.job_id, watch=True, args=args)
+
+
+def _loops_panel(args):
+    """Show the senior review panel's assessment for a loop."""
+    client = HeadLabsClient()
+    loop = _get_loop(client, args.job_id)
+    a = loop.get("gate_assessment")
+    ps = loop.get("panel_status")
+    if not a:
+        print(_c(f"Sem parecer da banca ainda (panel_status={ps or '-'}). "
+                 f"Convoque: headlabs loops review {args.job_id}", "dim"))
+        return
+    if getattr(args, "output", "table") == "json":
+        print(json.dumps(a, indent=2, default=str, ensure_ascii=False))
+        return
+    print(f"{_c('Banca de revisão', 'bold')} · gate {a.get('gate')} · "
+          f"recomendação: {_color_status(a.get('recommendation', ''))} "
+          f"(agregado {a.get('aggregate_score')})")
+    for v in a.get("verdicts", []):
+        print(f"  {_color_status(v.get('verdict', '')):<22} {v.get('role', ''):<12} "
+              f"score={v.get('score')}  skills={','.join(v.get('skills_used', []) or [])}")
+        for i in (v.get("issues") or [])[:6]:
+            sev = i.get("severity", "")
+            col = "red" if sev == "critical" else ("yellow" if sev in ("high", "medium") else "dim")
+            print(f"      {_c(sev, col)}: {_trunc(i.get('detail'), 96)}")
+        if v.get("error"):
+            print(f"      {_c('erro', 'red')}: {_trunc(v.get('error'), 90)}")
 
 
 # ── top-level status shortcut ─────────────────────────────────────────────────

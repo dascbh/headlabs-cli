@@ -566,6 +566,17 @@ def main():
     _add_common(oi, watch=True, tenant=True)
     oi.set_defaults(func=labsctl.cmd_loops, loops_cmd="iterate")
 
+    orv = loops_sub.add_parser("review", help="Convene the senior review panel on the gate")
+    orv.add_argument("job_id")
+    orv.add_argument("--reviewers", help="Competency seniors to convene (comma-sep): security,frontend,...")
+    _add_common(orv, watch=True, tenant=True)
+    orv.set_defaults(func=labsctl.cmd_loops, loops_cmd="review")
+
+    opn = loops_sub.add_parser("panel", help="Show the senior review panel's assessment")
+    opn.add_argument("job_id")
+    _add_common(opn)
+    opn.set_defaults(func=labsctl.cmd_loops, loops_cmd="panel")
+
     # ── status (top-level shortcut) ───────────────────────────────────────────
     p_status = sub.add_parser("status", help="Active builds (no arg) or a build's detail")
     p_status.add_argument("job_id", nargs="?", help="Build id (optional)")
