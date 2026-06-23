@@ -66,6 +66,11 @@ class ProgressReporter:
         self._start_ts: Optional[float] = None
         self._event_count = 0
         self._tool_count = 0
+        # Multi-agent: delegation depth per agent and the currently-active one,
+        # so events are indented under the agent that emitted them and handoffs
+        # render as a tree (forward-compatible: needs `agent`/`handoff` events).
+        self._agent_depth: dict = {}
+        self._current_agent: Optional[str] = None
 
     # ── local pipeline phases ────────────────────────────────────────────────
 
@@ -111,7 +116,13 @@ class ProgressReporter:
           indented sub-lines when the backend supplies a ``detail`` dict.
         - ``thinking``: ``● Thought for Ns`` with the reasoning as a ``╰``
           continuation (shown only when the backend emits thinking events).
+        - ``handoff``: one agent delegating to another (``→ delega para B``);
+          the target's later events are indented under it.
         - ``error`` (or level=error): a red dot line.
+
+        Events may carry an ``agent`` field; when the active agent changes a
+        header line is printed and the agent's events are indented by its
+        delegation depth (multi-agent team view).
         """
         etype = ev.get("type", "")
         level = ev.get("level", "info")
@@ -124,8 +135,15 @@ class ProgressReporter:
         elif etype in ("step", "thinking"):
             self._label = label
 
+        if etype == "handoff":
+            self._render_handoff(ev)
+            return
+
+        # Per-agent attribution: header on agent change + indent by depth.
+        pre = self._agent_prefix(ev)
+
         if level == "error" or etype == "error":
-            self._emit_block(f"  {self._dot(_RED)} {label}", self._detail_lines(ev))
+            self._emit_block(f"{pre}  {self._dot(_RED)} {label}", self._detail_lines(ev, pre))
             return
         if self.quiet:
             return
@@ -134,18 +152,54 @@ class ProgressReporter:
             name = tool or label
             el = _fmt_elapsed(time.time() - self._start_ts) if self._start_ts is not None else None
             if self.tty:
-                line = f"  {_DIM}- {name}" + (f"   +{el}" if el else "") + _RESET
+                line = f"{pre}  {_DIM}- {name}" + (f"   +{el}" if el else "") + _RESET
             else:
-                line = f"  - {name}" + (f"   +{el}" if el else "")
-            self._emit_block(line, self._detail_lines(ev))
+                line = f"{pre}  - {name}" + (f"   +{el}" if el else "")
+            self._emit_block(line, self._detail_lines(ev, pre))
         elif etype == "thinking":
-            self._emit_block(self._thinking_line(ev), self._thinking_detail(ev))
+            self._emit_block(self._thinking_line(ev, pre), self._thinking_detail(ev, pre))
         elif etype in ("status", "step"):
-            self._emit_block(f"  {self._dot(_CYAN)} {label}", [])
+            self._emit_block(f"{pre}  {self._dot(_CYAN)} {label}", [])
         elif self.verbose:
-            self._emit_block(f"  {self._dot(_CYAN)} {label}", [])
+            self._emit_block(f"{pre}  {self._dot(_CYAN)} {label}", [])
 
-    def _thinking_line(self, ev: dict) -> str:
+    def _agent_prefix(self, ev: dict) -> str:
+        """Indent prefix for an event based on the emitting agent's delegation
+        depth; prints an agent header when the active agent changes. Empty for
+        the root agent or when no `agent` attribution is present."""
+        agent = ev.get("agent") or self._current_agent
+        if not agent:
+            return ""
+        depth = self._agent_depth.get(agent, 0)
+        pre = "  " * depth
+        if agent != self._current_agent:
+            self._current_agent = agent
+            if depth > 0 and not self.quiet:
+                self._println(f"{pre}  {self._dot(_CYAN)} {agent}")
+        return pre
+
+    def _render_handoff(self, ev: dict) -> None:
+        """Render a delegation: agent A hands off to agent B. The target gets
+        depth(A)+1 so its subsequent events nest under it."""
+        if self.quiet:
+            return
+        detail = ev.get("detail") if isinstance(ev.get("detail"), dict) else {}
+        frm = detail.get("from") or ev.get("agent") or self._current_agent
+        to = detail.get("to") or ev.get("label") or "?"
+        task = detail.get("task") or detail.get("reason") or ""
+        depth = self._agent_depth.get(frm, 0)
+        self._agent_depth[to] = depth + 1
+        pre = "  " * depth
+        arrow = f"→ delega para {to}"
+        line = f"{pre}  {_CYAN}{arrow}{_RESET}" if self.tty else f"{pre}  {arrow}"
+        subs = []
+        if task:
+            t = str(task).strip().replace("\n", " ")[:160]
+            subs = [f"{pre}      {_DIM}{t}{_RESET}" if self.tty else f"{pre}      {t}"]
+        self._emit_block(line, subs)
+        self._current_agent = to
+
+    def _thinking_line(self, ev: dict, pre: str = "") -> str:
         """Primary line for a thinking event: '● Thought for Ns' (dimmed)."""
         detail = ev.get("detail") if isinstance(ev.get("detail"), dict) else {}
         secs = detail.get("seconds") or detail.get("duration_s")
@@ -153,9 +207,9 @@ class ProgressReporter:
             secs = round(detail["ms"] / 1000)
         head = f"Thought for {int(secs)}s" if isinstance(secs, (int, float)) else "Thinking"
         dot = self._dot(_DIM) if self.tty else _DOT
-        return f"  {dot} {_DIM}{head}{_RESET}" if self.tty else f"  {_DOT} {head}"
+        return f"{pre}  {dot} {_DIM}{head}{_RESET}" if self.tty else f"{pre}  {_DOT} {head}"
 
-    def _thinking_detail(self, ev: dict) -> list[str]:
+    def _thinking_detail(self, ev: dict, pre: str = "") -> list[str]:
         """The reasoning text as a '╰' continuation, if the event carries it."""
         detail = ev.get("detail") if isinstance(ev.get("detail"), dict) else {}
         text = detail.get("text") or detail.get("reasoning") or detail.get("summary")
@@ -164,9 +218,9 @@ class ProgressReporter:
         if not text:
             return []
         text = str(text).strip().replace("\n", " ")[:240]
-        return [f"      {_DIM}╰ {text}{_RESET}" if self.tty else f"      ╰ {text}"]
+        return [f"{pre}      {_DIM}╰ {text}{_RESET}" if self.tty else f"{pre}      ╰ {text}"]
 
-    def _detail_lines(self, ev: dict) -> list[str]:
+    def _detail_lines(self, ev: dict, pre: str = "") -> list[str]:
         """Indented sub-lines for a tool call — only when the backend provides
         a ``detail`` dict (the tool id and elapsed already live on the primary
         line, so nothing is repeated here)."""
@@ -177,7 +231,7 @@ class ProgressReporter:
             for key in ("summary", "result", "text", "message"):
                 val = detail.get(key)
                 if val:
-                    lines.append(f"      -> {str(val)[:160]}")
+                    lines.append(f"{pre}      -> {str(val)[:160]}")
                     break
             # Compact key=value for small scalar fields (args, counts, etc.).
             kv = [
@@ -187,7 +241,7 @@ class ProgressReporter:
             ]
             if kv:
                 seg = " · ".join(kv[:6])
-                lines.append(f"      {_DIM}{seg}{_RESET}" if self.tty else f"      {seg}")
+                lines.append(f"{pre}      {_DIM}{seg}{_RESET}" if self.tty else f"{pre}      {seg}")
         return lines
 
     def finish(self, status: str, summary: Optional[str] = None) -> None:
