@@ -471,6 +471,8 @@ def main():
     lc.add_argument("--stack", help="Tech stack, comma-separated (e.g. python,fastapi,cdk)")
     lc.add_argument("--auto-approve", dest="auto_approve", action="store_true", help="Resolve all gates automatically")
     lc.add_argument("--gate", help="Gates to KEEP: architecture,plan,destructive")
+    lc.add_argument("--judges", choices=["off", "gate", "full"], help="Judge panel policy (default off)")
+    lc.add_argument("--judge-model", dest="judge_model", choices=["fast", "standard"], help="Judge model (fast=Haiku, cheaper)")
     _add_common(lc, watch=True, wait=True, tenant=True)
     lc.set_defaults(func=labsctl.cmd_labs, labs_cmd="create")
 
@@ -514,6 +516,8 @@ def main():
     oc.add_argument("-i", "--intent", required=True, help="Build objective")
     oc.add_argument("--auto-approve", dest="auto_approve", action="store_true")
     oc.add_argument("--gate", help="Gates to KEEP: architecture,plan,destructive")
+    oc.add_argument("--judges", choices=["off", "gate", "full"], help="Judge panel policy (default off)")
+    oc.add_argument("--judge-model", dest="judge_model", choices=["fast", "standard"], help="Judge model (fast=Haiku)")
     _add_common(oc, watch=True, wait=True, tenant=True)
     oc.set_defaults(func=labsctl.cmd_loops, loops_cmd="create")
 
@@ -569,6 +573,8 @@ def main():
     orv = loops_sub.add_parser("review", help="Convene the senior review panel on the gate")
     orv.add_argument("job_id")
     orv.add_argument("--reviewers", help="Competency seniors to convene (comma-sep): security,frontend,...")
+    orv.add_argument("--judges", choices=["gate", "full"], help="gate=only the gate senior; full=+competency seniors")
+    orv.add_argument("--judge-model", dest="judge_model", choices=["fast", "standard"], help="Judge model (fast=Haiku)")
     _add_common(orv, watch=True, tenant=True)
     orv.set_defaults(func=labsctl.cmd_loops, loops_cmd="review")
 

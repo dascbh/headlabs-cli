@@ -159,16 +159,27 @@ def _die(msg: str, code: int = EXIT_USAGE) -> None:
 
 
 def _gates_from_args(args) -> Optional[dict]:
-    """Build the loop gate config from --auto-approve / --gate flags.
+    """Build the loop gate + judge config from flags.
     None => server defaults (pause after architecture, plan, and destructive)."""
-    if getattr(args, "auto_approve", False):
-        return {"after_architect": False, "after_planner": False,
-                "before_destructive": False, "auto_approve": [], "require_approval": []}
-    gates = getattr(args, "gate", None)
-    if gates:
-        chosen = {_GATE_MAP[g.strip()] for g in gates.split(",") if g.strip() in _GATE_MAP}
-        return {flag: (flag in chosen) for flag in _GATE_MAP.values()}
-    return None  # server DEFAULT_GATES
+    auto = getattr(args, "auto_approve", False)
+    gate = getattr(args, "gate", None)
+    judges = getattr(args, "judges", None)
+    judge_model = getattr(args, "judge_model", None)
+    if not (auto or gate or judges or judge_model):
+        return None  # server DEFAULT_GATES
+    if auto:
+        g = {"after_architect": False, "after_planner": False, "before_destructive": False,
+             "auto_approve": [], "require_approval": []}
+    elif gate:
+        chosen = {_GATE_MAP[x.strip()] for x in gate.split(",") if x.strip() in _GATE_MAP}
+        g = {flag: (flag in chosen) for flag in _GATE_MAP.values()}
+    else:
+        g = {"after_architect": True, "after_planner": True, "before_destructive": True}
+    if judges:
+        g["judges"] = judges            # off | gate | full
+    if judge_model:
+        g["judge_model"] = judge_model  # fast | standard
+    return g
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -477,6 +488,10 @@ def _loops_review(args):
     body = {}
     if getattr(args, "reviewers", None):
         body["reviewers"] = [r.strip() for r in args.reviewers.split(",") if r.strip()]
+    if getattr(args, "judges", None):
+        body["judges"] = args.judges
+    if getattr(args, "judge_model", None):
+        body["judge_model"] = args.judge_model
     res = client.request("POST", f"/loops/{args.job_id}/review", json=body)
     print(_c(f"⚖  Banca convocada · gate {res.get('gate')} · {', '.join(res.get('reviewers', []))}", "cyan"))
     print(_c(f"   Parecer (assíncrono): headlabs loops panel {args.job_id}", "dim"))
