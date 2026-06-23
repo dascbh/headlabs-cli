@@ -74,7 +74,8 @@ def test_run_sends_ephemeral_creds_and_no_collected_data(monkeypatch):
     monkeypatch.setattr(C.HeadLabsClient, "invoke",
                         lambda self, a, inp: (captured.update(input=inp) or ("e1", "cactus-gaming", "e1")))
     monkeypatch.setattr(C.HeadLabsClient, "poll",
-                        lambda self, e, timeout=600, tenant_id="platform", stream_id=None, reporter=None:
+                        lambda self, e, timeout=600, tenant_id="platform", stream_id=None,
+                        reporter=None, approval_handler=None:
                         C.Result(status="succeeded", account_id=""))
 
     res = _client().run("finops-advisor", "cactus-performance", days=30, question="x")

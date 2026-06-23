@@ -315,6 +315,71 @@ class ProgressReporter:
         for r in (reports or []):
             self._println(f"  {dim('Relatório: ' + r)}")
 
+    # ── approval gate ────────────────────────────────────────────────────────
+
+    def pause(self) -> None:
+        """Temporarily stop the spinner (e.g. to prompt the user)."""
+        if self.tty and self._spinner is not None and not self._stop.is_set():
+            self._stop.set()
+            self._spinner.join(timeout=0.5)
+            with self._lock:
+                self.out.write(_CLEAR_LINE)
+                self.out.flush()
+            self._spinner = None
+
+    def resume(self) -> None:
+        """Restart the spinner after a pause, if a wait is still in progress."""
+        if self.tty and self._start_ts is not None and self._spinner is None:
+            self._stop.clear()
+            self._spinner = threading.Thread(target=self._spin, daemon=True)
+            self._spinner.start()
+
+    def prompt_approval(self, detail: dict) -> str:
+        """Render an approval request and ask the user to approve/reject a
+        mutating action. Returns ``"approve"`` or ``"reject"``. Fails safe:
+        without an interactive terminal (or under ``--quiet``) returns
+        ``"reject"`` so nothing mutates unattended."""
+        action = detail.get("action") or detail.get("label") or "ação"
+        self.pause()
+        with self._lock:
+            w = self.out.write
+            w("\n")
+            w(f"  {self._dot(_YELLOW)} Aprovação necessária\n")
+            w(f"      ação:       {action}\n")
+            if detail.get("target"):
+                w(f"      alvo:       {detail['target']}\n")
+            rev = detail.get("reversible")
+            if rev is not None:
+                w(f"      reversível: {'sim' if rev else 'NÃO'}\n")
+            if detail.get("blast_radius"):
+                w(f"      impacto:    {detail['blast_radius']}\n")
+            if detail.get("saving_usd"):
+                try:
+                    w(f"      economia:   ${float(detail['saving_usd']):,.0f}/mo\n")
+                except (TypeError, ValueError):
+                    pass
+            self.out.flush()
+
+        interactive = self.tty and bool(getattr(sys.stdin, "isatty", lambda: False)())
+        if not interactive:
+            with self._lock:
+                self.out.write("      (sem terminal interativo — rejeitado por segurança)\n")
+                self.out.flush()
+            self.resume()
+            return "reject"
+
+        decision = "reject"
+        try:
+            ans = input("  Aprovar? (yes/no): ").strip().lower()
+            decision = "approve" if ans in ("y", "yes", "s", "sim") else "reject"
+        except (EOFError, KeyboardInterrupt):
+            decision = "reject"
+        with self._lock:
+            self.out.write("  ✓ aprovado\n" if decision == "approve" else "  x rejeitado\n")
+            self.out.flush()
+        self.resume()
+        return decision
+
     # ── internals ────────────────────────────────────────────────────────────
 
     def _spin(self) -> None:

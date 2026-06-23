@@ -38,7 +38,8 @@ def cmd_run(args):
         verbose=getattr(args, "verbose", False),
     )
     reporter.header(f"{agent_id}  ·  {args.profile}  ·  {args.days}d")
-    result = client.run(agent_id, args.profile, reporter=reporter, **kwargs)
+    result = client.run(agent_id, args.profile, reporter=reporter,
+                        approval_handler=reporter.prompt_approval, **kwargs)
 
     if result.status == "timeout":
         print("Error: agent timed out. Try again or check headlabs.ai dashboard.")
@@ -331,7 +332,8 @@ def cmd_chat(args):
             try:
                 for event in client.chat_stream(agent_id, session_id, user_input,
                                                  context=context, history=history,
-                                                 tenant_id=tenant_id):
+                                                 tenant_id=tenant_id,
+                                                 approval_handler=reporter.prompt_approval):
                     etype = event.get("type", "")
                     if etype == "progress":
                         reporter.event(event["event"])

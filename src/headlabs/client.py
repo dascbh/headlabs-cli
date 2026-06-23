@@ -136,6 +136,37 @@ class HeadLabsClient:
         resp.raise_for_status()
         return resp.json()
 
+    def approve_execution(self, exec_id: str, gate_id: str,
+                          decision: str, tenant_id: str = "platform") -> bool:
+        """Send an approval decision for a paused (awaiting_approval) execution.
+
+        ``decision`` is ``"approve"`` or ``"reject"``. Best-effort: returns
+        True on success, False otherwise (never raises into the poll loop).
+        """
+        try:
+            resp = requests.post(
+                f"{self.api_url}/executions/{exec_id}/approvals/{gate_id}"
+                f"?tenant_id={tenant_id}",
+                json={"decision": decision},
+                headers=self._headers(),
+                timeout=15,
+            )
+            resp.raise_for_status()
+            return True
+        except Exception:
+            return False
+
+    def _handle_approval(self, ev: dict, exec_id: str, tenant_id: str,
+                         approval_handler) -> None:
+        """An approval_request event: ask the handler (which prompts the user)
+        for a decision and send it back. Fails safe to 'reject' if there's no
+        handler, so a mutating action never proceeds unattended."""
+        detail = ev.get("detail") or {}
+        gate_id = detail.get("gate_id")
+        decision = approval_handler(detail) if approval_handler else "reject"
+        if gate_id:
+            self.approve_execution(exec_id, gate_id, decision, tenant_id)
+
     @staticmethod
     def _result_from_execution(data: dict) -> Result:
         status = data.get("status")
@@ -162,7 +193,7 @@ class HeadLabsClient:
         )
 
     def poll(self, exec_id: str, timeout: int = 600, tenant_id: str = "platform",
-             stream_id: str | None = None, reporter=None) -> Result:
+             stream_id: str | None = None, reporter=None, approval_handler=None) -> Result:
         """Poll for execution result.
 
         ``tenant_id`` must match the tenant the execution was created under
@@ -185,7 +216,10 @@ class HeadLabsClient:
                 try:
                     body = self.get_events(stream, since, tenant_id)
                     for ev in body.get("events", []):
-                        reporter.event(ev)
+                        if ev.get("type") == "approval_request":
+                            self._handle_approval(ev, exec_id, tenant_id, approval_handler)
+                        else:
+                            reporter.event(ev)
                     since = body.get("last_seq", since)
                     status = body.get("status")
                 except Exception:
@@ -218,7 +252,8 @@ class HeadLabsClient:
             print()
         return result
 
-    def run(self, agent_id: str, aws_profile: str, reporter=None, **kwargs: Any) -> Result:
+    def run(self, agent_id: str, aws_profile: str, reporter=None,
+            approval_handler=None, **kwargs: Any) -> Result:
         """Run an agent against the CLIENT's account.
 
         Option B (client-side credential management): short-lived session
@@ -272,7 +307,8 @@ class HeadLabsClient:
         else:
             print(f"  Account: {account_id}")
             print(f"  Exec: {exec_id[:8]}...")
-        result = self.poll(exec_id, tenant_id=tenant_id, stream_id=stream_id, reporter=reporter)
+        result = self.poll(exec_id, tenant_id=tenant_id, stream_id=stream_id,
+                           reporter=reporter, approval_handler=approval_handler)
         result.account_id = result.account_id or account_id
         return result
 
@@ -382,7 +418,7 @@ class HeadLabsClient:
 
     def chat_stream(self, agent_id: str, session_id: str, message: str,
                     context: dict | None = None, history: list | None = None,
-                    tenant_id: str | None = None):
+                    tenant_id: str | None = None, approval_handler=None):
         """Send chat message, poll for result, yield done event.
 
         ``tenant_id`` overrides the tenant used to poll the execution. The
@@ -430,7 +466,9 @@ class HeadLabsClient:
             try:
                 body = self.get_events(stream, since, poll_tenant)
                 for ev in body.get("events", []):
-                    if ev.get("type") in ("tool_use", "status", "step", "thinking"):
+                    if ev.get("type") == "approval_request":
+                        self._handle_approval(ev, exec_id, poll_tenant, approval_handler)
+                    elif ev.get("type") in ("tool_use", "status", "step", "thinking"):
                         yield {"type": "progress", "event": ev}
                 since = body.get("last_seq", since)
                 status = body.get("status")
