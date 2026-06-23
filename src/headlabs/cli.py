@@ -10,6 +10,7 @@ from pathlib import Path
 
 from headlabs.config import CONFIG_DIR, REPORTS_DIR, load_config, save_config
 from headlabs.agents.registry import AGENT_REGISTRY
+from headlabs import labsctl
 
 
 def cmd_run(args):
@@ -446,6 +447,130 @@ def main():
     p_report = sub.add_parser("report", help="Open reports")
     p_report.add_argument("--last", action="store_true", help="Open last report")
     p_report.set_defaults(func=cmd_report)
+
+    # ── labs (workspaces) ────────────────────────────────────────────────────
+    def _add_common(p, *, output=True, watch=False, wait=False, tenant=False):
+        if output:
+            p.add_argument("-o", "--output", default="table", choices=["table", "wide", "json"])
+        if watch:
+            p.add_argument("-w", "--watch", action="store_true", help="Follow live")
+        if wait:
+            p.add_argument("--wait", action="store_true", help="Block until terminal (CI)")
+        if tenant:
+            p.add_argument("--tenant", help="Tenant for polling")
+        p.add_argument("--quiet", action="store_true", help="IDs only / minimal output")
+        p.add_argument("--verbose", action="store_true")
+
+    p_labs = sub.add_parser("labs", aliases=["lab"], help="Project labs (workspaces grouping build loops)")
+    labs_sub = p_labs.add_subparsers(dest="labs_cmd")
+    p_labs.set_defaults(func=labsctl.cmd_labs)
+
+    lc = labs_sub.add_parser("create", help="Create a lab and start the first build")
+    lc.add_argument("-i", "--intent", required=True, help="Build objective (natural language)")
+    lc.add_argument("--name", help="Lab name (default: slug of intent)")
+    lc.add_argument("--stack", help="Tech stack, comma-separated (e.g. python,fastapi,cdk)")
+    lc.add_argument("--auto-approve", dest="auto_approve", action="store_true", help="Resolve all gates automatically")
+    lc.add_argument("--gate", help="Gates to KEEP: architecture,plan,destructive")
+    _add_common(lc, watch=True, wait=True, tenant=True)
+    lc.set_defaults(func=labsctl.cmd_labs, labs_cmd="create")
+
+    ll = labs_sub.add_parser("list", aliases=["ls"], help="List labs")
+    _add_common(ll)
+    ll.set_defaults(func=labsctl.cmd_labs, labs_cmd="list")
+
+    for _verb in ("get", "describe"):
+        g = labs_sub.add_parser(_verb, help=f"{_verb} a lab")
+        g.add_argument("lab", help="Lab id or name")
+        _add_common(g)
+        g.set_defaults(func=labsctl.cmd_labs, labs_cmd=_verb)
+
+    lr = labs_sub.add_parser("repo", help="Browse the lab's repository")
+    lr.add_argument("lab", help="Lab id or name")
+    lr.add_argument("--tree", action="store_true", help="List files (default)")
+    lr.add_argument("--cat", help="Print a file's content by path")
+    _add_common(lr)
+    lr.set_defaults(func=labsctl.cmd_labs, labs_cmd="repo")
+
+    lp = labs_sub.add_parser("push", help="Push the lab repository to GitHub")
+    lp.add_argument("lab", help="Lab id or name")
+    lp.add_argument("--repo", required=True, help="owner/name")
+    lp.add_argument("--branch", default="main")
+    lp.add_argument("--token", help="GitHub token (or env GITHUB_TOKEN)")
+    lp.add_argument("--message", help="Commit message")
+    _add_common(lp)
+    lp.set_defaults(func=labsctl.cmd_labs, labs_cmd="push")
+
+    larch = labs_sub.add_parser("archive", help="Archive a lab")
+    larch.add_argument("lab", help="Lab id or name")
+    larch.set_defaults(func=labsctl.cmd_labs, labs_cmd="archive")
+
+    # ── loops (build jobs) ────────────────────────────────────────────────────
+    p_loops = sub.add_parser("loops", aliases=["loop"], help="Build loops (jobs) inside labs")
+    loops_sub = p_loops.add_subparsers(dest="loops_cmd")
+    p_loops.set_defaults(func=labsctl.cmd_loops)
+
+    oc = loops_sub.add_parser("create", help="Start a build in an existing lab")
+    oc.add_argument("--lab", required=True, help="Lab id or name")
+    oc.add_argument("-i", "--intent", required=True, help="Build objective")
+    oc.add_argument("--auto-approve", dest="auto_approve", action="store_true")
+    oc.add_argument("--gate", help="Gates to KEEP: architecture,plan,destructive")
+    _add_common(oc, watch=True, wait=True, tenant=True)
+    oc.set_defaults(func=labsctl.cmd_loops, loops_cmd="create")
+
+    ol = loops_sub.add_parser("list", aliases=["ls"], help="List builds")
+    ol.add_argument("--lab", help="Filter by lab id or name")
+    ol.add_argument("--status", help="Filter by status")
+    ol.add_argument("--active", action="store_true", help="Only non-terminal builds")
+    _add_common(ol)
+    ol.set_defaults(func=labsctl.cmd_loops, loops_cmd="list")
+
+    for _verb in ("status", "get", "describe"):
+        o = loops_sub.add_parser(_verb, help=f"{_verb} a build")
+        o.add_argument("job_id", help="Build (loop) id")
+        _add_common(o)
+        o.set_defaults(func=labsctl.cmd_loops, loops_cmd=_verb)
+
+    ow = loops_sub.add_parser("watch", help="Follow a build live")
+    ow.add_argument("job_id")
+    ow.add_argument("--timeout", type=int, default=0, help="Seconds (0 = no timeout)")
+    _add_common(ow, tenant=True)
+    ow.set_defaults(func=labsctl.cmd_loops, loops_cmd="watch")
+
+    og = loops_sub.add_parser("logs", help="Show the build's agent trace")
+    og.add_argument("job_id")
+    og.add_argument("--phase", help="Filter by phase/agent")
+    _add_common(og)
+    og.set_defaults(func=labsctl.cmd_loops, loops_cmd="logs")
+
+    oa = loops_sub.add_parser("approve", help="Approve the pending gate")
+    oa.add_argument("job_id")
+    oa.add_argument("--note", help="Optional comment")
+    _add_common(oa, watch=True, tenant=True)
+    oa.set_defaults(func=labsctl.cmd_loops, loops_cmd="approve")
+
+    orj = loops_sub.add_parser("reject", help="Reject the pending gate (redo previous phase)")
+    orj.add_argument("job_id")
+    orj.add_argument("--note", required=True, help="Reason / feedback")
+    _add_common(orj)
+    orj.set_defaults(func=labsctl.cmd_loops, loops_cmd="reject")
+
+    for _verb in ("pause", "resume", "cancel", "retry"):
+        o = loops_sub.add_parser(_verb, help=f"{_verb} a build")
+        o.add_argument("job_id")
+        _add_common(o, watch=(_verb == "retry"), tenant=(_verb == "retry"))
+        o.set_defaults(func=labsctl.cmd_loops, loops_cmd=_verb)
+
+    oi = loops_sub.add_parser("iterate", help="New iteration with an adjustment")
+    oi.add_argument("job_id")
+    oi.add_argument("-i", "--intent", required=True, help="Adjustment to apply")
+    _add_common(oi, watch=True, tenant=True)
+    oi.set_defaults(func=labsctl.cmd_loops, loops_cmd="iterate")
+
+    # ── status (top-level shortcut) ───────────────────────────────────────────
+    p_status = sub.add_parser("status", help="Active builds (no arg) or a build's detail")
+    p_status.add_argument("job_id", nargs="?", help="Build id (optional)")
+    _add_common(p_status, tenant=True)
+    p_status.set_defaults(func=labsctl.cmd_status)
 
     args = parser.parse_args()
     if not args.command:

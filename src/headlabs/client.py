@@ -100,6 +100,19 @@ class HeadLabsClient:
             "Content-Type": "application/json",
         }
 
+    def request(self, method: str, path: str, *, params: dict | None = None,
+                json: dict | None = None, timeout: int = 30):
+        """Generic authenticated request against the platform API. Raises
+        requests.HTTPError on non-2xx. Returns parsed JSON ({} for empty/204)."""
+        resp = requests.request(
+            method, f"{self.api_url}{path}", params=params, json=json,
+            headers=self._headers(), timeout=timeout,
+        )
+        resp.raise_for_status()
+        if resp.status_code == 204 or not resp.content:
+            return {}
+        return resp.json()
+
     # Terminal execution states: succeeded plus the failure family.
     _TERMINAL = ("succeeded", "failed", "dlq", "timed_out", "cancelled", "rejected", "partial")
 
