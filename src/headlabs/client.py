@@ -11,33 +11,6 @@ import requests
 from headlabs.config import get_api_key, get_api_url
 from headlabs.result import Result
 from headlabs.agents.registry import AGENT_REGISTRY
-from headlabs.collectors.finops import FinOpsCollector
-from headlabs.collectors.generic import GenericCollector
-
-
-# Maps an agent's `collector` name (from AGENT_REGISTRY) to the collector class
-# that gathers data LOCALLY using the client's AWS profile. Agents without a
-# dedicated collector fall back to GenericCollector (account identity only).
-COLLECTOR_MAP = {
-    "finops": FinOpsCollector,
-}
-
-
-def _collected_summary(collected: dict) -> str:
-    """Short human summary of locally-collected data for the progress line."""
-    if not isinstance(collected, dict):
-        return ""
-    parts = []
-    svcs = collected.get("top_services")
-    if isinstance(svcs, dict) and svcs:
-        parts.append(f"{len(svcs)} serviços")
-    accts = collected.get("by_account")
-    if isinstance(accts, dict) and accts:
-        parts.append(f"{len(accts)} contas")
-    total = collected.get("total_usd")
-    if isinstance(total, (int, float)):
-        parts.append(f"${total:,.0f}")
-    return " · ".join(parts)
 
 
 def _ephemeral_credentials(session) -> dict | None:
