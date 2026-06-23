@@ -473,6 +473,9 @@ def main():
     lc.add_argument("--gate", help="Gates to KEEP: architecture,plan,destructive")
     lc.add_argument("--judges", choices=["off", "gate", "full"], help="Judge panel policy (default off)")
     lc.add_argument("--judge-model", dest="judge_model", choices=["fast", "standard"], help="Judge model (fast=Haiku, cheaper)")
+    lc.add_argument("--gate-mode", dest="gate_mode", choices=["human", "judge", "judge+human"],
+                    help="human=no panel; judge=panel auto-decides; judge+human=panel informs, human decides")
+    lc.add_argument("--max-revise", dest="max_revise", type=int, help="Max auto-revise loops before escalating to human (judge mode, default 2)")
     _add_common(lc, watch=True, wait=True, tenant=True)
     lc.set_defaults(func=labsctl.cmd_labs, labs_cmd="create")
 
@@ -518,6 +521,9 @@ def main():
     oc.add_argument("--gate", help="Gates to KEEP: architecture,plan,destructive")
     oc.add_argument("--judges", choices=["off", "gate", "full"], help="Judge panel policy (default off)")
     oc.add_argument("--judge-model", dest="judge_model", choices=["fast", "standard"], help="Judge model (fast=Haiku)")
+    oc.add_argument("--gate-mode", dest="gate_mode", choices=["human", "judge", "judge+human"],
+                    help="human=no panel; judge=panel auto-decides; judge+human=panel informs, human decides")
+    oc.add_argument("--max-revise", dest="max_revise", type=int, help="Max auto-revise loops before escalating (judge mode, default 2)")
     _add_common(oc, watch=True, wait=True, tenant=True)
     oc.set_defaults(func=labsctl.cmd_loops, loops_cmd="create")
 

@@ -165,7 +165,9 @@ def _gates_from_args(args) -> Optional[dict]:
     gate = getattr(args, "gate", None)
     judges = getattr(args, "judges", None)
     judge_model = getattr(args, "judge_model", None)
-    if not (auto or gate or judges or judge_model):
+    gate_mode = getattr(args, "gate_mode", None)
+    max_revise = getattr(args, "max_revise", None)
+    if not (auto or gate or judges or judge_model or gate_mode or max_revise is not None):
         return None  # server DEFAULT_GATES
     if auto:
         g = {"after_architect": False, "after_planner": False, "before_destructive": False,
@@ -175,10 +177,19 @@ def _gates_from_args(args) -> Optional[dict]:
         g = {flag: (flag in chosen) for flag in _GATE_MAP.values()}
     else:
         g = {"after_architect": True, "after_planner": True, "before_destructive": True}
-    if judges:
-        g["judges"] = judges            # off | gate | full
+    # Judge scope: --gate-mode human disables the panel; judge/judge+human default to full.
+    if gate_mode == "human":
+        g["judges"] = "off"
+    elif judges:
+        g["judges"] = judges
+    elif gate_mode in ("judge", "judge+human"):
+        g["judges"] = "full"
+    if gate_mode in ("judge", "judge+human"):
+        g["gate_mode"] = gate_mode      # judge=autonomous, judge+human=panel informs, human decides
     if judge_model:
         g["judge_model"] = judge_model  # fast | standard
+    if max_revise is not None:
+        g["max_revise"] = int(max_revise)
     return g
 
 
