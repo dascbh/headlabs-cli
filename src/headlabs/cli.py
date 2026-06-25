@@ -168,6 +168,11 @@ def _run_local(agent_id, args, reporter, kwargs):
         elif etype == "error":
             error = ev.get("error", "unknown error")
         else:
+            # Filter XML noise from parallel tool invocations
+            lbl = ev.get("label", "")
+            dtxt = (ev.get("detail") or {}).get("text", "") if isinstance(ev.get("detail"), dict) else ""
+            if "<invoke" in lbl or "<invoke" in dtxt:
+                continue
             reporter.event(ev)
 
     proc.wait()
