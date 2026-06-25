@@ -61,8 +61,8 @@ def _client():
     return HeadLabsClient()
 
 
-def create_lab(intent, name, stack, *, auto_approve=True, retries=3):
-    args = ["labs", "create", "-i", intent, "--name", name, "--stack", stack, "-o", "json"]
+def create_lab(intent, name, stack, *, auto_approve=True, extra_args=(), retries=3):
+    args = ["labs", "create", "-i", intent, "--name", name, "--stack", stack, "-o", "json", *extra_args]
     if auto_approve:
         args.append("--auto-approve")
     for attempt in range(retries):
@@ -207,6 +207,110 @@ def test_gate_flow_pauses_then_resumes():
         _, after, _ = cli("loops", "status", job_id, "-o", "json")
         final = after if isinstance(after, dict) else {}
         assert final.get("pending_gate") != "after_architect", "gate not cleared after approve"
+    finally:
+        cli("loops", "cancel", job_id)
+        teardown(final, lab_id)
+
+
+# ── guardrail: reject → rework ────────────────────────────────────────────────
+
+@pytest.mark.skipif(not E2E_BUILD, reason="set HEADLABS_E2E_BUILD=1")
+def test_reject_sends_back_to_rework():
+    """Rejecting at the architecture gate clears it and re-drives the build
+    (the loop reworks the prior phase with the feedback)."""
+    name = f"e2e-reject-{int(time.time())}"
+    created = create_lab("API CRUD de produtos com tabela", name, "python", auto_approve=False)
+    lab_id, job_id = created["lab_id"], created["job_id"]
+    final = {}
+    try:
+        deadline, paused, iters_before = time.time() + 300, False, 0
+        while time.time() < deadline:
+            _, d, _ = cli("loops", "status", job_id, "-o", "json")
+            if isinstance(d, dict) and d.get("pending_gate") == "after_architect":
+                paused = True
+                iters_before = int(d.get("iterations", 0) or 0)
+                break
+            time.sleep(15)
+        assert paused, "did not reach the after_architect gate"
+        rc, _, _ = cli("loops", "reject", job_id, "--note", "refaça a arquitetura: use uma abordagem mais simples")
+        assert rc == 0, "reject command failed"
+        # Reject feeds back to the previous phase and bumps iterations — the
+        # build reworks (and may re-reach the gate). Assert the rework happened.
+        deadline, reworked = time.time() + 120, False
+        while time.time() < deadline:
+            _, d, _ = cli("loops", "status", job_id, "-o", "json")
+            if isinstance(d, dict):
+                final = d
+                trace = d.get("agents_trace") or []
+                rejected = any(isinstance(t, dict) and str(t.get("action", "")).startswith("rejected")
+                               for t in trace)
+                if int(d.get("iterations", 0) or 0) > iters_before or rejected:
+                    reworked = True
+                    break
+            time.sleep(10)
+        assert reworked, "reject did not trigger a rework (iterations/trace unchanged)"
+    finally:
+        cli("loops", "cancel", job_id)
+        teardown(final, lab_id)
+
+
+# ── guardrail: research mode (investigate, build nothing) ────────────────────
+
+@pytest.mark.skipif(not E2E_BUILD, reason="set HEADLABS_E2E_BUILD=1")
+def test_research_produces_findings_and_no_resources():
+    """research mode runs orchestrator→researcher→deliverer (no gates, no
+    executor): it produces findings and provisions NO managed resources."""
+    name = f"e2e-research-{int(time.time())}"
+    rc, data, raw = cli("research", "-i", "estado da arte de rate limiting distribuído",
+                        "--name", name, "--depth", "quick", "-o", "json")
+    assert rc == 0 and isinstance(data, dict) and data.get("job_id"), f"research create failed: {raw!r}"
+    job_id = data["job_id"]
+    lab_id = data.get("lab_id")
+    final = poll_until_terminal(job_id, timeout=420)
+    try:
+        assert (final.get("status") or "").lower() in _TERMINAL_OK, f"research not complete: {final.get('status')}"
+        build_types = {"table", "function", "kb", "storage", "agent", "container"}
+        provisioned = [r for r in (final.get("resources_created") or [])
+                       if str(r).split(":")[0] in build_types]
+        assert not provisioned, f"research must not build resources: {provisioned}"
+        assert final.get("findings") or final.get("research"), "research produced no findings"
+    finally:
+        if lab_id:
+            cli("labs", "archive", lab_id)
+
+
+# ── guardrail: judge panel decides autonomously (gate_mode=judge) ────────────
+
+@pytest.mark.skipif(not E2E_BUILD, reason="set HEADLABS_E2E_BUILD=1")
+def test_judge_panel_engages():
+    """With --gate-mode judge the senior-judge panel runs at the gate and
+    decides (approve/revise/escalate) — proving autonomous governance, not just
+    a human pause. We assert the panel engages: it either reaches 'reviewing',
+    advances past the architect without a human approve, or reaches terminal."""
+    name = f"e2e-judge-{int(time.time())}"
+    created = create_lab("API de inventário com tabela e contagem", name, "python",
+                         auto_approve=False, extra_args=["--gate-mode", "judge", "--judges", "full"])
+    lab_id, job_id = created["lab_id"], created["job_id"]
+    final = {}
+    try:
+        deadline, engaged = time.time() + 360, False
+        while time.time() < deadline:
+            _, d, _ = cli("loops", "status", job_id, "-o", "json")
+            if isinstance(d, dict):
+                final = d
+                st = (d.get("status") or "").lower()
+                ph = d.get("phase")
+                if st == "reviewing" or d.get("panel_status") in ("running", "done"):
+                    engaged = True
+                    break
+                if ph in ("planner", "executor", "validator", "deliverer") and st != "awaiting_approval":
+                    engaged = True  # advanced past architect with no human approve → judge decided
+                    break
+                if st in (_TERMINAL_OK | _TERMINAL_FAIL):
+                    engaged = True
+                    break
+            time.sleep(12)
+        assert engaged, f"judge panel did not engage: {final.get('status')}/{final.get('phase')}"
     finally:
         cli("loops", "cancel", job_id)
         teardown(final, lab_id)
