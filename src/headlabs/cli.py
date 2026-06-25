@@ -107,24 +107,9 @@ def _run_local(agent_id, args, reporter, kwargs):
             print(f"\033[31merro: docker build falhou\033[0m\n{r.stderr[-300:]}")
             sys.exit(1)
     else:
-        # Try platform repo
-        platform_path = (cfg.get("platform_path")
-                         or os.environ.get("HEADLABS_PLATFORM_PATH")
-                         or _find_platform_repo())
-        if platform_path:
-            reporter.phase("Build local", f"{platform_path}")
-            module = agent_id.replace("-", "_")
-            r = subprocess.run(
-                ["docker", "build", "--platform", "linux/arm64",
-                 "--build-arg", f"AGENT_ID={agent_id}", "--build-arg", f"AGENT_MODULE={module}",
-                 "-f", "Dockerfile.agent", "-t", image_tag, "."],
-                cwd=platform_path, capture_output=True, text=True)
-            if r.returncode != 0:
-                print(f"\033[31merro: docker build falhou\033[0m\n{r.stderr[-300:]}")
-                sys.exit(1)
-        else:
-            print(f"\033[31merro: ./agents/{agent_id}/ não encontrado e HEADLABS_PLATFORM_PATH não configurado.\033[0m")
-            sys.exit(2)
+        print(f"\033[31merro: ./agents/{agent_id}/ não encontrado.\033[0m")
+        print(f"\033[2m  Baixe o agente primeiro: headlabs agents pull {agent_id}\033[0m")
+        sys.exit(2)
 
     # Build the input event (same as client.run builds)
     input_data = {
