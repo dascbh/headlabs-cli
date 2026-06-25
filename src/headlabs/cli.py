@@ -873,6 +873,279 @@ def cmd_agents_pull(args):
     print(f"  \033[2mEdite e faça push: headlabs agents push {agent_id}\033[0m")
 
 
+def cmd_mcps(args):
+    """MCP lifecycle: init, push, pull, dev."""
+    sub = getattr(args, "mcps_cmd", None)
+    if sub == "init":
+        return _mcps_init(args)
+    if sub == "push":
+        return _mcps_push(args)
+    if sub == "pull":
+        return _mcps_pull(args)
+    if sub == "dev":
+        return _mcps_dev(args)
+    # Default: list MCPs
+    from headlabs.client import HeadLabsClient
+    client = HeadLabsClient()
+    tools = client.list_tools()
+    mcps = [t for t in tools if t.get("type") == "mcp"]
+    if not mcps:
+        print("No MCPs found.")
+        return
+    print(f"{'ID':<28} {'Name':<30}")
+    print("-" * 60)
+    for m in mcps:
+        print(f"{m.get('id',''):<28} {m.get('name',''):<30}")
+
+
+def _mcps_init(args):
+    """Scaffold a new MCP server in ./mcps/<id>/."""
+    mcp_id = args.mcp_id
+    mcp_dir = os.path.join(os.getcwd(), "mcps", mcp_id)
+    if os.path.exists(mcp_dir):
+        print(f"\033[31merro: mcps/{mcp_id}/ já existe.\033[0m")
+        sys.exit(2)
+
+    display = mcp_id.replace("-", " ").title()
+    desc = getattr(args, "description", None) or f"MCP server: {display}"
+
+    server_py = f'''"""MCP server — {display}."""
+from mcp.server.fastmcp import FastMCP
+import os
+
+mcp = FastMCP("{mcp_id}")
+
+
+@mcp.tool()
+def hello(name: str = "world") -> str:
+    """Example tool — replace with your implementation."""
+    return f"Hello, {{name}}!"
+
+
+# ── Entrypoint ────────────────────────────────────────────────────────────────
+app = mcp.streamable_http_app()
+
+if __name__ == "__main__":
+    mcp.run(transport=os.environ.get("MCP_TRANSPORT", "streamable-http"))
+'''
+
+    config_yaml = f'''mcp:
+  id: {mcp_id}
+  name: "{display}"
+  description: "{desc}"
+  version: "1.0.0"
+  transport: streamable-http
+  port: 8080
+'''
+
+    requirements = "mcp>=1.2.0\nhttpx>=0.27.0\nuvicorn>=0.30\n"
+
+    dockerfile = f'''FROM python:3.12-slim
+ENV MCP_ID={mcp_id} PORT=8080 PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+COPY . /app
+EXPOSE 8080
+CMD ["python", "server.py"]
+'''
+
+    test_py = f'''"""Smoke test: verify MCP server imports cleanly."""
+def test_import():
+    import server
+    assert hasattr(server, "mcp")
+'''
+
+    os.makedirs(mcp_dir, exist_ok=True)
+    os.makedirs(os.path.join(mcp_dir, "tests"), exist_ok=True)
+    files = {
+        "server.py": server_py,
+        "config.yaml": config_yaml,
+        "requirements.txt": requirements,
+        "Dockerfile": dockerfile,
+        "tests/__init__.py": "",
+        "tests/test_server.py": test_py,
+    }
+    for name, content in files.items():
+        with open(os.path.join(mcp_dir, name), "w") as f:
+            f.write(content)
+
+    print(f"\033[32m✓ MCP criado: mcps/{mcp_id}/\033[0m")
+    print(f"\033[2m  server.py     tools + FastMCP entrypoint\033[0m")
+    print(f"\033[2m  Dockerfile    self-contained\033[0m")
+    print(f"\033[2m  config.yaml · requirements.txt · tests/\033[0m")
+    print()
+    print(f"  Testar local: \033[2mheadlabs mcps dev {mcp_id}\033[0m")
+    print(f"  Publicar:     \033[2mheadlabs mcps push {mcp_id} --wait\033[0m")
+
+
+def _mcps_push(args):
+    """Push MCP source (versioned) + build + deploy."""
+    import subprocess
+    import base64
+    from headlabs.client import HeadLabsClient
+    from headlabs.config import load_config
+
+    mcp_id = args.mcp_id
+    mcp_dir = os.path.join(os.getcwd(), "mcps", mcp_id)
+    if not os.path.isdir(mcp_dir):
+        print(f"\033[31merro: mcps/{mcp_id}/ não encontrado.\033[0m")
+        sys.exit(2)
+
+    client = HeadLabsClient()
+    cfg = load_config()
+
+    # 1. Collect + upload source (versioned)
+    files = {}
+    for root, dirs, fnames in os.walk(mcp_dir):
+        dirs[:] = [d for d in dirs if d not in ("__pycache__", ".pytest_cache")]
+        for fname in fnames:
+            if fname.endswith(".pyc"):
+                continue
+            full = os.path.join(root, fname)
+            rel = os.path.relpath(full, mcp_dir)
+            with open(full, "rb") as f:
+                files[rel] = base64.b64encode(f.read()).decode()
+
+    print(f"\033[2m  Uploading {len(files)} files…\033[0m")
+    try:
+        resp = client.request("POST", f"/mcps/{mcp_id}/source",
+                              json={"files": files, "message": getattr(args, "message", "") or ""},
+                              timeout=30)
+        print(f"\033[32m  ✓ Source v{resp.get('version', '?')}\033[0m")
+    except Exception as exc:
+        print(f"\033[33m  (source upload: {str(exc)[:80]})\033[0m")
+
+    # 2. Docker build + push ECR
+    ACCOUNT = "688128002471"
+    REGION = "us-east-1"
+    ECR = f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/headlabs-mcps"
+    image_uri = f"{ECR}:{mcp_id}"
+
+    print(f"\033[2m  Building {mcp_id}…\033[0m")
+    r = subprocess.run(["docker", "build", "--platform", "linux/arm64", "-t", image_uri, "."],
+                       cwd=mcp_dir, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"\033[31merro: docker build falhou\033[0m\n{r.stderr[-300:]}")
+        sys.exit(1)
+    print(f"\033[32m  ✓ Build OK\033[0m")
+
+    profile = getattr(args, "profile", None) or os.environ.get("AWS_PROFILE", "")
+    login_cmd = f"aws ecr get-login-password --region {REGION}"
+    if profile:
+        login_cmd += f" --profile {profile}"
+    login_cmd += f" | docker login --username AWS --password-stdin {ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com"
+    subprocess.run(login_cmd, shell=True, capture_output=True)
+
+    print(f"\033[2m  Pushing {mcp_id}…\033[0m")
+    r = subprocess.run(["docker", "push", image_uri], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"\033[31merro: docker push falhou\033[0m\n{r.stderr[-200:]}")
+        sys.exit(1)
+    print(f"\033[32m  ✓ Push OK\033[0m")
+
+    # 3. Deploy (register/update MCP runtime)
+    try:
+        resp = client.request("POST", f"/mcps/{mcp_id}/deploy",
+                              json={"image_tag": mcp_id}, timeout=30)
+        print(f"\033[32m✓ MCP deployado: {mcp_id}\033[0m" +
+              (f" (runtime: {resp.get('runtime_id','')})" if resp.get("runtime_id") else ""))
+    except Exception as exc:
+        # If deploy endpoint doesn't exist yet, inform
+        print(f"\033[33m  Deploy endpoint pendente: {str(exc)[:80]}\033[0m")
+        print(f"\033[2m  A imagem está no ECR. O EventBridge pode triggar o deploy automaticamente.\033[0m")
+
+
+def _mcps_dev(args):
+    """Run MCP locally via Docker on localhost:<port>."""
+    import subprocess
+
+    mcp_id = args.mcp_id
+    mcp_dir = os.path.join(os.getcwd(), "mcps", mcp_id)
+    if not os.path.isdir(mcp_dir):
+        print(f"\033[31merro: mcps/{mcp_id}/ não encontrado.\033[0m")
+        print(f"\033[2m  Crie com: headlabs mcps init {mcp_id}\033[0m")
+        sys.exit(2)
+
+    port = getattr(args, "port", 8080)
+    image_tag = f"headlabs-local-mcp:{mcp_id}"
+
+    print(f"\033[2m  Building {mcp_id}…\033[0m")
+    r = subprocess.run(["docker", "build", "--platform", "linux/arm64", "-t", image_tag, "."],
+                       cwd=mcp_dir, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"\033[31merro: docker build falhou\033[0m\n{r.stderr[-300:]}")
+        sys.exit(1)
+
+    print(f"\033[32m✓ MCP rodando: http://localhost:{port}/mcp\033[0m")
+    print(f"\033[2m  Ctrl+C para parar\033[0m")
+    print()
+    try:
+        subprocess.run(["docker", "run", "--rm", "-p", f"{port}:8080",
+                        "--platform", "linux/arm64", image_tag])
+    except KeyboardInterrupt:
+        print("\n\033[2m  MCP encerrado.\033[0m")
+
+
+def _mcps_pull(args):
+    """Pull MCP source from the platform."""
+    import base64
+    from headlabs.client import HeadLabsClient
+
+    mcp_id = args.mcp_id
+    mcp_dir = os.path.join(os.getcwd(), "mcps", mcp_id)
+    if os.path.isdir(mcp_dir):
+        try:
+            ans = input(f"  mcps/{mcp_id}/ já existe. Substituir? (y/n): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = "n"
+        if ans not in ("y", "yes", "s", "sim"):
+            print("\033[2m  Cancelado.\033[0m")
+            return
+        import shutil
+        shutil.rmtree(mcp_dir)
+
+    client = HeadLabsClient()
+    try:
+        params = {}
+        ver = getattr(args, "version", None)
+        if ver:
+            params["version"] = ver
+        resp = client.request("GET", f"/mcps/{mcp_id}/source", params=params)
+        files = resp.get("files", {})
+        source_version = resp.get("version")
+    except Exception:
+        files = {}
+        source_version = None
+
+    if files:
+        os.makedirs(mcp_dir, exist_ok=True)
+        for rel_path, b64_content in files.items():
+            full = os.path.join(mcp_dir, rel_path)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "wb") as f:
+                f.write(base64.b64decode(b64_content))
+        # Always write correct Dockerfile
+        with open(os.path.join(mcp_dir, "Dockerfile"), "w") as f:
+            f.write(
+                f"FROM python:3.12-slim\n"
+                f"ENV MCP_ID={mcp_id} PORT=8080 PYTHONUNBUFFERED=1\n"
+                f"WORKDIR /app\n"
+                f"COPY requirements.txt /tmp/requirements.txt\n"
+                f"RUN pip install --no-cache-dir -r /tmp/requirements.txt\n"
+                f"COPY . /app\n"
+                f"EXPOSE 8080\n"
+                f'CMD ["python", "server.py"]\n'
+            )
+        print(f"\033[32m✓ Pull: mcps/{mcp_id}/ v{source_version} ({len(files)} files)\033[0m")
+    else:
+        print(f"\033[33m  Source não encontrado. Crie com: headlabs mcps init {mcp_id}\033[0m")
+        return
+
+    print(f"  \033[2mTestar: headlabs mcps dev {mcp_id}\033[0m")
+    print(f"  \033[2mPush:   headlabs mcps push {mcp_id}\033[0m")
+
+
 def cmd_skills(args):
     """List skills."""
     from headlabs.client import HeadLabsClient
@@ -1124,6 +1397,33 @@ def main():
     # tools
     p_tools = sub.add_parser("tools", help="List available tools and MCPs")
     p_tools.set_defaults(func=cmd_tools)
+
+    # ── MCPs lifecycle ────────────────────────────────────────────────────────
+    p_mcps = sub.add_parser("mcps", aliases=["mcp"], help="MCP servers (init/push/pull/dev)")
+    p_mcps_sub = p_mcps.add_subparsers(dest="mcps_cmd")
+    p_mcps.set_defaults(func=cmd_mcps)
+
+    pm_init = p_mcps_sub.add_parser("init", help="Scaffold a new MCP server (only name required)")
+    pm_init.add_argument("mcp_id", help="MCP ID (lowercase, hyphens)")
+    pm_init.add_argument("--description", help="What this MCP does")
+    pm_init.set_defaults(func=cmd_mcps, mcps_cmd="init")
+
+    pm_push = p_mcps_sub.add_parser("push", help="Push local MCP to platform (version + deploy)")
+    pm_push.add_argument("mcp_id", help="MCP ID (must exist in ./mcps/<id>/)")
+    pm_push.add_argument("--profile", help="AWS profile for ECR auth")
+    pm_push.add_argument("-m", "--message", help="Version commit message")
+    pm_push.add_argument("--wait", action="store_true", help="Block until deploy completes")
+    pm_push.set_defaults(func=cmd_mcps, mcps_cmd="push")
+
+    pm_pull = p_mcps_sub.add_parser("pull", help="Pull a remote MCP's source to ./mcps/<id>/")
+    pm_pull.add_argument("mcp_id", help="MCP ID to pull")
+    pm_pull.add_argument("--version", type=int, help="Pull a specific version")
+    pm_pull.set_defaults(func=cmd_mcps, mcps_cmd="pull")
+
+    pm_dev = p_mcps_sub.add_parser("dev", help="Run MCP locally (localhost:8080)")
+    pm_dev.add_argument("mcp_id", help="MCP ID (must exist in ./mcps/<id>/)")
+    pm_dev.add_argument("--port", type=int, default=8080, help="Local port (default: 8080)")
+    pm_dev.set_defaults(func=cmd_mcps, mcps_cmd="dev")
 
     # chat
     p_chat = sub.add_parser("chat", help="Interactive chat with an agent")
