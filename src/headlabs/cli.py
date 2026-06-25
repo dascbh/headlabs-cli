@@ -76,6 +76,8 @@ def cmd_agents(args):
 
     if hasattr(args, 'subcmd') and args.subcmd == 'create':
         return cmd_agents_create(args)
+    if hasattr(args, 'subcmd') and args.subcmd == 'deploy':
+        return cmd_agents_deploy(args)
 
     client = HeadLabsClient()
     remote = client.list_remote_agents()
@@ -215,6 +217,48 @@ def cmd_agent_create_interactive(args):
     except KeyboardInterrupt:
         pass
     print("\nEncerrado.")
+
+
+def cmd_agents_deploy(args):
+    """Deploy an agent via the platform API (POST /agents/:id/deploy)."""
+    import time as _time
+    from headlabs.client import HeadLabsClient
+
+    client = HeadLabsClient()
+    agent_id = args.agent_id
+    body = {"image_tag": getattr(args, "tag", None) or agent_id,
+            "force": getattr(args, "force", False)}
+    try:
+        resp = client.request("POST", f"/agents/{agent_id}/deploy", json=body)
+    except Exception as exc:
+        print(f"\033[31merro: {exc}\033[0m")
+        sys.exit(2)
+
+    dep_id = resp.get("deployment_id")
+    print(f"\033[32m✓ Deploy iniciado: {dep_id}\033[0m  (agent: {agent_id}, tag: {body['image_tag']})")
+
+    if not getattr(args, "wait", False):
+        print(f"\033[2m  Acompanhe: headlabs agents deploy-status {agent_id} {dep_id}\033[0m")
+        return
+
+    # Poll until terminal
+    deadline = _time.time() + 180
+    while _time.time() < deadline:
+        _time.sleep(5)
+        try:
+            st = client.request("GET", f"/agents/{agent_id}/deployments/{dep_id}")
+        except Exception:
+            continue
+        status = st.get("status", "in_progress")
+        if status == "succeeded":
+            v = st.get("version", "?")
+            print(f"\033[32m✓ Deploy concluído: {agent_id} → v{v}\033[0m")
+            return
+        if status == "failed":
+            print(f"\033[31m✗ Deploy falhou: {st.get('error', '?')}\033[0m")
+            sys.exit(1)
+    print("\033[33m⏱ Timeout (180s). Verifique: headlabs agents deploy-status\033[0m")
+    sys.exit(8)
 
 
 def cmd_skills(args):
@@ -417,6 +461,14 @@ def main():
     p_ac.add_argument("--tenant", help="Tenant ID for polling the wizard session")
     p_ac.add_argument("--verbose", action="store_true", help="Show every progress event")
     p_ac.set_defaults(func=cmd_agents, subcmd="create")
+
+    # agents deploy
+    p_ad = p_agents_sub.add_parser("deploy", help="Deploy an agent (build+push optional, update runtime)")
+    p_ad.add_argument("agent_id", help="Agent ID to deploy")
+    p_ad.add_argument("--tag", help="ECR image tag (default: agent_id)")
+    p_ad.add_argument("--force", action="store_true", help="Skip extended health check")
+    p_ad.add_argument("--wait", action="store_true", help="Block until deployment completes")
+    p_ad.set_defaults(func=cmd_agents, subcmd="deploy")
 
     # skills
     p_skills = sub.add_parser("skills", help="List or create skills")
