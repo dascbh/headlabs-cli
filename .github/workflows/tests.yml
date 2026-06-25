@@ -1,0 +1,59 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * *"        # nightly e2e smoke
+  workflow_dispatch:
+    inputs:
+      run_builds:
+        description: "Run the full autonomous-build e2e (slow, real resources)"
+        type: boolean
+        default: false
+
+jobs:
+  # Fast, deterministic — runs on every PR/push. The e2e tests auto-skip
+  # because HEADLABS_E2E is unset.
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: pytest -q
+
+  # E2E against the live platform. Gated to schedule/manual (real resources,
+  # minutes per build). Needs HEADLABS_API_KEY (+ optional API_URL) as secrets.
+  e2e:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      HEADLABS_E2E: "1"
+      # builds run only on manual dispatch with run_builds=true (else: smoke + guardrails light)
+      HEADLABS_E2E_BUILD: ${{ (github.event_name == 'workflow_dispatch' && inputs.run_builds) && '1' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - name: Configure HeadLabs credentials
+        run: |
+          mkdir -p ~/.headlabs
+          python - <<'PY'
+          import json, os, pathlib
+          cfg = {"api_key": os.environ["HEADLABS_API_KEY"]}
+          if os.environ.get("HEADLABS_API_URL"):
+              cfg["api_url"] = os.environ["HEADLABS_API_URL"]
+          (pathlib.Path.home() / ".headlabs").mkdir(parents=True, exist_ok=True)
+          (pathlib.Path.home() / ".headlabs" / "config.json").write_text(json.dumps(cfg))
+          PY
+        env:
+          HEADLABS_API_KEY: ${{ secrets.HEADLABS_API_KEY }}
+          HEADLABS_API_URL: ${{ secrets.HEADLABS_API_URL }}
+      - run: pytest tests/test_e2e_labs.py -q -rs

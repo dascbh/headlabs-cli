@@ -219,3 +219,19 @@ def test_labs_list_quiet_prints_ids(fake, capsys):
     fake.router = lambda m, p, b: [{"lab_id": "lab_1"}, {"lab_id": "lab_2"}]
     L._labs_list(mkargs(quiet=True))
     assert capsys.readouterr().out.split() == ["lab_1", "lab_2"]
+
+
+# ── contract: loops iterate ──────────────────────────────────────────────────
+
+def test_loops_iterate_requires_intent(fake):
+    with pytest.raises(SystemExit) as e:
+        L._loops_iterate(mkargs(job_id="loop_1", intent=None))
+    assert e.value.code == L.EXIT_USAGE
+
+
+def test_loops_iterate_posts_iteration(fake):
+    fake.router = lambda m, p, b: {"loop_id": "loop_2"}
+    L._loops_iterate(mkargs(job_id="loop_1", intent="trocar para Redis no rate limit"))
+    m, p, b = fake.calls[-1]
+    assert (m, p) == ("POST", "/loops/loop_1/iterate")
+    assert b == {"intent": "trocar para Redis no rate limit"}
