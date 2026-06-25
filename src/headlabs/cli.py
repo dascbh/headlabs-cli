@@ -533,6 +533,7 @@ def main():
     ol.add_argument("--lab", help="Filter by lab id or name")
     ol.add_argument("--status", help="Filter by status")
     ol.add_argument("--active", action="store_true", help="Only non-terminal builds")
+    ol.add_argument("--mode", choices=["build", "research"], help="Filter by job mode")
     _add_common(ol)
     ol.set_defaults(func=labsctl.cmd_loops, loops_cmd="list")
 
@@ -590,6 +591,28 @@ def main():
     opn.add_argument("job_id")
     _add_common(opn)
     opn.set_defaults(func=labsctl.cmd_loops, loops_cmd="panel")
+
+    # ── research (mode="research" — investigate, don't build) ─────────────────
+    # One simple command: `headlabs research "<tema>"`. Defaults already do the
+    # right thing — deep investigation across all available sources — so no
+    # flags are needed for the common case. Flags are only for exceptions.
+    # Follow-up (list/status/watch) reuses the loop surface, which is mode-aware
+    # and renders findings: `headlabs status <id>`, `headlabs loops watch <id>`,
+    # `headlabs loops list --mode research`.
+    p_research = sub.add_parser("research", aliases=["rsch"],
+                                help="Investigate a topic (amplified web search + broad research agent) — returns findings, no build")
+    p_research.add_argument("intent", nargs="?", default=argparse.SUPPRESS,
+                            help="Topic/question to investigate (natural language)")
+    p_research.add_argument("-i", "--intent", dest="intent", default=None,
+                            help=argparse.SUPPRESS)  # back-compat alias for the positional
+    p_research.add_argument("--lab", help="Accumulate findings in an existing lab (id or name); default: create a fresh one")
+    p_research.add_argument("--name", help="Lab name when creating one (default: slug of the topic)")
+    p_research.add_argument("--stack", help="Optional domain tags, comma-separated")
+    p_research.add_argument("--depth", choices=["quick", "standard", "deep", "exhaustive"], default="deep",
+                            help="Investigation depth (default: deep)")
+    p_research.add_argument("--sources", help="Restrict sources, comma-separated (default: all available, e.g. web,docs,repo)")
+    _add_common(p_research, watch=True, wait=True, tenant=True)
+    p_research.set_defaults(func=labsctl.cmd_research)
 
     # ── status (top-level shortcut) ───────────────────────────────────────────
     p_status = sub.add_parser("status", help="Active builds (no arg) or a build's detail")

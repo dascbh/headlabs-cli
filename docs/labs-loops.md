@@ -11,6 +11,10 @@ autônomos), no estilo `kubectl`/`aws-cli`: comandos resource-verb, saída
 - **Loop (job)** — um **build**: o pipeline multi-agente
   `orchestrator → researcher → architect → planner → executor → validator → deliverer`,
   com **gates** (pontos de aprovação humana).
+- **Research (modo do loop)** — um loop com `mode=research`: só **pesquisa
+  investigativa amplificada** (web search + agente de pesquisa ampla) que
+  retorna **findings**, sem construir. Acumula contexto no lab. Veja
+  [`research`](#research--investigar-sem-construir).
 - **Gate** — pausa para aprovação. Por padrão o build pausa em **arquitetura**,
   **plano** e antes de ações **destrutivas**. Você aprova/rejeita e o build segue.
 
@@ -161,6 +165,62 @@ headlabs loops logs    loop_9c83cba1fa52 [--phase executor]
 
 ---
 
+## `research` — investigar, sem construir
+
+Nem todo trabalho é construir. O modo **research** roda **apenas pesquisa
+investigativa amplificada** (web search + um agente de pesquisa ampla e
+abrangente) e retorna **findings** — sem `architect`/`planner`/`executor`, sem
+gerar código. A pesquisa muitas vezes revela caminhos e ideias que *podem* (ou
+não) virar produtos; um levantamento acurado e rigoroso dá a **base de contexto**
+para o sucesso dos builds seguintes.
+
+Internamente é um **loop** com `mode=research` dentro de um lab — os findings
+ficam acumulados no **repositório do lab** e servem de contexto para builds
+futuros (`loops create --lab ...`).
+
+Pipeline (sem gates — é read-only, roda ponta a ponta):
+```
+orchestrator → researcher → analyst → synthesizer → deliverer
+```
+
+### investigar — um comando só
+```bash
+# o caso comum: só o tema. Default já é deep + todas as fontes disponíveis.
+headlabs research "estado da arte em rate limiting distribuído"
+
+# acompanhando ao vivo
+headlabs research "estado da arte em rate limiting distribuído" -w
+
+# investiga dentro de um lab existente (enriquece o contexto dele)
+headlabs research "concorrentes e padrões de pricing de URL shorteners" --lab notes-api
+```
+O **tema** é posicional — não precisa de `-i`. As flags abaixo são só para
+casos excepcionais (o default já cobre o uso normal):
+- `--depth`: profundidade — `quick | standard | deep | exhaustive` (default `deep`).
+- `--sources`: restringe as fontes, separadas por vírgula (default: **todas** as disponíveis, ex.: `web,docs,repo`).
+- `--lab`: acumula os findings num lab existente (id ou nome); sem ela, cria um lab novo.
+- `--name` / `--stack`: nome/tags do lab quando um novo é criado.
+- `-w/--watch`: acompanha ao vivo; `--wait`: bloqueia até terminar (CI).
+
+Saída (`-o json`):
+```json
+{ "lab_id": "lab_280a551ebbf8", "job_id": "loop_9c83cba1fa52", "mode": "research", "created_lab": true }
+```
+
+Ao concluir (com `-w`/`--wait`, ou depois via `status`), os **findings** são
+renderizados: resumo executivo, principais achados, **caminhos/ideias** e fontes.
+
+### acompanhar / listar
+Investigações são loops — use a superfície de loops, que é ciente do modo e
+renderiza os findings:
+```bash
+headlabs status loop_9c83cba1fa52        # pipeline + findings (se concluído)
+headlabs loops watch loop_9c83cba1fa52   # ao vivo; renderiza findings no fim
+headlabs loops list --mode research      # só investigações (coluna MODE)
+```
+
+---
+
 ## `status` — atalho de topo
 ```bash
 headlabs status                  # builds ativos (= loops list --active)
@@ -216,7 +276,8 @@ headlabs labs create -i "build do serviço X" --auto-approve --wait || exit $?
 
 ```
 lab (workspace)
- └── loop (build/job)  ──>  orchestrator → researcher → architect ⏸ → planner ⏸ → executor → validator → deliverer
-                                                          gate          gate
- └── repositório (arquivos)  ──>  push GitHub
+ ├── loop (build/job)   ──> orchestrator → researcher → architect ⏸ → planner ⏸ → executor → validator → deliverer
+ │                                                          gate          gate
+ ├── loop (research)    ──> orchestrator → researcher → analyst → synthesizer → deliverer   (sem gates → findings)
+ └── repositório (arquivos + findings)  ──>  push GitHub
 ```

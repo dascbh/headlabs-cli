@@ -34,6 +34,15 @@ _TERMINAL = _TERMINAL_OK | _TERMINAL_FAIL | _TERMINAL_CANCEL
 _LOOP_PHASES = ["orchestrator", "researcher", "architect", "planner",
                 "executor", "validator", "deliverer"]
 
+# Research mode (mode="research"): amplified investigative research only — no
+# architect/planner/executor build. Broad web search + deep analysis, ending in
+# a synthesized findings report that becomes context for later builds.
+_RESEARCH_PHASES = ["orchestrator", "researcher", "analyst", "synthesizer",
+                    "deliverer"]
+
+# Research depth → server effort budget (breadth of sources, recursion depth).
+_RESEARCH_DEPTHS = ("quick", "standard", "deep", "exhaustive")
+
 # CLI gate name → server gate flag
 _GATE_MAP = {"architecture": "after_architect", "plan": "after_planner",
              "destructive": "before_destructive"}
@@ -323,6 +332,152 @@ def _labs_create(args):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# research (mode="research" loops — investigate, don't build)
+# ════════════════════════════════════════════════════════════════════════════
+
+def _research_opts(args) -> dict:
+    """Research knobs sent to the server under the loop's ``research`` key.
+
+    ``depth`` scales the investigation budget (breadth of sources + recursion);
+    ``sources`` restricts/expands where the agent looks (default: web + the
+    lab's accumulated repository)."""
+    depth = (getattr(args, "depth", None) or "deep").strip().lower()
+    if depth not in _RESEARCH_DEPTHS:
+        _die(f"--depth inválido: {depth} (use {', '.join(_RESEARCH_DEPTHS)})", EXIT_USAGE)
+    opts = {"depth": depth}
+    sources = getattr(args, "sources", None)
+    if sources:
+        opts["sources"] = [s.strip() for s in sources.split(",") if s.strip()]
+    return opts
+
+
+def cmd_research(args):
+    """``research "<tema>"`` — investigate a topic with amplified search (web +
+    a broad investigative agent) and return findings. No build.
+
+    Defaults cover the common case (deep depth, all available sources), so no
+    flags are needed normally. Follow-up reuses the loop surface, which is
+    mode-aware: ``headlabs status <id>``, ``headlabs loops watch <id>``,
+    ``headlabs loops list --mode research``."""
+    return _research_create(args)
+
+
+def _research_create(args):
+    client = HeadLabsClient()
+    intent = getattr(args, "intent", None)
+    if not intent:
+        _die("informe o tema a investigar com -i/--intent", EXIT_USAGE)
+    # Research accumulates findings in a lab (the context base). Reuse an
+    # existing lab when given; otherwise spin up a fresh workspace to hold it.
+    if getattr(args, "lab", None):
+        lab = _resolve_lab(client, args.lab)
+        lab_id, created = lab["lab_id"], False
+    else:
+        name = getattr(args, "name", None) or _slug(intent)
+        stack = [s.strip() for s in (getattr(args, "stack", None) or "").split(",") if s.strip()]
+        lab = client.request("POST", "/labs-v2",
+                              json={"name": name, "description": intent, "stack": stack})
+        lab_id, created = lab["lab_id"], True
+    body = {"intent": intent, "lab_id": lab_id, "mode": "research",
+            "research": _research_opts(args)}
+    loop = client.request("POST", "/loops", json=body)
+    job_id = loop.get("loop_id")
+    if getattr(args, "output", "table") == "json":
+        print(json.dumps({"lab_id": lab_id, "job_id": job_id, "mode": "research",
+                          "created_lab": created}, indent=2))
+    else:
+        if created:
+            print(_c(f"✓ Lab criado: {lab_id}", "green") + f"  ({lab.get('name')})")
+        print(_c(f"✓ Pesquisa iniciada: {job_id}", "green") +
+              _c(f"  [{body['research']['depth']}]", "dim"))
+        print(_c(f"  Acompanhe:  headlabs loops watch {job_id}", "dim"))
+        print(_c(f"  ou:         headlabs status {job_id}", "dim"))
+    if getattr(args, "watch", False) or getattr(args, "wait", False):
+        return _follow(client, job_id, watch=getattr(args, "watch", False),
+                       args=args, mode="research")
+
+
+def _await_findings(client: HeadLabsClient, job_id: str, loop: dict,
+                    attempts: int = 5, delay: float = 1.5) -> dict:
+    """Re-fetch the loop until `findings` is populated.
+
+    The deliverer marks the loop `complete` (via update_loop_state) a beat
+    BEFORE the platform stores the final `findings` in its end-of-run callback,
+    so a loop snapshot taken the instant status flips may not carry findings yet.
+    Poll a few times to close that gap before rendering."""
+    if loop.get("findings"):
+        return loop
+    for _ in range(attempts):
+        time.sleep(delay)
+        try:
+            fresh = client.request("GET", f"/loops/{job_id}")
+        except Exception:  # noqa: BLE001
+            continue
+        if fresh.get("findings"):
+            return fresh
+        loop = fresh or loop
+    return loop
+
+
+def _render_findings(loop: dict) -> None:
+    """Render a research loop's findings: executive summary, key findings,
+    opportunities (paths/ideas), and sources. Degrades gracefully when the
+    server has not (yet) attached structured findings."""
+    findings = loop.get("findings")
+    if not findings:
+        print(_c("Pesquisa concluída — sem findings estruturados retornados.", "dim"))
+        if loop.get("loop_id"):
+            print(_c(f"  Veja depois: headlabs status {loop['loop_id']}", "dim"))
+        return
+    summary = findings.get("summary") or findings.get("overview")
+    if summary:
+        import textwrap
+        print(f"\n{_c('Resumo da pesquisa', 'bold')}")
+        for ln in textwrap.wrap(str(summary).strip(), width=78):
+            print(f"  {ln}")
+
+    key = findings.get("key_findings") or findings.get("themes") or findings.get("findings") or []
+    if key:
+        print(f"\n{_c('Principais achados', 'bold')} ({len(key)})")
+        for f in key[:12]:
+            if isinstance(f, dict):
+                title = f.get("title") or f.get("finding") or f.get("detail") or ""
+                detail = f.get("detail") if f.get("title") else None
+            else:
+                title, detail = str(f), None
+            print(f"  {_c('●', 'cyan')} {_trunc(title, 96)}")
+            if detail and detail != title:
+                print(f"      {_c(_trunc(detail, 100), 'dim')}")
+
+    opps = findings.get("opportunities") or findings.get("ideas") or findings.get("paths") or []
+    if opps:
+        print(f"\n{_c('Caminhos / ideias', 'bold')} ({len(opps)})")
+        for o in opps[:10]:
+            if isinstance(o, dict):
+                title = o.get("title") or o.get("idea") or o.get("detail") or ""
+                conf = o.get("confidence")
+                tail = _c(f"   ({conf})", "dim") if conf else ""
+            else:
+                title, tail = str(o), ""
+            print(f"  {_c('→', 'green')} {_trunc(title, 90)}{tail}")
+
+    sources = findings.get("sources") or []
+    if sources:
+        print(f"\n{_c('Fontes', 'bold')} ({len(sources)})")
+        for s in sources[:12]:
+            if isinstance(s, dict):
+                title = s.get("title") or s.get("name") or ""
+                url = s.get("url") or s.get("href") or ""
+                print(f"  {_c('-', 'dim')} {_trunc(title or url, 70)}  {_c(url if title else '', 'dim')}")
+            else:
+                print(f"  {_c('-', 'dim')} {_trunc(str(s), 90)}")
+
+    report = findings.get("report_path") or findings.get("report")
+    if report and loop.get("lab_id"):
+        print(_c(f"\nRelatório completo: headlabs labs repo {loop['lab_id']} --cat {report}", "dim"))
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # loops
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -369,6 +524,12 @@ def _loops_list(args):
         loops = [l for l in loops if display_status(l) == sfilter or l.get("status") == sfilter]
     if getattr(args, "active", False):
         loops = [l for l in loops if l.get("status") not in _TERMINAL]
+    mfilter = getattr(args, "mode", None)
+    if mfilter:
+        if mfilter == "build":
+            loops = [l for l in loops if (l.get("mode") or "build") == "build"]
+        else:
+            loops = [l for l in loops if l.get("mode") == mfilter]
     if getattr(args, "quiet", False):
         for l in loops:
             print(l.get("loop_id"))
@@ -376,13 +537,14 @@ def _loops_list(args):
     cols = [
         ("JOB_ID", lambda l: l.get("loop_id", "")),
         ("LAB", lambda l: _trunc(l.get("lab_id", ""), 16)),
+        ("MODE", lambda l: l.get("mode") or "build"),
         ("INTENT", lambda l: _trunc(l.get("intent"), 36)),
         ("STAGE", lambda l: l.get("phase", "")),
         ("STATUS", lambda l: display_status(l), "status"),
         ("AGE", lambda l: _age(l.get("started_at"))),
     ]
     if getattr(args, "output", "table") == "wide":
-        cols.insert(5, ("ITER", lambda l: f"{l.get('iterations',0)}/{l.get('max_iterations',5)}"))
+        cols.insert(6, ("ITER", lambda l: f"{l.get('iterations',0)}/{l.get('max_iterations',5)}"))
     render(loops, cols, getattr(args, "output", "table"),
            empty="Nenhum build. Inicie com: headlabs loops create --lab <lab> -i \"...\"")
 
@@ -395,12 +557,17 @@ def _loops_status(args):
         print(json.dumps(loop, indent=2, default=str, ensure_ascii=False))
         return _exit_for(loop)
     phase = loop.get("phase", "")
-    cur_idx = _LOOP_PHASES.index(phase) if phase in _LOOP_PHASES else -1
+    is_research = loop.get("mode") == "research"
+    phases = _RESEARCH_PHASES if is_research else _LOOP_PHASES
+    cur_idx = phases.index(phase) if phase in phases else -1
     print(f"{_c('Job', 'bold')}:     {loop.get('loop_id')}   (lab: {loop.get('lab_id')})")
     print(f"Intent:  {_trunc(loop.get('intent'), 100)}")
-    print(f"Status:  {_color_status(display_status(loop))}    Iteração: {loop.get('iterations',0)}/{loop.get('max_iterations',5)}    Início: {_age(loop.get('started_at'))} atrás")
+    _kind = "Pesquisa" if is_research else "Build"
+    print(f"Modo:    {_kind}    Status:  {_color_status(display_status(loop))}    "
+          f"Iteração: {loop.get('iterations',0)}/{loop.get('max_iterations',5)}    "
+          f"Início: {_age(loop.get('started_at'))} atrás")
     print(_c("Pipeline:", "bold"))
-    for i, ph in enumerate(_LOOP_PHASES):
+    for i, ph in enumerate(phases):
         if cur_idx < 0:
             mark, col = "·", "dim"
         elif i < cur_idx:
@@ -422,6 +589,8 @@ def _loops_status(args):
     res = loop.get("resources_created") or []
     if res:
         print(f"\n{_c('Recursos:', 'bold')} {', '.join(str(r) for r in res[:8])}")
+    if is_research and (loop.get("status") or "").lower() in _TERMINAL_OK:
+        _render_findings(loop)
     return _exit_for(loop)
 
 
@@ -563,9 +732,12 @@ def _exit_for(loop: dict) -> int:
     return EXIT_OK
 
 
-def _follow(client: HeadLabsClient, job_id: str, *, watch: bool, args=None) -> int:
+def _follow(client: HeadLabsClient, job_id: str, *, watch: bool, args=None, mode=None) -> int:
     """Follow a build: render phase transitions + live tool events; stop on
-    terminal status or a pending gate. Returns/exits with a semantic code."""
+    terminal status or a pending gate. Returns/exits with a semantic code.
+
+    ``mode`` hints the kind of job ("research" vs build); when the finished
+    loop is a research run, its synthesized findings are rendered on success."""
     from headlabs.progress import ProgressReporter
     from headlabs.config import get_tenant
 
@@ -603,6 +775,10 @@ def _follow(client: HeadLabsClient, job_id: str, *, watch: bool, args=None) -> i
             if status in _TERMINAL:
                 norm = "succeeded" if status in _TERMINAL_OK else ("cancelled" if status in _TERMINAL_CANCEL else "failed")
                 reporter.finish(norm)
+                if norm == "succeeded" and (mode == "research" or loop.get("mode") == "research"):
+                    # findings land a beat after status flips to complete — wait for them
+                    loop = _await_findings(client, job_id, loop)
+                    _render_findings(loop)
                 code = EXIT_FAILED if status in _TERMINAL_FAIL else EXIT_OK
                 break
             if deadline and time.time() > deadline:

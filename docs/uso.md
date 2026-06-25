@@ -12,6 +12,11 @@ banca, veja `headlabs-platform/docs/judge-panel-spec.md`.
 - **Lab** — workspace de um projeto. Agrupa builds e acumula um repositório de arquivos.
 - **Loop (build)** — um build autônomo. Pipeline de agentes:
   `orchestrator → researcher → architect → planner → executor → validator → deliverer`.
+- **Research** — quando você **não** quer construir, e sim **investigar**. Um loop
+  com `mode=research` que roda só **pesquisa amplificada** (web search + agente de
+  pesquisa ampla e investigativa) e retorna **findings** (resumo, achados,
+  caminhos/ideias, fontes). Acumula contexto no lab pra embasar builds futuros.
+  Veja [a seção `research`](./labs-loops.md#research--investigar-sem-construir).
 - **Gate** — ponto de pausa para revisão: `after_architect`, `after_planner`,
   `before_destructive`.
 - **Banca** — seniors LLM-as-judge que avaliam o artefato no gate (arquitetura/plano).
@@ -82,6 +87,36 @@ O build segue para o gate do plano e, por fim, executa e entrega.
 headlabs status                  # todos os builds ativos
 headlabs loops status <loop_id>  # detalhe (inclui resumo da banca)
 headlabs loops logs   <loop_id>  # trace dos agentes
+```
+
+## 3b. Pesquisar (sem construir)
+
+Quando o objetivo é **entender um tema** antes (ou em vez) de construir. O tema é
+posicional e os defaults já cobrem o caso comum (**deep** + todas as fontes):
+
+```bash
+# o caso comum — só o tema
+headlabs research "estado da arte e concorrentes em rate limiting distribuído"
+
+# acompanhando ao vivo
+headlabs research "estado da arte e concorrentes em rate limiting distribuído" -w
+
+# dentro de um lab que já existe (enriquece o contexto dele)
+headlabs research "padrões de pricing de URL shorteners" --lab notes-api
+```
+
+- É read-only: **não** gera código nem pede gates — roda ponta a ponta.
+- Flags (`--depth quick|standard|deep|exhaustive`, `--sources web,docs,repo`) são
+  só para casos excepcionais; sem elas, é `deep` em todas as fontes.
+- Ao concluir, imprime **findings**: resumo, principais achados, **caminhos/ideias**
+  e fontes. O relatório fica no repositório do lab (`headlabs labs repo <lab> --tree`).
+- Reaproveite: `headlabs loops create --lab <lab> -i "..."` usa esses findings como contexto.
+
+Acompanhar / listar (investigações são loops — a superfície de loops é ciente do modo):
+```bash
+headlabs status <loop_id>             # pipeline + findings
+headlabs loops watch <loop_id>        # ao vivo
+headlabs loops list --mode research   # só investigações
 ```
 
 ---
