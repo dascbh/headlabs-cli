@@ -328,6 +328,9 @@ def cmd_agent_create_interactive(args):
             if err:
                 print(f"  x {err}")
                 break
+            if not answer or not answer.strip():
+                print("\033[33m  (resposta vazia — repita a última mensagem)\033[0m")
+                continue
             print(f"\n{answer}\n")
             history.append({"role": "user", "content": pending})
             history.append({"role": "assistant", "content": answer})
