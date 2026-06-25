@@ -762,9 +762,15 @@ def cmd_agents_pull(args):
     agent_id = args.agent_id
     agent_dir = os.path.join(os.getcwd(), "agents", agent_id)
     if os.path.isdir(agent_dir):
-        print(f"\033[31merro: ./agents/{agent_id}/ já existe localmente.\033[0m")
-        print(f"\033[2m  Remova-o antes ou use outro diretório.\033[0m")
-        sys.exit(2)
+        try:
+            ans = input(f"  ./agents/{agent_id}/ já existe. Substituir? (y/n): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = "n"
+        if ans not in ("y", "yes", "s", "sim"):
+            print("\033[2m  Cancelado.\033[0m")
+            return
+        import shutil
+        shutil.rmtree(agent_dir)
 
     client = HeadLabsClient()
 
