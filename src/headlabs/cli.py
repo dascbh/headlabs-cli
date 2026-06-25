@@ -78,6 +78,8 @@ def cmd_agents(args):
         return cmd_agents_create(args)
     if hasattr(args, 'subcmd') and args.subcmd == 'deploy':
         return cmd_agents_deploy(args)
+    if hasattr(args, 'subcmd') and args.subcmd == 'init':
+        return cmd_agents_init(args)
 
     client = HeadLabsClient()
     remote = client.list_remote_agents()
@@ -356,6 +358,216 @@ def _find_platform_repo() -> str | None:
     return None
 
 
+def cmd_agents_init(args):
+    """Scaffold a new code agent. Only the name is required; everything else
+    has sensible defaults. Generates the full agent directory ready to edit and deploy."""
+    from headlabs.config import load_config
+
+    agent_id = args.agent_id
+    cfg = load_config()
+    platform_path = (
+        cfg.get("platform_path")
+        or os.environ.get("HEADLABS_PLATFORM_PATH")
+        or _find_platform_repo()
+    )
+    if not platform_path:
+        print("\033[31merro: repo da plataforma não encontrado.\033[0m")
+        print("\033[2m  Configure: headlabs config --platform-path /caminho\033[0m")
+        sys.exit(2)
+
+    agent_dir = os.path.join(platform_path, "agents", agent_id)
+    if os.path.exists(agent_dir):
+        print(f"\033[31merro: agents/{agent_id}/ já existe.\033[0m")
+        sys.exit(2)
+
+    # Resolve params with defaults
+    model = getattr(args, "model", None) or "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+    tools = [t.strip() for t in (getattr(args, "tools", None) or "web_search,web_fetch").split(",") if t.strip()]
+    framework = getattr(args, "framework", None) or "strands"
+    memory = getattr(args, "memory", None) or "null"
+    display = agent_id.replace("-", " ").title()
+    module = agent_id.replace("-", "_")
+
+    # Prompt: inline, file, or default template
+    prompt_file = getattr(args, "prompt_file", None)
+    prompt_inline = getattr(args, "prompt", None)
+    if prompt_file:
+        prompt_text = open(prompt_file).read().strip()
+    elif prompt_inline:
+        prompt_text = prompt_inline
+    else:
+        prompt_text = (
+            f"Você é um agente especialista ({display}). Analise a intenção do usuário,\n"
+            f"use as ferramentas disponíveis para coletar dados REAIS e citáveis,\n"
+            f"e retorne uma resposta estruturada e acionável.\n\n"
+            f"Não invente dados. Se algo não for encontrado, diga explicitamente.\n"
+            f"Retorne APENAS JSON com schema {module.title().replace('_','')}Output."
+        )
+
+    # Schema
+    schema_text = getattr(args, "schema", None)
+    if schema_text and os.path.isfile(schema_text):
+        schema_content = open(schema_text).read()
+    else:
+        schema_content = f'''from pydantic import BaseModel
+from typing import Optional
+
+
+class {module.title().replace("_","")}Input(BaseModel):
+    intent: str
+    tenant_id: str
+    loop_id: str = ""
+
+
+class {module.title().replace("_","")}Output(BaseModel):
+    summary: str
+    findings: list[dict] = []
+    sources: list[str] = []
+    processing_time_ms: Optional[int] = None
+'''
+
+    # Tools
+    tool_imports = ", ".join(tools)
+    tools_content = f'''"""Read-only domain tools for {display}."""
+from headlabs_sdk.sdk.platform_tools import {tool_imports}
+'''
+    # If tools are custom (not platform builtins), generate stubs
+    platform_tools = {"web_search", "web_fetch", "list_tenant_mcps"}
+    custom = [t for t in tools if t not in platform_tools]
+    if custom:
+        tools_content = f'''"""Read-only domain tools for {display}."""
+try:
+    from strands import tool
+except ImportError:
+    def tool(f): return f
+
+from headlabs_sdk.sdk.platform_tools import {", ".join(t for t in tools if t in platform_tools) or "web_search"}
+
+'''
+        for t in custom:
+            tools_content += f'''
+@tool
+def {t}() -> dict:
+    """TODO: implement {t}."""
+    return {{"error": "not implemented"}}
+
+'''
+
+    # Agent
+    input_cls = f"{module.title().replace('_','')}Input"
+    output_cls = f"{module.title().replace('_','')}Output"
+    agent_content = f'''"""{display} agent."""
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+
+from headlabs_sdk.sdk import HeadLabsAgentBase, InvocationContext
+from schema import {input_cls}, {output_cls}
+from tools import {tool_imports}
+
+
+_SYSTEM_PROMPT = """
+{prompt_text}
+""".strip()
+
+
+class {module.title().replace("_","")}Agent(HeadLabsAgentBase):
+    input_schema = {input_cls}
+    output_schema = {output_cls}
+    system_prompt = _SYSTEM_PROMPT
+    domain_tools = [{tool_imports}]
+
+    def build_message(self, input_data: {input_cls}, ctx: InvocationContext) -> str:
+        return (
+            f"{{input_data.intent}}\\n\\n"
+            f"tenant_id: {{input_data.tenant_id}}\\n"
+            f"Retorne APENAS JSON com schema {output_cls}."
+        )
+
+
+handler = {module.title().replace("_","")}Agent.as_handler()
+'''
+
+    # Config
+    config_content = f'''agent:
+  id:          {agent_id}
+  version:     "1.0.0"
+  framework:   {framework}
+  category:    general
+  description: "{display}"
+
+llm:
+  model:      {model}
+  max_tokens: 4096
+
+memory:
+  short:  {memory}
+  medium: null
+  long:   null
+
+skills: []
+
+tools:
+  native: []
+  mcp:    []
+
+guardrail: null
+
+tenant:
+  partition_enabled: true
+  isolation:         shared
+
+observability:
+  otel:            true
+  langfuse_traces: false
+  xray:            true
+'''
+
+    # Requirements
+    reqs = "strands-agents>=0.5\npydantic>=2\n"
+
+    # Test
+    test_content = f'''"""Canary test: verify output schema parses."""
+from schema import {output_cls}
+
+
+def test_output_schema_minimal():
+    out = {output_cls}.model_validate({{"summary": "test"}})
+    assert out.summary == "test"
+    assert out.findings == []
+'''
+
+    # Write all files
+    os.makedirs(agent_dir, exist_ok=True)
+    os.makedirs(os.path.join(agent_dir, "tests"), exist_ok=True)
+
+    files = {
+        "agent.py": agent_content,
+        "schema.py": schema_content,
+        "tools.py": tools_content,
+        "config.yaml": config_content,
+        "requirements.txt": reqs,
+        "__init__.py": "",
+        "tests/__init__.py": "",
+        "tests/test_agent.py": test_content,
+    }
+    for name, content in files.items():
+        with open(os.path.join(agent_dir, name), "w") as f:
+            f.write(content)
+
+    # Create underscore symlink for Python imports
+    symlink = os.path.join(platform_path, "agents", module)
+    if not os.path.exists(symlink):
+        os.symlink(agent_dir, symlink)
+
+    print(f"\033[32m✓ Agent scaffold criado: agents/{agent_id}/\033[0m")
+    print(f"\033[2m  agent.py   — handler + prompt + build_message\033[0m")
+    print(f"\033[2m  schema.py  — input/output models\033[0m")
+    print(f"\033[2m  tools.py   — domain tools ({', '.join(tools)})\033[0m")
+    print(f"\033[2m  config.yaml, requirements.txt, tests/\033[0m")
+    print()
+    print(f"\033[2m  Edite, depois: headlabs agents deploy {agent_id} --wait\033[0m")
+
+
 def cmd_skills(args):
     """List skills."""
     from headlabs.client import HeadLabsClient
@@ -565,6 +777,18 @@ def main():
     p_ad.add_argument("--force", action="store_true", help="Skip extended health check")
     p_ad.add_argument("--wait", action="store_true", help="Block until deployment completes")
     p_ad.set_defaults(func=cmd_agents, subcmd="deploy")
+
+    # agents init
+    p_ai = p_agents_sub.add_parser("init", help="Scaffold a new code agent (only name required)")
+    p_ai.add_argument("agent_id", help="Agent ID (lowercase, hyphens)")
+    p_ai.add_argument("--model", help="Bedrock model ID (default: sonnet)")
+    p_ai.add_argument("--tools", help="Tools comma-separated (default: web_search,web_fetch)")
+    p_ai.add_argument("--framework", choices=["strands", "langgraph"], help="Default: strands")
+    p_ai.add_argument("--memory", choices=["null", "short", "medium"], help="Default: null")
+    p_ai.add_argument("--prompt", help="System prompt inline")
+    p_ai.add_argument("--prompt-file", dest="prompt_file", help="System prompt from file")
+    p_ai.add_argument("--schema", help="Path to a custom schema.py file")
+    p_ai.set_defaults(func=cmd_agents, subcmd="init")
 
     # skills
     p_skills = sub.add_parser("skills", help="List or create skills")
