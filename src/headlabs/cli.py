@@ -813,6 +813,36 @@ def cmd_agents_pull(args):
         print(f"\033[32m✓ Pull: agents/{agent_id}/ v{source_version} ({len(files)} files)\033[0m")
         if available and len(available) > 1:
             print(f"\033[2m  Versões disponíveis: {available}\033[0m")
+
+        # Pull skills + prompt from the store (gives dev full context)
+        try:
+            meta = client.request("GET", f"/agents/{agent_id}")
+            manifest = meta.get("manifest") or {}
+            skill_ids = manifest.get("skills") or []
+            if skill_ids:
+                skills_dir = os.path.join(agent_dir, "skills")
+                os.makedirs(skills_dir, exist_ok=True)
+                for sid in skill_ids:
+                    try:
+                        sk = client.request("GET", f"/resources/skill/{sid}")
+                        with open(os.path.join(skills_dir, f"{sid}.md"), "w") as f:
+                            f.write(sk.get("content", ""))
+                    except Exception:
+                        pass
+                print(f"\033[2m  Skills: {', '.join(skill_ids)} → skills/\033[0m")
+        except Exception:
+            pass
+        # Pull the production prompt from the store (may differ from agent.py if hot-updated)
+        try:
+            prompt_resp = client.request("GET", f"/prompts/{agent_id}", params={"label": "production"})
+            prompt_content = prompt_resp.get("content", "")
+            if prompt_content:
+                with open(os.path.join(agent_dir, "prompt.md"), "w") as f:
+                    f.write(f"<!-- Prompt v{prompt_resp.get('version','?')} (production) -->\n")
+                    f.write(prompt_content)
+                print(f"\033[2m  Prompt (store): v{prompt_resp.get('version','?')} → prompt.md\033[0m")
+        except Exception:
+            pass
     else:
         # Fallback: generate scaffold from agent metadata
         print(f"\033[2m  Source não encontrado na plataforma. Gerando scaffold do metadata…\033[0m")
