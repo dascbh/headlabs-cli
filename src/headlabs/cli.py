@@ -668,6 +668,7 @@ FROM 688128002471.dkr.ecr.us-east-1.amazonaws.com/headlabs-agents:sdk-base
 ENV AGENT_ID={agent_id} PORT=8080
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
+COPY . /app/agents/{agent_id}
 COPY . /app/agents/{module}
 EXPOSE 8080
 CMD ["python", "-m", "headlabs_sdk.sdk.runtime"]
@@ -798,6 +799,7 @@ def cmd_agents_pull(args):
                     f"ENV AGENT_ID={agent_id} PORT=8080\n"
                     f"COPY requirements.txt /tmp/requirements.txt\n"
                     f"RUN pip install --no-cache-dir -r /tmp/requirements.txt\n"
+                    f"COPY . /app/agents/{agent_id}\n"
                     f"COPY . /app/agents/{module}\n"
                     f"EXPOSE 8080\n"
                     f'CMD ["python", "-m", "headlabs_sdk.sdk.runtime"]\n'
