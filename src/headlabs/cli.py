@@ -220,45 +220,140 @@ def cmd_agent_create_interactive(args):
 
 
 def cmd_agents_deploy(args):
-    """Deploy an agent via the platform API (POST /agents/:id/deploy)."""
+    """Build + push + deploy an agent. Abstracts Docker/ECR/AgentCore entirely.
+
+    Flow: resolve platform repo → docker build → docker push ECR → POST /deploy → poll READY.
+    The dev only runs: headlabs agents deploy <agent_id> [--wait]
+    """
+    import subprocess
     import time as _time
     from headlabs.client import HeadLabsClient
+    from headlabs.config import load_config
 
-    client = HeadLabsClient()
     agent_id = args.agent_id
-    body = {"image_tag": getattr(args, "tag", None) or agent_id,
-            "force": getattr(args, "force", False)}
-    try:
-        resp = client.request("POST", f"/agents/{agent_id}/deploy", json=body)
-    except Exception as exc:
-        print(f"\033[31merro: {exc}\033[0m")
+    tag = getattr(args, "tag", None) or agent_id
+    client = HeadLabsClient()
+
+    # ── 1. Resolve platform repo path ─────────────────────────────────────────
+    cfg = load_config()
+    platform_path = (
+        cfg.get("platform_path")
+        or os.environ.get("HEADLABS_PLATFORM_PATH")
+        or _find_platform_repo()
+    )
+    if not platform_path or not os.path.isfile(os.path.join(platform_path, "Dockerfile.agent")):
+        print("\033[31merro: repo da plataforma não encontrado.\033[0m")
+        print("\033[2m  Configure: headlabs config --platform-path /caminho/para/headlabs-platform\033[0m")
+        print("\033[2m  Ou defina HEADLABS_PLATFORM_PATH no env.\033[0m")
         sys.exit(2)
 
-    dep_id = resp.get("deployment_id")
-    print(f"\033[32m✓ Deploy iniciado: {dep_id}\033[0m  (agent: {agent_id}, tag: {body['image_tag']})")
+    # ── 2. Determine Dockerfile + image tag ───────────────────────────────────
+    # "loops-latest" tag → Dockerfile.loops (all loop agents); otherwise Dockerfile.agent
+    ACCOUNT = "688128002471"
+    REGION = "us-east-1"
+    ECR = f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/headlabs-agents"
+    image_uri = f"{ECR}:{tag}"
+
+    if tag == "loops-latest" or agent_id.startswith("loop-"):
+        dockerfile = "Dockerfile.loops"
+        if tag != "loops-latest":
+            tag = "loops-latest"
+            image_uri = f"{ECR}:{tag}"
+        build_args = []
+    else:
+        dockerfile = "Dockerfile.agent"
+        module = agent_id.replace("-", "_")
+        build_args = ["--build-arg", f"AGENT_ID={agent_id}",
+                      "--build-arg", f"AGENT_MODULE={module}"]
+
+    # ── 3. Docker build ───────────────────────────────────────────────────────
+    print(f"\033[2m  Building {image_uri}…\033[0m")
+    cmd = ["docker", "build", "--platform", "linux/arm64",
+           "-f", dockerfile, "-t", image_uri, "."] + build_args
+    r = subprocess.run(cmd, cwd=platform_path, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"\033[31merro: docker build falhou\033[0m")
+        print(r.stderr[-500:] if r.stderr else r.stdout[-500:])
+        sys.exit(1)
+    print(f"\033[32m  ✓ Build OK\033[0m")
+
+    # ── 4. ECR login + push ───────────────────────────────────────────────────
+    print(f"\033[2m  Pushing {tag}…\033[0m")
+    profile = getattr(args, "profile", None) or os.environ.get("AWS_PROFILE", "")
+    login_cmd = f"aws ecr get-login-password --region {REGION}"
+    if profile:
+        login_cmd += f" --profile {profile}"
+    login_cmd += f" | docker login --username AWS --password-stdin {ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com"
+    subprocess.run(login_cmd, shell=True, capture_output=True)
+
+    r = subprocess.run(["docker", "push", image_uri], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"\033[31merro: docker push falhou\033[0m")
+        print(r.stderr[-300:] if r.stderr else "")
+        sys.exit(1)
+    print(f"\033[32m  ✓ Push OK\033[0m")
+
+    # ── 5. Trigger deploy via API (don't wait for EventBridge) ────────────────
+    # For loop agents, do batch deploy
+    if tag == "loops-latest":
+        body = {"agents": ["loop-orchestrator", "loop-researcher", "loop-deliverer",
+                           "loop-architect", "loop-planner", "loop-executor", "loop-validator"],
+                "image_tag": tag, "strategy": "parallel"}
+        try:
+            resp = client.request("POST", "/deploy", json=body)
+        except Exception as exc:
+            print(f"\033[31merro na API: {exc}\033[0m")
+            sys.exit(2)
+        print(f"\033[32m✓ Deploy batch iniciado: {resp.get('group_id')}\033[0m")
+        deps = resp.get("deployments", [])
+    else:
+        try:
+            resp = client.request("POST", f"/agents/{agent_id}/deploy",
+                                  json={"image_tag": tag, "force": getattr(args, "force", False)})
+        except Exception as exc:
+            print(f"\033[31merro na API: {exc}\033[0m")
+            sys.exit(2)
+        dep_id = resp.get("deployment_id")
+        print(f"\033[32m✓ Deploy iniciado: {dep_id}\033[0m  ({agent_id})")
+        deps = [{"deployment_id": dep_id, "agent_id": agent_id}]
 
     if not getattr(args, "wait", False):
-        print(f"\033[2m  Acompanhe: headlabs agents deploy-status {agent_id} {dep_id}\033[0m")
         return
 
-    # Poll until terminal
-    deadline = _time.time() + 180
-    while _time.time() < deadline:
+    # ── 6. Poll until all deployments complete ────────────────────────────────
+    deadline = _time.time() + 300
+    pending = {d["deployment_id"]: d["agent_id"] for d in deps}
+    while pending and _time.time() < deadline:
         _time.sleep(5)
-        try:
-            st = client.request("GET", f"/agents/{agent_id}/deployments/{dep_id}")
-        except Exception:
-            continue
-        status = st.get("status", "in_progress")
-        if status == "succeeded":
-            v = st.get("version", "?")
-            print(f"\033[32m✓ Deploy concluído: {agent_id} → v{v}\033[0m")
-            return
-        if status == "failed":
-            print(f"\033[31m✗ Deploy falhou: {st.get('error', '?')}\033[0m")
-            sys.exit(1)
-    print("\033[33m⏱ Timeout (180s). Verifique: headlabs agents deploy-status\033[0m")
-    sys.exit(8)
+        for dep_id, aid in list(pending.items()):
+            try:
+                st = client.request("GET", f"/agents/{aid}/deployments/{dep_id}")
+            except Exception:
+                continue
+            status = st.get("status", "in_progress")
+            if status == "succeeded":
+                print(f"\033[32m  ✓ {aid} → v{st.get('version','?')}\033[0m")
+                del pending[dep_id]
+            elif status == "failed":
+                print(f"\033[31m  ✗ {aid}: {st.get('error','?')[:100]}\033[0m")
+                del pending[dep_id]
+    if pending:
+        print(f"\033[33m⏱ Timeout. Pendentes: {list(pending.values())}\033[0m")
+        sys.exit(8)
+    print(f"\033[32m✓ Todos deployados.\033[0m")
+
+
+def _find_platform_repo() -> str | None:
+    """Try common locations for the headlabs-platform repo."""
+    candidates = [
+        os.path.expanduser("~/Documents/headlabs.ai/headlabs-platform"),
+        os.path.expanduser("~/Documents/headlabs-platform"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "headlabs-platform"),
+    ]
+    for p in candidates:
+        if os.path.isfile(os.path.join(p, "Dockerfile.agent")):
+            return p
+    return None
 
 
 def cmd_skills(args):
@@ -463,9 +558,10 @@ def main():
     p_ac.set_defaults(func=cmd_agents, subcmd="create")
 
     # agents deploy
-    p_ad = p_agents_sub.add_parser("deploy", help="Deploy an agent (build+push optional, update runtime)")
+    p_ad = p_agents_sub.add_parser("deploy", help="Deploy an agent (build+push+update runtime)")
     p_ad.add_argument("agent_id", help="Agent ID to deploy")
-    p_ad.add_argument("--tag", help="ECR image tag (default: agent_id)")
+    p_ad.add_argument("--tag", help="ECR image tag (default: agent_id; loop agents auto-use loops-latest)")
+    p_ad.add_argument("--profile", help="AWS profile for ECR auth (default: env AWS_PROFILE)")
     p_ad.add_argument("--force", action="store_true", help="Skip extended health check")
     p_ad.add_argument("--wait", action="store_true", help="Block until deployment completes")
     p_ad.set_defaults(func=cmd_agents, subcmd="deploy")
