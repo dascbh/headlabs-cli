@@ -796,20 +796,19 @@ def cmd_agents_pull(args):
             os.makedirs(os.path.dirname(full), exist_ok=True)
             with open(full, "wb") as f:
                 f.write(base64.b64decode(b64_content))
-        # Ensure Dockerfile exists (for local run)
-        if not os.path.isfile(os.path.join(agent_dir, "Dockerfile")):
-            module = agent_id.replace("-", "_")
-            with open(os.path.join(agent_dir, "Dockerfile"), "w") as f:
-                f.write(
-                    f"FROM 688128002471.dkr.ecr.us-east-1.amazonaws.com/headlabs-agents:sdk-base\n"
-                    f"ENV AGENT_ID={agent_id} PORT=8080\n"
-                    f"COPY requirements.txt /tmp/requirements.txt\n"
-                    f"RUN pip install --no-cache-dir -r /tmp/requirements.txt\n"
-                    f"COPY . /app/agents/{agent_id}\n"
-                    f"COPY . /app/agents/{module}\n"
-                    f"EXPOSE 8080\n"
-                    f'CMD ["python", "-m", "headlabs_sdk.sdk.runtime"]\n'
-                )
+        # Always write a correct Dockerfile (generated, not user code)
+        module = agent_id.replace("-", "_")
+        with open(os.path.join(agent_dir, "Dockerfile"), "w") as f:
+            f.write(
+                f"FROM 688128002471.dkr.ecr.us-east-1.amazonaws.com/headlabs-agents:sdk-base\n"
+                f"ENV AGENT_ID={agent_id} PORT=8080\n"
+                f"COPY requirements.txt /tmp/requirements.txt\n"
+                f"RUN pip install --no-cache-dir -r /tmp/requirements.txt\n"
+                f"COPY . /app/agents/{agent_id}\n"
+                f"COPY . /app/agents/{module}\n"
+                f"EXPOSE 8080\n"
+                f'CMD ["python", "-m", "headlabs_sdk.sdk.runtime"]\n'
+            )
         print(f"\033[32m✓ Pull: agents/{agent_id}/ v{source_version} ({len(files)} files)\033[0m")
         if available and len(available) > 1:
             print(f"\033[2m  Versões disponíveis: {available}\033[0m")
