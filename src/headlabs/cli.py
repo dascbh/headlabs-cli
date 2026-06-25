@@ -238,25 +238,40 @@ def cmd_agents_deploy(args):
 
     # ── 1. Resolve platform repo path ─────────────────────────────────────────
     cfg = load_config()
-    platform_path = (
-        cfg.get("platform_path")
-        or os.environ.get("HEADLABS_PLATFORM_PATH")
-        or _find_platform_repo()
-    )
-    if not platform_path or not os.path.isfile(os.path.join(platform_path, "Dockerfile.agent")):
-        print("\033[31merro: repo da plataforma não encontrado.\033[0m")
-        print("\033[2m  Configure: headlabs config --platform-path /caminho/para/headlabs-platform\033[0m")
-        print("\033[2m  Ou defina HEADLABS_PLATFORM_PATH no env.\033[0m")
-        sys.exit(2)
+    # Try local ./agents/<id>/ first (self-contained, no platform repo needed),
+    # then fall back to the platform repo for legacy/internal agents.
+    local_agent_dir = os.path.join(os.getcwd(), "agents", agent_id)
+    if os.path.isfile(os.path.join(local_agent_dir, "Dockerfile")):
+        # Self-contained agent: build from its own Dockerfile
+        platform_path = None
+        build_context = local_agent_dir
+        dockerfile = "Dockerfile"
+        build_args = []
+        print(f"\033[2m  Fonte: ./agents/{agent_id}/ (self-contained)\033[0m")
+    else:
+        platform_path = (
+            cfg.get("platform_path")
+            or os.environ.get("HEADLABS_PLATFORM_PATH")
+            or _find_platform_repo()
+        )
+        if not platform_path or not os.path.isfile(os.path.join(platform_path, "Dockerfile.agent")):
+            print("\033[31merro: agente não encontrado em ./agents/ nem no repo da plataforma.\033[0m")
+            print("\033[2m  Crie com: headlabs agents init " + agent_id + "\033[0m")
+            print("\033[2m  Ou configure: HEADLABS_PLATFORM_PATH=/caminho/headlabs-platform\033[0m")
+            sys.exit(2)
+        build_context = platform_path
+        print(f"\033[2m  Fonte: {platform_path} (platform repo)\033[0m")
 
     # ── 2. Determine Dockerfile + image tag ───────────────────────────────────
-    # "loops-latest" tag → Dockerfile.loops (all loop agents); otherwise Dockerfile.agent
     ACCOUNT = "688128002471"
     REGION = "us-east-1"
     ECR = f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/headlabs-agents"
     image_uri = f"{ECR}:{tag}"
 
-    if tag == "loops-latest" or agent_id.startswith("loop-"):
+    if not platform_path:
+        # Self-contained agent (from ./agents/<id>/)
+        pass  # build_context, dockerfile, build_args already set
+    elif tag == "loops-latest" or agent_id.startswith("loop-"):
         dockerfile = "Dockerfile.loops"
         if tag != "loops-latest":
             tag = "loops-latest"
@@ -272,7 +287,7 @@ def cmd_agents_deploy(args):
     print(f"\033[2m  Building {image_uri}…\033[0m")
     cmd = ["docker", "build", "--platform", "linux/arm64",
            "-f", dockerfile, "-t", image_uri, "."] + build_args
-    r = subprocess.run(cmd, cwd=platform_path, capture_output=True, text=True)
+    r = subprocess.run(cmd, cwd=build_context, capture_output=True, text=True)
     if r.returncode != 0:
         print(f"\033[31merro: docker build falhou\033[0m")
         print(r.stderr[-500:] if r.stderr else r.stdout[-500:])
@@ -359,23 +374,12 @@ def _find_platform_repo() -> str | None:
 
 
 def cmd_agents_init(args):
-    """Scaffold a new code agent. Only the name is required; everything else
-    has sensible defaults. Generates the full agent directory ready to edit and deploy."""
-    from headlabs.config import load_config
+    """Scaffold a new code agent in the current directory. Only the name is
+    required; everything else has sensible defaults. The generated structure is
+    self-contained — no need for the headlabs-platform repo."""
 
     agent_id = args.agent_id
-    cfg = load_config()
-    platform_path = (
-        cfg.get("platform_path")
-        or os.environ.get("HEADLABS_PLATFORM_PATH")
-        or _find_platform_repo()
-    )
-    if not platform_path:
-        print("\033[31merro: repo da plataforma não encontrado.\033[0m")
-        print("\033[2m  Configure: headlabs config --platform-path /caminho\033[0m")
-        sys.exit(2)
-
-    agent_dir = os.path.join(platform_path, "agents", agent_id)
+    agent_dir = os.path.join(os.getcwd(), "agents", agent_id)
     if os.path.exists(agent_dir):
         print(f"\033[31merro: agents/{agent_id}/ já existe.\033[0m")
         sys.exit(2)
@@ -428,29 +432,29 @@ class {module.title().replace("_","")}Output(BaseModel):
 
     # Tools
     tool_imports = ", ".join(tools)
-    tools_content = f'''"""Read-only domain tools for {display}."""
-from headlabs_sdk.sdk.platform_tools import {tool_imports}
-'''
-    # If tools are custom (not platform builtins), generate stubs
     platform_tools = {"web_search", "web_fetch", "list_tenant_mcps"}
     custom = [t for t in tools if t not in platform_tools]
-    if custom:
+    if not custom:
+        tools_content = f'''"""Read-only domain tools for {display}."""
+from headlabs_sdk.sdk.platform_tools import {tool_imports}
+'''
+    else:
+        builtin_imports = [t for t in tools if t in platform_tools]
         tools_content = f'''"""Read-only domain tools for {display}."""
 try:
     from strands import tool
 except ImportError:
     def tool(f): return f
-
-from headlabs_sdk.sdk.platform_tools import {", ".join(t for t in tools if t in platform_tools) or "web_search"}
-
 '''
+        if builtin_imports:
+            tools_content += f"\nfrom headlabs_sdk.sdk.platform_tools import {', '.join(builtin_imports)}\n"
         for t in custom:
             tools_content += f'''
+
 @tool
 def {t}() -> dict:
     """TODO: implement {t}."""
     return {{"error": "not implemented"}}
-
 '''
 
     # Agent
@@ -536,6 +540,20 @@ def test_output_schema_minimal():
     assert out.findings == []
 '''
 
+    # Dockerfile (self-contained — dev doesn't need the platform repo)
+    dockerfile_content = f'''# Auto-generated by headlabs agents init
+FROM --platform=linux/arm64 python:3.12-slim
+ENV AGENT_ID={agent_id} PORT=8080 PYTHONPATH=/app PYTHONUNBUFFERED=1
+WORKDIR /app
+
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+COPY . /app/agents/{module}
+EXPOSE 8080
+CMD ["python", "-m", "headlabs_sdk.sdk.runtime"]
+'''
+
     # Write all files
     os.makedirs(agent_dir, exist_ok=True)
     os.makedirs(os.path.join(agent_dir, "tests"), exist_ok=True)
@@ -546,6 +564,7 @@ def test_output_schema_minimal():
         "tools.py": tools_content,
         "config.yaml": config_content,
         "requirements.txt": reqs,
+        "Dockerfile": dockerfile_content,
         "__init__.py": "",
         "tests/__init__.py": "",
         "tests/test_agent.py": test_content,
@@ -554,18 +573,15 @@ def test_output_schema_minimal():
         with open(os.path.join(agent_dir, name), "w") as f:
             f.write(content)
 
-    # Create underscore symlink for Python imports
-    symlink = os.path.join(platform_path, "agents", module)
-    if not os.path.exists(symlink):
-        os.symlink(agent_dir, symlink)
-
-    print(f"\033[32m✓ Agent scaffold criado: agents/{agent_id}/\033[0m")
-    print(f"\033[2m  agent.py   — handler + prompt + build_message\033[0m")
-    print(f"\033[2m  schema.py  — input/output models\033[0m")
-    print(f"\033[2m  tools.py   — domain tools ({', '.join(tools)})\033[0m")
-    print(f"\033[2m  config.yaml, requirements.txt, tests/\033[0m")
+    print(f"\033[32m✓ Agent criado: agents/{agent_id}/\033[0m")
+    print(f"\033[2m  agent.py      handler + prompt + build_message\033[0m")
+    print(f"\033[2m  schema.py     input/output models\033[0m")
+    print(f"\033[2m  tools.py      domain tools ({', '.join(tools)})\033[0m")
+    print(f"\033[2m  Dockerfile    self-contained (deploy sem precisar do repo da plataforma)\033[0m")
+    print(f"\033[2m  config.yaml · requirements.txt · tests/\033[0m")
     print()
-    print(f"\033[2m  Edite, depois: headlabs agents deploy {agent_id} --wait\033[0m")
+    print(f"  Edite, depois:")
+    print(f"  \033[2mheadlabs agents deploy {agent_id} --wait\033[0m")
 
 
 def cmd_skills(args):
