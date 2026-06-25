@@ -733,13 +733,15 @@ def cmd_agents_push(args):
                 content = f.read()
             files[rel] = base64.b64encode(content).decode()
 
-    # Upload source to platform
+    # Upload source to platform (versioned — each push = new immutable version)
     print(f"\033[2m  Uploading {len(files)} files…\033[0m")
     try:
-        client.request("POST", f"/agents/{agent_id}/source",
-                       json={"files": files}, timeout=30)
+        resp = client.request("POST", f"/agents/{agent_id}/source",
+                              json={"files": files, "message": getattr(args, "message", "") or ""},
+                              timeout=30)
+        v = resp.get("version", "?")
+        print(f"\033[32m  ✓ Source v{v}\033[0m")
     except Exception as exc:
-        # If endpoint doesn't exist yet, just warn and proceed with deploy
         print(f"\033[33m  (source upload skipped: {str(exc)[:80]})\033[0m")
 
     # Trigger deploy (reuse cmd_agents_deploy logic)
@@ -767,10 +769,18 @@ def cmd_agents_pull(args):
 
     # Try to get source files from platform
     try:
-        resp = client.request("GET", f"/agents/{agent_id}/source")
+        params = {}
+        ver = getattr(args, "version", None)
+        if ver:
+            params["version"] = ver
+        resp = client.request("GET", f"/agents/{agent_id}/source", params=params)
         files = resp.get("files", {})
+        source_version = resp.get("version")
+        available = resp.get("versions_available", [])
     except Exception:
         files = {}
+        source_version = None
+        available = []
 
     if files:
         os.makedirs(agent_dir, exist_ok=True)
@@ -792,7 +802,9 @@ def cmd_agents_pull(args):
                     f"EXPOSE 8080\n"
                     f'CMD ["python", "-m", "headlabs_sdk.sdk.runtime"]\n'
                 )
-        print(f"\033[32m✓ Pull: agents/{agent_id}/ ({len(files)} files)\033[0m")
+        print(f"\033[32m✓ Pull: agents/{agent_id}/ v{source_version} ({len(files)} files)\033[0m")
+        if available and len(available) > 1:
+            print(f"\033[2m  Versões disponíveis: {available}\033[0m")
     else:
         # Fallback: generate scaffold from agent metadata
         print(f"\033[2m  Source não encontrado na plataforma. Gerando scaffold do metadata…\033[0m")
@@ -1046,12 +1058,14 @@ def main():
     p_ap = p_agents_sub.add_parser("push", help="Push local agent to platform (upload source + deploy)")
     p_ap.add_argument("agent_id", help="Agent ID (must exist in ./agents/<id>/)")
     p_ap.add_argument("--profile", help="AWS profile for ECR auth")
+    p_ap.add_argument("--message", "-m", help="Version commit message")
     p_ap.add_argument("--wait", action="store_true", help="Block until deploy completes")
     p_ap.set_defaults(func=cmd_agents, subcmd="push")
 
     # agents pull
     p_apl = p_agents_sub.add_parser("pull", help="Pull a remote agent's source to ./agents/<id>/")
     p_apl.add_argument("agent_id", help="Agent ID to pull")
+    p_apl.add_argument("--version", type=int, help="Pull a specific version (default: latest/production)")
     p_apl.set_defaults(func=cmd_agents, subcmd="pull")
 
     # skills
