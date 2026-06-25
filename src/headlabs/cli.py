@@ -273,10 +273,9 @@ _ARCHITECT_AGENT_ID = "agent-architect"
 
 
 def cmd_agent_create_interactive(args):
-    """Agentic agent-creation wizard: an assistant conducts the whole creation
-    interview in the terminal — it greets, asks the purpose, whether the agent is
-    conversational / invocation / both, the description, proposes a design, and
-    creates the agent on your approval. Powered by a backend architect agent."""
+    """One-shot agent creation: send the dev's intent, the architect researches
+    and creates in a single invocation. If the architect needs clarification
+    (critical gap after research), it asks once and the dev responds."""
     import uuid
     from headlabs.client import HeadLabsClient
     from headlabs.progress import ProgressReporter
@@ -285,26 +284,24 @@ def cmd_agent_create_interactive(args):
     client = HeadLabsClient()
     session_id = str(uuid.uuid4())
     tenant_id = getattr(args, "tenant", None) or get_tenant()
-    history: list[dict] = []
 
-    print("HeadLabs · criação de agente assistida")
-    print("   O assistente vai conduzir a criação. Digite /exit para sair.\n")
+    print("HeadLabs · criação de agente")
+    print("   Descreva o que você quer. O architect pesquisa e cria.\n")
 
-    # Kickoff: the assistant speaks first and runs the interview.
-    pending = (
-        "Inicie agora a criação de um novo agente comigo. Conduza a entrevista, "
-        "uma pergunta por vez: apresente-se em uma linha e pergunte primeiro o "
-        "propósito do agente; em seguida pergunte se ele será CONVERSACIONAL, de "
-        "INVOCAÇÃO (estruturado) ou AMBOS, e peça uma descrição curta. Quando tiver "
-        "o necessário, proponha o design (id, nome, prompt, tools, schema se aplicável) "
-        "e crie ao receber meu aceite."
-    )
-    show_pending = False  # don't echo the internal kickoff as a user line
+    try:
+        user_input = input("→ ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if not user_input:
+        return
+
+    history = []
+    pending = user_input
 
     try:
         while True:
             reporter = ProgressReporter(quiet=False, verbose=getattr(args, "verbose", False))
-            reporter.begin_wait("Pensando…")
+            reporter.begin_wait("Criando…")
             answer, err = None, None
             try:
                 for event in client.chat_stream(_ARCHITECT_AGENT_ID, session_id, pending,
@@ -329,35 +326,37 @@ def cmd_agent_create_interactive(args):
                 print(f"  x {err}")
                 break
             if not answer or not answer.strip():
-                print("\033[33m  (resposta vazia — repita a última mensagem)\033[0m")
+                print("\033[33m  (timeout — tentando novamente)\033[0m")
                 continue
+
             print(f"\n{answer}\n")
             history.append({"role": "user", "content": pending})
             history.append({"role": "assistant", "content": answer})
-            history = history[-24:]
 
-            # Auto-exit when the architect has created the agent/MCP
+            # Auto-exit when creation is done
             _done_signals = ("push_agent_source", "create_agent", "push_mcp_source",
                              "agente criado", "agent criado", "mcp criado",
                              "headlabs agents deploy", "headlabs mcps deploy",
-                             "versionado (v1", "versionado (v")
+                             "headlabs run", "headlabs chat",
+                             "runtime", "ativado")
             if any(s in (answer or "").lower() for s in _done_signals):
-                print("\033[32m✓ Criação concluída.\033[0m")
+                print("\033[32m✓ Pronto.\033[0m")
                 break
 
-            try:
-                user_input = input("Você: ").strip()
-            except EOFError:
+            # Architect is asking for clarification — let dev respond
+            if "?" in answer:
+                try:
+                    user_input = input("→ ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    break
+                if not user_input or user_input in ("/exit", "/quit"):
+                    break
+                pending = user_input
+            else:
+                # No question, no creation signal — done
                 break
-            if user_input in ("/exit", "/quit"):
-                break
-            if not user_input:
-                continue
-            pending = user_input
-            show_pending = True
     except KeyboardInterrupt:
         pass
-    print("\nEncerrado.")
 
 
 def cmd_agents_deploy(args):
