@@ -1344,6 +1344,8 @@ def main():
     p_agents = sub.add_parser("agents", aliases=["agent"], help="List or create agents")
     p_agents_sub = p_agents.add_subparsers(dest="subcmd")
     p_agents.set_defaults(func=cmd_agents)
+    # agents list (alias for bare `agents`)
+    p_agents_sub.add_parser("list", aliases=["ls"], help="List agents").set_defaults(func=cmd_agents, subcmd=None)
     # agents create — no flags launches the agentic creation wizard
     p_ac = p_agents_sub.add_parser("create", help="Create an agent (no flags = guided agentic wizard)")
     p_ac.add_argument("--id", help="Agent ID (lowercase, hyphens). Omit for the guided wizard.")
