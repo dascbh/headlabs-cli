@@ -333,6 +333,15 @@ def cmd_agent_create_interactive(args):
             history.append({"role": "assistant", "content": answer})
             history = history[-24:]
 
+            # Auto-exit when the architect has created the agent/MCP
+            _done_signals = ("push_agent_source", "create_agent", "push_mcp_source",
+                             "agente criado", "agent criado", "mcp criado",
+                             "headlabs agents deploy", "headlabs mcps deploy",
+                             "versionado (v1", "versionado (v")
+            if any(s in (answer or "").lower() for s in _done_signals):
+                print("\033[32m✓ Criação concluída.\033[0m")
+                break
+
             try:
                 user_input = input("Você: ").strip()
             except EOFError:
