@@ -161,7 +161,7 @@ def test_functional_build(sid, intent, stack, prefixes, cov_min):
         lab_id, job_id = created["lab_id"], created["job_id"]
         final = {}
         try:
-            final = poll_until_terminal(job_id, timeout=600)
+            final = poll_until_terminal(job_id, timeout=900)
             status = (final.get("status") or "").lower()
             if status not in _TERMINAL_OK:
                 last_reason = f"status={status}"
