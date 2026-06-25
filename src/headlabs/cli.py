@@ -80,6 +80,10 @@ def cmd_agents(args):
         return cmd_agents_deploy(args)
     if hasattr(args, 'subcmd') and args.subcmd == 'init':
         return cmd_agents_init(args)
+    if hasattr(args, 'subcmd') and args.subcmd == 'push':
+        return cmd_agents_push(args)
+    if hasattr(args, 'subcmd') and args.subcmd == 'pull':
+        return cmd_agents_pull(args)
 
     client = HeadLabsClient()
     remote = client.list_remote_agents()
@@ -584,6 +588,111 @@ CMD ["python", "-m", "headlabs_sdk.sdk.runtime"]
     print(f"  \033[2mheadlabs agents deploy {agent_id} --wait\033[0m")
 
 
+def cmd_agents_push(args):
+    """Push local agent source to the platform + deploy.
+
+    1. Reads all source files from ./agents/<id>/
+    2. Uploads them to the platform (POST /agents/:id/source)
+    3. Triggers deploy (build + push ECR + update runtime)
+    """
+    import base64
+    from headlabs.client import HeadLabsClient
+
+    agent_id = args.agent_id
+    agent_dir = os.path.join(os.getcwd(), "agents", agent_id)
+    if not os.path.isdir(agent_dir):
+        print(f"\033[31merro: ./agents/{agent_id}/ não encontrado.\033[0m")
+        print(f"\033[2m  Crie com: headlabs agents init {agent_id}\033[0m")
+        sys.exit(2)
+
+    # Collect source files (skip __pycache__, .pyc, tests output)
+    files = {}
+    for root, dirs, fnames in os.walk(agent_dir):
+        dirs[:] = [d for d in dirs if d not in ("__pycache__", ".pytest_cache", "node_modules")]
+        for fname in fnames:
+            if fname.endswith(".pyc"):
+                continue
+            full = os.path.join(root, fname)
+            rel = os.path.relpath(full, agent_dir)
+            with open(full, "rb") as f:
+                content = f.read()
+            files[rel] = base64.b64encode(content).decode()
+
+    client = HeadLabsClient()
+
+    # Upload source to platform
+    print(f"\033[2m  Uploading {len(files)} files…\033[0m")
+    try:
+        client.request("POST", f"/agents/{agent_id}/source",
+                       json={"files": files}, timeout=30)
+    except Exception as exc:
+        # If endpoint doesn't exist yet, just warn and proceed with deploy
+        print(f"\033[33m  (source upload skipped: {str(exc)[:80]})\033[0m")
+
+    # Trigger deploy (reuse cmd_agents_deploy logic)
+    args.tag = None
+    args.force = False
+    cmd_agents_deploy(args)
+
+
+def cmd_agents_pull(args):
+    """Pull a remote agent's source to ./agents/<id>/.
+
+    Downloads the source files previously pushed via `agents push`, or falls
+    back to generating a scaffold from the agent's metadata (prompt, config)."""
+    import base64
+    from headlabs.client import HeadLabsClient
+
+    agent_id = args.agent_id
+    agent_dir = os.path.join(os.getcwd(), "agents", agent_id)
+    if os.path.isdir(agent_dir):
+        print(f"\033[31merro: ./agents/{agent_id}/ já existe localmente.\033[0m")
+        print(f"\033[2m  Remova-o antes ou use outro diretório.\033[0m")
+        sys.exit(2)
+
+    client = HeadLabsClient()
+
+    # Try to get source files from platform
+    try:
+        resp = client.request("GET", f"/agents/{agent_id}/source")
+        files = resp.get("files", {})
+    except Exception:
+        files = {}
+
+    if files:
+        os.makedirs(agent_dir, exist_ok=True)
+        for rel_path, b64_content in files.items():
+            full = os.path.join(agent_dir, rel_path)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "wb") as f:
+                f.write(base64.b64decode(b64_content))
+        print(f"\033[32m✓ Pull: agents/{agent_id}/ ({len(files)} files)\033[0m")
+    else:
+        # Fallback: generate scaffold from agent metadata
+        print(f"\033[2m  Source não encontrado na plataforma. Gerando scaffold do metadata…\033[0m")
+        try:
+            meta = client.request("GET", f"/agents/{agent_id}")
+        except Exception as exc:
+            print(f"\033[31merro: agente '{agent_id}' não encontrado: {exc}\033[0m")
+            sys.exit(2)
+        # Use init with the agent's prompt/description
+        from types import SimpleNamespace
+        init_args = SimpleNamespace(
+            agent_id=agent_id,
+            model=meta.get("model"),
+            tools=",".join(meta.get("manifest", {}).get("tools_native", []) or []) or None,
+            framework=meta.get("framework"),
+            memory=None,
+            prompt=meta.get("prompt"),
+            prompt_file=None,
+            schema=None,
+        )
+        cmd_agents_init(init_args)
+        return
+
+    print(f"  \033[2mEdite e faça push: headlabs agents push {agent_id}\033[0m")
+
+
 def cmd_skills(args):
     """List skills."""
     from headlabs.client import HeadLabsClient
@@ -805,6 +914,18 @@ def main():
     p_ai.add_argument("--prompt-file", dest="prompt_file", help="System prompt from file")
     p_ai.add_argument("--schema", help="Path to a custom schema.py file")
     p_ai.set_defaults(func=cmd_agents, subcmd="init")
+
+    # agents push
+    p_ap = p_agents_sub.add_parser("push", help="Push local agent to platform (upload source + deploy)")
+    p_ap.add_argument("agent_id", help="Agent ID (must exist in ./agents/<id>/)")
+    p_ap.add_argument("--profile", help="AWS profile for ECR auth")
+    p_ap.add_argument("--wait", action="store_true", help="Block until deploy completes")
+    p_ap.set_defaults(func=cmd_agents, subcmd="push")
+
+    # agents pull
+    p_apl = p_agents_sub.add_parser("pull", help="Pull a remote agent's source to ./agents/<id>/")
+    p_apl.add_argument("agent_id", help="Agent ID to pull")
+    p_apl.set_defaults(func=cmd_agents, subcmd="pull")
 
     # skills
     p_skills = sub.add_parser("skills", help="List or create skills")
