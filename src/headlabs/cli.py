@@ -38,8 +38,12 @@ def cmd_run(args):
         verbose=getattr(args, "verbose", False),
     )
     reporter.header(f"{agent_id}  ·  {args.profile}  ·  {args.days}d")
-    result = client.run(agent_id, args.profile, reporter=reporter,
-                        approval_handler=reporter.prompt_approval, **kwargs)
+
+    if getattr(args, "local", False):
+        result = _run_local(agent_id, args, reporter, kwargs)
+    else:
+        result = client.run(agent_id, args.profile, reporter=reporter,
+                            approval_handler=reporter.prompt_approval, **kwargs)
 
     if result.status == "timeout":
         print("Error: agent timed out. Try again or check headlabs.ai dashboard.")
@@ -68,6 +72,135 @@ def cmd_run(args):
             savings=result.total_saving_usd,
             reports=[html_path, json_path],
         )
+
+
+def _run_local(agent_id, args, reporter, kwargs):
+    """Run the agent locally via Docker, streaming NDJSON events from stdout."""
+    import subprocess
+    import json as _json
+    import boto3
+    from headlabs.client import _ephemeral_credentials
+    from headlabs.result import Result
+    from headlabs.config import load_config
+
+    profile = args.profile
+    session = boto3.Session(profile_name=profile)
+    sts = session.client("sts")
+    account_id = kwargs.pop("account_id", None) or sts.get_caller_identity()["Account"]
+    reporter.phase("Perfil AWS resolvido", account_id)
+
+    creds = _ephemeral_credentials(session)
+    if not creds:
+        reporter.phase("Sem credenciais AWS", "execução pode falhar")
+
+    cfg = load_config()
+
+    # Resolve agent image: local ./agents/<id>/ or pre-built ECR tag
+    local_dir = os.path.join(os.getcwd(), "agents", agent_id)
+    image_tag = f"headlabs-local:{agent_id}"
+    if os.path.isfile(os.path.join(local_dir, "Dockerfile")):
+        reporter.phase("Build local", f"./agents/{agent_id}/")
+        r = subprocess.run(
+            ["docker", "build", "--platform", "linux/arm64", "-t", image_tag, "."],
+            cwd=local_dir, capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"\033[31merro: docker build falhou\033[0m\n{r.stderr[-300:]}")
+            sys.exit(1)
+    else:
+        # Try platform repo
+        platform_path = (cfg.get("platform_path")
+                         or os.environ.get("HEADLABS_PLATFORM_PATH")
+                         or _find_platform_repo())
+        if platform_path:
+            reporter.phase("Build local", f"{platform_path}")
+            module = agent_id.replace("-", "_")
+            r = subprocess.run(
+                ["docker", "build", "--platform", "linux/arm64",
+                 "--build-arg", f"AGENT_ID={agent_id}", "--build-arg", f"AGENT_MODULE={module}",
+                 "-f", "Dockerfile.agent", "-t", image_tag, "."],
+                cwd=platform_path, capture_output=True, text=True)
+            if r.returncode != 0:
+                print(f"\033[31merro: docker build falhou\033[0m\n{r.stderr[-300:]}")
+                sys.exit(1)
+        else:
+            print(f"\033[31merro: ./agents/{agent_id}/ não encontrado e HEADLABS_PLATFORM_PATH não configurado.\033[0m")
+            sys.exit(2)
+
+    # Build the input event (same as client.run builds)
+    input_data = {
+        "tenant_id": "ALL",
+        "lookback_days": kwargs.get("days", 30),
+        "aws_region": session.region_name or "us-east-1",
+        "account_id": account_id,
+    }
+    if creds:
+        input_data.update(creds)
+    if kwargs.get("question"):
+        input_data["question"] = kwargs["question"]
+    event = {"input": input_data, "_stream_id": "local"}
+
+    # Docker run: stdin=event, stdout=NDJSON stream, env vars injected
+    env_args = []
+    env_vars = {
+        "AGENT_ID": agent_id,
+        "HEADLABS_LOCAL": "1",
+        "HEADLABS_API_KEY": cfg.get("api_key", ""),
+        "HEADLABS_API_URL": cfg.get("api_url", "https://api.headlabs.ai/api/v1"),
+        "AWS_DEFAULT_REGION": session.region_name or "us-east-1",
+    }
+    if creds:
+        env_vars["AWS_ACCESS_KEY_ID"] = creds.get("aws_access_key_id", "")
+        env_vars["AWS_SECRET_ACCESS_KEY"] = creds.get("aws_secret_access_key", "")
+        if creds.get("aws_session_token"):
+            env_vars["AWS_SESSION_TOKEN"] = creds["aws_session_token"]
+    for k, v in env_vars.items():
+        env_args += ["-e", f"{k}={v}"]
+
+    reporter.phase("Executando local", image_tag)
+    reporter.begin_wait("Agente local processando…")
+
+    cmd = ["docker", "run", "--rm", "-i", "--platform", "linux/arm64"] + env_args + [
+        image_tag, "python", "-m", "headlabs_sdk.sdk.invoke_local"]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+    proc.stdin.write(_json.dumps(event))
+    proc.stdin.close()
+
+    # Stream NDJSON events line-by-line
+    output = None
+    error = None
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = _json.loads(line)
+        except _json.JSONDecodeError:
+            continue
+        etype = ev.get("type")
+        if etype == "result":
+            output = ev.get("output", {})
+        elif etype == "error":
+            error = ev.get("error", "unknown error")
+        else:
+            reporter.event(ev)
+
+    proc.wait()
+    reporter.finish("succeeded" if output else "failed")
+
+    if error and not output:
+        return Result(status="failed", summary=error)
+
+    output = output or {}
+    return Result(
+        status="succeeded",
+        raw_output=output,
+        insights=output.get("insights") or output.get("findings", []),
+        summary=output.get("summary", ""),
+        total_saving_usd=output.get("total_saving_usd", 0.0),
+        account_id=account_id,
+        cost_summary=output.get("cost_summary", {}),
+    )
 
 
 def cmd_agents(args):
@@ -887,6 +1020,7 @@ def main():
     p_run.add_argument("--question", help="Ask a specific question")
     p_run.add_argument("--quiet", action="store_true", help="Suppress progress output")
     p_run.add_argument("--verbose", action="store_true", help="Show every progress event")
+    p_run.add_argument("--local", action="store_true", help="Run the agent locally via Docker (from ./agents/<id>/)")
     p_run.add_argument("--output", choices=["json", "html", "md"], default="html", help="Output format")
     p_run.add_argument("--no-browser", action="store_true", help="Don't open browser")
     p_run.set_defaults(func=cmd_run)
