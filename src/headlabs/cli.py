@@ -1364,6 +1364,8 @@ def cmd_mcps(args):
         return _mcps_dev(args)
     if sub == "connect":
         return _mcps_connect(args)
+    if sub == "test":
+        return _mcps_test(args)
     # Default: list MCPs
     from headlabs.client import HeadLabsClient
     client = HeadLabsClient()
@@ -1376,6 +1378,153 @@ def cmd_mcps(args):
     print("-" * 60)
     for m in mcps:
         print(f"{m.get('id',''):<28} {m.get('name',''):<30}")
+
+
+def _mcps_test(args):
+    """Test an MCP server: connect, discover tools, validate schemas, optionally invoke."""
+    import asyncio, json, time
+
+    mcp_id = args.mcp_id
+    url = getattr(args, "url", None)
+    invoke = getattr(args, "invoke", False)
+
+    # Resolve URL: explicit, local, or platform
+    if not url:
+        if getattr(args, "local", False):
+            port = getattr(args, "port", 8000) or 8000
+            url = f"http://localhost:{port}/mcp"
+        else:
+            url = f"https://mcps.headlabs.ai/{mcp_id}/mcp"
+
+    print(f"\033[1m  MCP Test: {mcp_id}\033[0m")
+    print(f"  Endpoint: {url}")
+    print()
+
+    async def _run():
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
+
+        headers = {}
+        # Add auth for platform MCPs
+        if "mcps.headlabs.ai" in url:
+            try:
+                from headlabs.client import HeadLabsClient
+                c = HeadLabsClient()
+                cfg = c._config()
+                api_key = cfg.get("api_key", "")
+                if api_key:
+                    import base64
+                    cred = base64.b64encode(f"{api_key}:".encode()).decode()
+                    headers["Authorization"] = f"Basic {cred}"
+            except Exception:
+                pass
+
+        t0 = time.time()
+        try:
+            async with streamablehttp_client(url, headers=headers, timeout=30, terminate_on_close=False) as (read, write, _):
+                async with ClientSession(read, write) as session:
+                    # 1. Initialize
+                    await session.initialize()
+                    t_init = time.time() - t0
+                    info = session.server_info if hasattr(session, 'server_info') else None
+                    sname = getattr(info, 'name', '?') if info else '?'
+                    sver = getattr(info, 'version', '?') if info else '?'
+                    print(f"  \033[32m✓ initialize\033[0m  {t_init:.2f}s  server={sname} v{sver}")
+
+                    # 2. List tools
+                    t1 = time.time()
+                    result = await session.list_tools()
+                    tools = result.tools if hasattr(result, 'tools') else []
+                    t_list = time.time() - t1
+                    print(f"  \033[32m✓ tools/list\033[0m  {t_list:.2f}s  {len(tools)} tools discovered")
+                    print()
+
+                    # 3. Validate each tool
+                    issues = []
+                    print(f"  {'TOOL':<30} {'PARAMS':<6} {'SCHEMA':<8} {'STATUS'}")
+                    print(f"  {'-'*70}")
+                    for tool in tools:
+                        name = tool.name
+                        desc = tool.description or ""
+                        schema = tool.inputSchema if hasattr(tool, 'inputSchema') else {}
+                        props = (schema.get("properties") or {}) if isinstance(schema, dict) else {}
+                        required = (schema.get("required") or []) if isinstance(schema, dict) else []
+                        n_params = len(props)
+
+                        # Semantic checks
+                        tool_issues = []
+                        if not desc:
+                            tool_issues.append("no description")
+                        elif len(desc) < 10:
+                            tool_issues.append("description too short")
+                        if n_params > 0 and not required:
+                            tool_issues.append("no required params defined")
+                        for pname, pval in props.items():
+                            if isinstance(pval, dict) and not pval.get("description") and not pval.get("type"):
+                                tool_issues.append(f"param '{pname}' lacks type")
+
+                        status = "\033[32m✓ ok\033[0m" if not tool_issues else f"\033[33m⚠ {'; '.join(tool_issues)}\033[0m"
+                        schema_ok = "✓" if isinstance(schema, dict) and schema.get("type") == "object" else "⚠"
+                        print(f"  {name:<30} {n_params:<6} {schema_ok:<8} {status}")
+                        if tool_issues:
+                            issues.extend([(name, i) for i in tool_issues])
+
+                    print()
+
+                    # 4. Optional: invoke each tool with empty/minimal args
+                    if invoke:
+                        print("  \033[1mInvocation tests (dry-run with minimal args):\033[0m")
+                        for tool in tools:
+                            name = tool.name
+                            schema = tool.inputSchema if hasattr(tool, 'inputSchema') else {}
+                            props = (schema.get("properties") or {}) if isinstance(schema, dict) else {}
+                            required = (schema.get("required") or []) if isinstance(schema, dict) else []
+                            # Build minimal args from required params
+                            test_args = {}
+                            for p in required:
+                                ptype = props.get(p, {}).get("type", "string") if isinstance(props.get(p), dict) else "string"
+                                if ptype == "integer":
+                                    test_args[p] = 1
+                                elif ptype == "number":
+                                    test_args[p] = 1.0
+                                elif ptype == "boolean":
+                                    test_args[p] = True
+                                elif ptype == "array":
+                                    test_args[p] = []
+                                else:
+                                    test_args[p] = "test"
+                            try:
+                                t2 = time.time()
+                                r = await session.call_tool(name, test_args)
+                                elapsed = time.time() - t2
+                                content = r.content if hasattr(r, 'content') else []
+                                text = content[0].text[:80] if content and hasattr(content[0], 'text') else str(content)[:80]
+                                is_error = r.isError if hasattr(r, 'isError') else False
+                                if is_error:
+                                    print(f"    {name:<28} \033[31m✗ error\033[0m {elapsed:.2f}s  {text}")
+                                else:
+                                    print(f"    {name:<28} \033[32m✓\033[0m       {elapsed:.2f}s  {text}")
+                            except Exception as e:
+                                print(f"    {name:<28} \033[31m✗ {str(e)[:60]}\033[0m")
+                        print()
+
+                    # Summary
+                    total = time.time() - t0
+                    n_ok = len(tools) - len(set(i[0] for i in issues))
+                    n_warn = len(set(i[0] for i in issues))
+                    print(f"  \033[1mSummary:\033[0m {len(tools)} tools, {n_ok} ok, {n_warn} warnings, {total:.2f}s total")
+                    if issues:
+                        print(f"  \033[33mIssues:\033[0m")
+                        for tname, issue in issues[:10]:
+                            print(f"    • {tname}: {issue}")
+                    else:
+                        print(f"  \033[32mAll tools pass schema & semantic validation.\033[0m")
+
+        except Exception as e:
+            print(f"  \033[31m✗ Connection failed: {e}\033[0m")
+            return
+
+    asyncio.run(_run())
 
 
 def _mcps_connect(args):
@@ -2013,6 +2162,14 @@ def main():
     pm_conn.add_argument("mcp_id", help="MCP ID to connect")
     pm_conn.add_argument("--token", help="API token/key (prompted if omitted)")
     pm_conn.set_defaults(func=cmd_mcps, mcps_cmd="connect")
+
+    pm_test = p_mcps_sub.add_parser("test", help="Test an MCP: connect, discover tools, validate schemas")
+    pm_test.add_argument("mcp_id", help="MCP ID to test")
+    pm_test.add_argument("--url", help="Custom endpoint URL (overrides auto-resolution)")
+    pm_test.add_argument("--local", action="store_true", help="Test against localhost:8000")
+    pm_test.add_argument("--port", type=int, default=8000, help="Local port (with --local)")
+    pm_test.add_argument("--invoke", action="store_true", help="Also invoke each tool with minimal test args")
+    pm_test.set_defaults(func=cmd_mcps, mcps_cmd="test")
 
     # ── Trigger (event-driven agent invocation) ───────────────────────────────
     p_trigger = sub.add_parser("trigger", help="Event triggers: MCP event → agent invocation")
