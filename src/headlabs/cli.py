@@ -2337,8 +2337,29 @@ def cmd_chat(args):
                     from rich.markdown import Markdown
                     from rich.panel import Panel
                     import re as _re
-                    # Strip emojis (keep ✓✗⚠ which are useful status indicators)
-                    _answer = _re.sub(r'[\U0001F300-\U0001FAFF\U00002702-\U000027B0\U0001F600-\U0001F64F\U0001F680-\U0001F6FF\U0001F900-\U0001F9FF\U0000FE00-\U0000FE0F\U00002600-\U000026FF\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF\U00002B50\U0001F4A5\U0001F4B0\U0001F4CB\U0001F4CA\U0001F4C8\U0001F3AF\U0001F525]', '', answer)
+                    # Strip emojis: remove everything in emoji Unicode ranges
+                    _emoji_re = _re.compile("["
+                        "\U0001F1E0-\U0001F1FF"  # flags
+                        "\U0001F300-\U0001F5FF"  # symbols & pictographs
+                        "\U0001F600-\U0001F64F"  # emoticons
+                        "\U0001F680-\U0001F6FF"  # transport
+                        "\U0001F700-\U0001F77F"  # alchemical
+                        "\U0001F780-\U0001F7FF"  # geometric extended
+                        "\U0001F800-\U0001F8FF"  # supplemental arrows
+                        "\U0001F900-\U0001F9FF"  # supplemental symbols
+                        "\U0001FA00-\U0001FA6F"  # chess symbols
+                        "\U0001FA70-\U0001FAFF"  # symbols extended-A
+                        "\U00002702-\U000027B0"  # dingbats
+                        "\U000024C2-\U0001F251"  # enclosed chars
+                        "\U0000FE00-\U0000FE0F"  # variation selectors
+                        "\U00002600-\U000026FF"  # misc symbols
+                        "\U00002B50-\U00002B55"  # stars
+                        "\U0000200D"             # ZWJ
+                        "\U00002934-\U00002935"  # arrows
+                        "]+", flags=_re.UNICODE)
+                    _answer = _emoji_re.sub('', answer)
+                    # Also strip ✅❌ (checkmarks that aren't our ✓✗⚠)
+                    _answer = _answer.replace('✅', '').replace('❌', '').replace('🔍', '')
                     _console = Console(width=min(Console().width, 100))
                     _console.print()
                     _console.print(Panel(Markdown(_answer), title="Agent", border_style="dim", padding=(1, 2)))
