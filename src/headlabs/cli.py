@@ -350,6 +350,8 @@ def cmd_agent_create_interactive(args):
         "- Select MCPs from the available list that match the intent.\n"
         "- In the prompt, document each MCP's tools by name (query the MCP mentally).\n"
         "- Be specific and actionable in the prompt. No filler.\n"
+        "- NEVER include table_put, table_delete, container_deploy, or storage_upload unless the user EXPLICITLY asks to persist/store data. Analysis agents only need read tools (web_search, web_fetch, table_get, kb_retrieve).\n"
+        "- Prefer the minimal tool set. If the agent only reads/analyzes, do NOT give it write tools.\n"
     )
 
     session_id = str(uuid.uuid4())
