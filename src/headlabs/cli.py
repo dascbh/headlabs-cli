@@ -779,11 +779,26 @@ def _agents_test_tools(client, agent_id, profile, args):
                 relevant = [t for t in unused if not t.startswith("_")][:5]
                 if relevant:
                     print(f"    \033[33m  ⚠ Unused: {', '.join(relevant)}\033[0m")
-                    # Check if unused tools are relevant to the scenario
-                    scenario_lower = scenario.lower()
                     missed = [t for t in relevant if any(k in t for k in ["odd", "bet", "price", "score", "live"])]
                     if missed:
                         print(f"    \033[31m  ✗ Likely needed but not called: {', '.join(missed)}\033[0m")
+
+                # Auto-fix: if --fix flag, patch the agent prompt with MCP tools docs
+                if getattr(args, "fix", False):
+                    tool_list = ", ".join(mcp_tools)
+                    fix_instruction = (
+                        f"Add explicit MCP tools documentation to the prompt: "
+                        f"'MCP TOOLS ({mcp_id}): Available tools: {tool_list}. "
+                        f"ALWAYS use these tools as primary data source before falling back to web_search. "
+                        f"Get IDs from listing tools (e.g. jogos()) first, then call specific tools with the ID.'"
+                    )
+                    print(f"\n  \033[1mAuto-fixing: documenting MCP tools in prompt…\033[0m")
+                    from types import SimpleNamespace
+                    fix_args = SimpleNamespace(id=agent_id, instruction=fix_instruction,
+                                              profile=profile, tenant=None)
+                    from headlabs.cli import cmd_agents_update
+                    cmd_agents_update(fix_args)
+                    print(f"  \033[32m✓ Prompt updated with MCP tools documentation.\033[0m")
 
 
 def cmd_agents_test(args):
