@@ -227,13 +227,18 @@ def cmd_agents(args):
 
 
 def cmd_agents_create(args):
-    """Create a declarative agent.
+    """Create an agent.
 
-    With no --prompt/--prompt-file/--id: launch the AGENTIC creation wizard, where
-    an assistant conducts the whole creation (asks purpose, conversational vs
-    invocation vs both, description, proposes the design, and creates it).
-    With flags: one-shot programmatic creation (for scripts/power users).
+    Inline (one-shot):  headlabs agents create "quero um agente que..."
+    Interactive:        headlabs agents create  (prompts for input)
+    Programmatic:      headlabs agents create --id x --prompt "..."
     """
+    # Agentic creation (NLP → research → create)
+    intent = getattr(args, "intent", None)
+    if intent:
+        # Inline: skip the interactive prompt, go straight
+        args._inline_intent = intent
+        return cmd_agent_create_interactive(args)
     if not getattr(args, "prompt", None) and not getattr(args, "prompt_file", None) and not getattr(args, "id", None):
         return cmd_agent_create_interactive(args)
 
@@ -286,14 +291,20 @@ def cmd_agent_create_interactive(args):
     tenant_id = getattr(args, "tenant", None) or get_tenant()
 
     print("HeadLabs · criação de agente")
-    print("   Descreva o que você quer. O architect pesquisa e cria.\n")
 
-    try:
-        user_input = input("→ ").strip()
-    except (EOFError, KeyboardInterrupt):
-        return
-    if not user_input:
-        return
+    # Inline mode: intent already provided
+    inline = getattr(args, "_inline_intent", None)
+    if inline:
+        user_input = inline
+        print(f"   → {user_input}\n")
+    else:
+        print("   Descreva o que você quer. O architect pesquisa e cria.\n")
+        try:
+            user_input = input("→ ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if not user_input:
+            return
 
     history = []
     # Prefix: force one-shot behavior regardless of prompt cache state
@@ -1356,7 +1367,8 @@ def main():
     # agents list (alias for bare `agents`)
     p_agents_sub.add_parser("list", aliases=["ls"], help="List agents").set_defaults(func=cmd_agents, subcmd=None)
     # agents create — no flags launches the agentic creation wizard
-    p_ac = p_agents_sub.add_parser("create", help="Create an agent (no flags = guided agentic wizard)")
+    p_ac = p_agents_sub.add_parser("create", help="Create an agent (inline or interactive)")
+    p_ac.add_argument("intent", nargs="?", help="What you want (inline, one-shot creation)")
     p_ac.add_argument("--id", help="Agent ID (lowercase, hyphens). Omit for the guided wizard.")
     p_ac.add_argument("--name", help="Display name (defaults to id)")
     p_ac.add_argument("--prompt", help="System prompt (inline)")
