@@ -398,13 +398,13 @@ def _research_create(args):
 
 
 def _await_findings(client: HeadLabsClient, job_id: str, loop: dict,
-                    attempts: int = 5, delay: float = 1.5) -> dict:
+                    attempts: int = 15, delay: float = 3.0) -> dict:
     """Re-fetch the loop until `findings` is populated.
 
     The deliverer marks the loop `complete` (via update_loop_state) a beat
     BEFORE the platform stores the final `findings` in its end-of-run callback,
     so a loop snapshot taken the instant status flips may not carry findings yet.
-    Poll a few times to close that gap before rendering."""
+    Poll for up to ~45s to close that gap before rendering."""
     if loop.get("findings"):
         return loop
     for _ in range(attempts):
@@ -425,9 +425,9 @@ def _render_findings(loop: dict) -> None:
     server has not (yet) attached structured findings."""
     findings = loop.get("findings")
     if not findings:
-        print(_c("Pesquisa concluída — sem findings estruturados retornados.", "dim"))
+        print(_c("Pesquisa concluída — os findings estão sendo finalizados.", "dim"))
         if loop.get("loop_id"):
-            print(_c(f"  Veja depois: headlabs status {loop['loop_id']}", "dim"))
+            print(_c(f"  Rode em instantes: headlabs status {loop['loop_id']}", "dim"))
         return
     summary = findings.get("summary") or findings.get("overview")
     if summary:
@@ -590,7 +590,7 @@ def _loops_status(args):
     if res:
         print(f"\n{_c('Recursos:', 'bold')} {', '.join(str(r) for r in res[:8])}")
     if is_research and (loop.get("status") or "").lower() in _TERMINAL_OK:
-        _render_findings(loop)
+        _render_findings(_await_findings(client, args.job_id, loop))
     return _exit_for(loop)
 
 
