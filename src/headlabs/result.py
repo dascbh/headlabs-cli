@@ -13,6 +13,7 @@ class Result:
     summary: str = ""
     total_saving_usd: float = 0.0
     account_id: str = ""
+    agent_id: str = ""
     cost_summary: dict = field(default_factory=dict)
 
     def to_html(self, path: str) -> None:

@@ -189,6 +189,7 @@ class HeadLabsClient:
             summary=(output.get("summary") if isinstance(output, dict) else None) or default_summary,
             total_saving_usd=output.get("total_saving_usd", 0.0) if isinstance(output, dict) else 0.0,
             account_id=output.get("account_id", "") if isinstance(output, dict) else "",
+            agent_id=output.get("agent_id", data.get("agent_id", "")) if isinstance(output, dict) else data.get("agent_id", ""),
             cost_summary=output.get("cost_summary", {}) if isinstance(output, dict) else {},
         )
 
