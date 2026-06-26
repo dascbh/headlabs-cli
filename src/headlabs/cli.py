@@ -777,12 +777,10 @@ def cmd_agents_test(args):
     scenario = getattr(args, "scenario", None)
     try:
         if profile:
-            # Use the run path (with AWS creds)
             result = client.run(agent_id, profile, days=30,
                                 question=scenario or None)
             output_text = _json.dumps(result.raw_output, ensure_ascii=False, default=str)[:6000]
         else:
-            # Invoke without AWS (for agents that don't need it)
             exec_id, tenant_id, stream_id = client.invoke(agent_id, {
                 "intent": scenario or "análise completa",
                 "tenant_id": "ALL",
@@ -794,21 +792,42 @@ def cmd_agents_test(args):
 
     print(f"\033[2m  Output capturado ({len(output_text)} chars)\033[0m")
 
-    # 3. Send to critic
+    # 3. Send to critic with STRICT schema and fixed dimensions
+    DIMENSIONS = [
+        "task_completion", "reasoning_quality", "tool_usage",
+        "output_structure", "accuracy", "safety"
+    ]
     critic_input = (
-        f"[INSTRUÇÃO: Avalie o output deste agente de forma adversarial. "
-        f"Score 0-100 em 8 dimensões. Seja implacável.]\n\n"
-        f"═══ CONTRATO DO AGENTE ═══\n{contract}\n\n"
-        f"═══ OUTPUT REAL DA EXECUÇÃO ═══\n{output_text}\n\n"
-        f"Avalie. Retorne JSON com schema: "
-        f"{{score, verdict, dimensions[{{name,score,evidence,gap}}], "
-        f"top_gaps[], recommendations[], adversarial_scenarios[]}}"
+        "You are a strict AI agent evaluator. Evaluate the agent execution below.\n\n"
+        "RULES:\n"
+        "- Score each dimension 0-100. Be harsh but fair.\n"
+        "- Provide specific evidence (quote the output) for each score.\n"
+        "- Recommendations must be concrete, actionable instructions that can be applied to the agent's prompt.\n"
+        "- Do NOT return markdown. Return ONLY the JSON object below, nothing else.\n\n"
+        f"═══ AGENT CONTRACT ═══\n{contract}\n\n"
+        f"═══ SCENARIO ═══\n{scenario or '(default analysis)'}\n\n"
+        f"═══ AGENT OUTPUT ═══\n{output_text}\n\n"
+        "Return this EXACT JSON structure (no other text):\n"
+        "{\n"
+        '  "score": <overall 0-100>,\n'
+        '  "verdict": "PASS" | "NEEDS_WORK" | "FAIL",\n'
+        '  "dimensions": {\n'
+        '    "task_completion": {"score": <0-100>, "evidence": "<specific quote or observation>"},\n'
+        '    "reasoning_quality": {"score": <0-100>, "evidence": "..."},\n'
+        '    "tool_usage": {"score": <0-100>, "evidence": "..."},\n'
+        '    "output_structure": {"score": <0-100>, "evidence": "..."},\n'
+        '    "accuracy": {"score": <0-100>, "evidence": "..."},\n'
+        '    "safety": {"score": <0-100>, "evidence": "..."}\n'
+        '  },\n'
+        '  "top_issues": ["<issue 1>", "<issue 2>", ...],\n'
+        '  "fix_instructions": ["<concrete prompt change 1>", "<concrete prompt change 2>", ...]\n'
+        "}"
     )
 
     session_id = str(uuid.uuid4())
     tenant_id = get_tenant()
     reporter = ProgressReporter(quiet=False, verbose=False)
-    print(f"\n\033[1m  Avaliação adversarial: {agent_id}\033[0m")
+    print(f"\n\033[1m  Avaliação: {agent_id}\033[0m")
     reporter.begin_wait("Critic analisando…")
 
     answer = ""
@@ -822,72 +841,96 @@ def cmd_agents_test(args):
                 answer = event.get("message", "")
             elif et == "error":
                 reporter.finish("failed")
-                print(f"  x {event.get('error')}")
+                print(f"  ✗ {event.get('error')}")
                 sys.exit(1)
         reporter.finish("succeeded")
     except Exception as exc:
         reporter.finish("failed")
-        print(f"  x {exc}")
+        print(f"  ✗ {exc}")
         sys.exit(1)
 
-    # 4. Render results
-    # Try to parse JSON from the answer
+    # 4. Parse JSON strictly
+    import re
     evaluation = None
     try:
-        # Find JSON block in the answer
-        import re
-        json_match = re.search(r'\{[\s\S]*"score"[\s\S]*\}', answer)
-        if json_match:
-            evaluation = _json.loads(json_match.group())
+        # Try to find a JSON object with "score" and "verdict"
+        # Use non-greedy matching between outermost braces
+        cleaned = answer.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r'^```\w*\n?', '', cleaned)
+            cleaned = re.sub(r'\n?```$', '', cleaned)
+        # Find the JSON object
+        brace_start = cleaned.find("{")
+        if brace_start >= 0:
+            depth = 0
+            end = brace_start
+            for i in range(brace_start, len(cleaned)):
+                if cleaned[i] == "{":
+                    depth += 1
+                elif cleaned[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+            evaluation = _json.loads(cleaned[brace_start:end])
     except Exception:
         pass
 
-    if evaluation:
-        score = evaluation.get("score", 0)
-        verdict = evaluation.get("verdict", "?")
-        color = "\033[32m" if verdict == "PASS" else ("\033[33m" if verdict == "NEEDS_WORK" else "\033[31m")
+    if not evaluation or "score" not in evaluation:
+        print(f"\n  \033[31m✗ Critic não retornou JSON válido. Raw:\033[0m")
+        print(f"  {answer[:400]}")
+        return
 
-        print(f"\n  {color}{'━' * 50}\033[0m")
-        print(f"  {color}  SCORE: {score}/100  ·  VERDICT: {verdict}\033[0m")
-        print(f"  {color}{'━' * 50}\033[0m\n")
+    # 5. Render results (deterministic format)
+    score = evaluation.get("score", 0)
+    verdict = evaluation.get("verdict", "?")
+    color = "\033[32m" if verdict == "PASS" else ("\033[33m" if verdict == "NEEDS_WORK" else "\033[31m")
 
-        dims = evaluation.get("dimensions", [])
-        if dims:
-            print("  \033[1mDimensões:\033[0m")
-            for d in dims:
-                s = d.get("score", 0)
-                dc = "\033[32m" if s >= 80 else ("\033[33m" if s >= 60 else "\033[31m")
-                print(f"    {dc}{s:>3}\033[0m  {d.get('name','')}")
-                if d.get("gap"):
-                    print(f"         \033[2m↳ {d['gap'][:120]}\033[0m")
-            print()
+    print(f"\n  {color}{'━' * 50}\033[0m")
+    print(f"  {color}  SCORE: {score}/100  ·  {verdict}\033[0m")
+    print(f"  {color}{'━' * 50}\033[0m\n")
 
-        gaps = evaluation.get("top_gaps", [])
-        if gaps:
-            print("  \033[1mTop gaps:\033[0m")
-            for g in gaps[:5]:
-                print(f"    \033[31m✗\033[0m {g[:150]}")
-            print()
+    dims = evaluation.get("dimensions", {})
+    if isinstance(dims, dict):
+        print(f"  {'DIMENSION':<22} {'SCORE':<7} EVIDENCE")
+        print(f"  {'-'*65}")
+        for dname in DIMENSIONS:
+            d = dims.get(dname, {})
+            s = d.get("score", 0) if isinstance(d, dict) else 0
+            ev = d.get("evidence", "") if isinstance(d, dict) else ""
+            dc = "\033[32m" if s >= 80 else ("\033[33m" if s >= 60 else "\033[31m")
+            print(f"  {dname:<22} {dc}{s:>3}/100\033[0m  {ev[:55]}")
+        print()
 
-        recs = evaluation.get("recommendations", [])
-        if recs:
-            print("  \033[1mRecomendações:\033[0m")
-            for r in recs[:5]:
-                print(f"    \033[36m→\033[0m {r[:150]}")
-            print()
-    else:
-        # Fallback: print raw answer
-        print(f"\n{answer}\n")
+    issues = evaluation.get("top_issues", [])
+    if issues:
+        print("  \033[1mIssues:\033[0m")
+        for g in issues[:5]:
+            print(f"    \033[31m✗\033[0m {g[:140]}")
+        print()
 
-    # 5. Auto-fix if requested
-    if getattr(args, "fix", False) and evaluation and evaluation.get("recommendations"):
-        recs = evaluation["recommendations"]
-        instruction = "; ".join(recs[:3])
-        print(f"\033[2m  Aplicando fix: {instruction[:100]}…\033[0m")
+    fixes = evaluation.get("fix_instructions", [])
+    if fixes:
+        print("  \033[1mFix instructions:\033[0m")
+        for f in fixes[:5]:
+            print(f"    \033[36m→\033[0m {f[:140]}")
+        print()
+
+    # 6. Auto-fix: apply fix_instructions + re-validate
+    if getattr(args, "fix", False) and fixes:
+        instruction = " | ".join(fixes[:3])
+        print(f"\033[1m  Applying fix…\033[0m")
+        print(f"  \033[2m{instruction[:120]}\033[0m")
         from types import SimpleNamespace
         fix_args = SimpleNamespace(id=agent_id, instruction=instruction,
                                    profile=profile, tenant=None)
         cmd_agents_update(fix_args)
+
+        # Re-run the test to validate the fix worked
+        print(f"\n\033[1m  Re-validating after fix…\033[0m")
+        retest_args = SimpleNamespace(agent_id=agent_id, profile=profile,
+                                      scenario=scenario, fix=False, tools=False, reasoning=True)
+        _agents_test_reasoning(client, agent_id, profile, retest_args)
 
 
 def cmd_agents_deploy(args):
