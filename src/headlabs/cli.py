@@ -926,19 +926,28 @@ def cmd_agents_test(args):
     tc_c = "\033[32m" if tc_score >= 70 else ("\033[33m" if tc_score >= 40 else "\033[31m")
     print(f"  {'tool_calls':<22} {tc_c}{tc_bar} {tc_score:>3}/100\033[0m  {n_tool_calls} calls")
 
-    print(f"\n  {color}Overall: {score}/100 — {verdict}\033[0m")
+    # Overall: same bar style, then actionable next step
+    ov_blocks = score // 10
+    ov_bar = "█" * ov_blocks + "░" * (10 - ov_blocks)
+    print(f"\n  {'OVERALL':<22} {color}{ov_bar} {score:>3}/100\033[0m")
 
     issues = evaluation.get("top_issues", [])
-    if issues:
-        print(f"\n  \033[1mIssues:\033[0m")
-        for g in issues[:5]:
-            print(f"    \033[31m✗\033[0m {g[:130]}")
-
     fixes = evaluation.get("fix_instructions", [])
-    if fixes:
-        print(f"\n  \033[1mFix instructions:\033[0m")
-        for f in fixes[:5]:
-            print(f"    \033[36m→\033[0m {f[:130]}")
+    if score >= 80:
+        print(f"  \033[32mAgent is production-ready.\033[0m")
+    elif issues:
+        print(f"\n  \033[1mPrioridade:\033[0m {issues[0][:120]}")
+        if fixes:
+            print(f"  \033[1mAção:\033[0m {fixes[0][:120]}")
+
+    if len(issues) > 1:
+        print(f"\n  \033[2mOutros issues:\033[0m")
+        for g in issues[1:5]:
+            print(f"    \033[31m✗\033[0m {g[:120]}")
+    if len(fixes) > 1:
+        print(f"\n  \033[2mOutras ações:\033[0m")
+        for f in fixes[1:5]:
+            print(f"    \033[36m→\033[0m {f[:120]}")
     print()
 
     # 6. Auto-fix: apply fix_instructions + re-validate
