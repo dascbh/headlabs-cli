@@ -1201,6 +1201,34 @@ def cmd_schedule(args):
             print(f"{s.get('agent_id',''):<28} {s.get('cron',''):<20} {s.get('enabled','')}")
 
 
+def cmd_marketplace(args):
+    """Unified marketplace: list all agents + MCPs available to the tenant."""
+    from headlabs.client import HeadLabsClient
+    client = HeadLabsClient()
+
+    print(f"\033[1m{'TYPE':<8} {'ID':<30} {'STATUS':<10} {'DESCRIPTION'}\033[0m")
+    print("─" * 90)
+
+    # Agents
+    try:
+        agents = client.list_remote_agents()
+        for a in (agents or []):
+            if a.get("id") == "agent-architect":
+                continue
+            print(f"\033[36m{'agent':<8}\033[0m {a.get('id',''):<30} {a.get('status','?'):<10} {(a.get('description','') or '')[:40]}")
+    except Exception:
+        pass
+
+    # MCPs
+    try:
+        tools = client.list_tools()
+        mcps = [t for t in tools if t.get("type") == "mcp"]
+        for m in mcps:
+            print(f"\033[33m{'mcp':<8}\033[0m {m.get('id',''):<30} {'active':<10} {(m.get('name','') or '')[:40]}")
+    except Exception:
+        pass
+
+
 def cmd_webhook(args):
     """Webhook commands: create, get, remove."""
     from headlabs.client import HeadLabsClient
@@ -1223,6 +1251,53 @@ def cmd_webhook(args):
         print(f"\033[32m✓ Webhook removido\033[0m")
     else:
         print("Use: headlabs webhook create <agent_id>")
+
+
+def cmd_trigger(args):
+    """Event triggers: set an MCP event to invoke an agent."""
+    from headlabs.client import HeadLabsClient
+    client = HeadLabsClient()
+    sub = getattr(args, "trigger_cmd", None)
+
+    if sub == "set":
+        body = {
+            "source": args.source,
+            "event": getattr(args, "event", "") or "any",
+            "filter": {},
+        }
+        flt = getattr(args, "filter", None)
+        if flt:
+            # Parse "key=value,key2=value2"
+            for pair in flt.split(","):
+                if "=" in pair:
+                    k, v = pair.split("=", 1)
+                    body["filter"][k.strip()] = v.strip()
+        try:
+            r = client.request("POST", f"/agents/{args.agent_id}/trigger", json=body)
+            print(f"\033[32m✓ Trigger: {args.agent_id} ← {args.source}:{body['event']}\033[0m")
+            print(f"\033[2m  ID: {r.get('trigger_id')}\033[0m")
+            # Also create a webhook so the MCP source can call back
+            hook = client.request("POST", f"/agents/{args.agent_id}/webhook")
+            print(f"\033[2m  Webhook URL (configure no {args.source}): {hook.get('url')}\033[0m")
+            print(f"\033[2m  Token: {hook.get('auth_token')}\033[0m")
+        except Exception as exc:
+            print(f"\033[31merro: {exc}\033[0m")
+    elif sub == "remove":
+        client.request("DELETE", f"/agents/{args.agent_id}/trigger/{args.trigger_id}")
+        print(f"\033[32m✓ Trigger removido\033[0m")
+    else:
+        # List
+        try:
+            items = client.request("GET", "/triggers")
+            if not items:
+                print("Nenhum trigger configurado.")
+                return
+            print(f"{'AGENT':<25} {'SOURCE':<15} {'EVENT':<15} {'FILTER'}")
+            print("-" * 70)
+            for t in items:
+                print(f"{t.get('agent_id',''):<25} {t.get('source',''):<15} {t.get('event',''):<15} {t.get('filter','')}")
+        except Exception:
+            print("Nenhum trigger configurado.")
 
 
 def cmd_pipeline(args):
@@ -1277,7 +1352,7 @@ def cmd_pipeline(args):
 
 
 def cmd_mcps(args):
-    """MCP lifecycle: init, push, pull, dev."""
+    """MCP lifecycle: init, push, pull, dev, connect."""
     sub = getattr(args, "mcps_cmd", None)
     if sub == "init":
         return _mcps_init(args)
@@ -1287,6 +1362,8 @@ def cmd_mcps(args):
         return _mcps_pull(args)
     if sub == "dev":
         return _mcps_dev(args)
+    if sub == "connect":
+        return _mcps_connect(args)
     # Default: list MCPs
     from headlabs.client import HeadLabsClient
     client = HeadLabsClient()
@@ -1299,6 +1376,29 @@ def cmd_mcps(args):
     print("-" * 60)
     for m in mcps:
         print(f"{m.get('id',''):<28} {m.get('name',''):<30}")
+
+
+def _mcps_connect(args):
+    """Store tenant credentials for an MCP (so the runtime can authenticate)."""
+    from headlabs.client import HeadLabsClient
+    client = HeadLabsClient()
+    mcp_id = args.mcp_id
+    token = getattr(args, "token", None)
+    if not token:
+        try:
+            token = input(f"  Token/API key for {mcp_id}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+    if not token:
+        print("\033[31merro: token vazio\033[0m")
+        return
+    try:
+        client.request("POST", f"/mcps/{mcp_id}/credentials",
+                       json={"token": token})
+        print(f"\033[32m✓ Credenciais salvas: {mcp_id}\033[0m")
+        print(f"\033[2m  Agentes com manifest.mcp=[{{\"server\":\"{mcp_id}\"}}] usarão este token.\033[0m")
+    except Exception as exc:
+        print(f"\033[31merro: {exc}\033[0m")
 
 
 def _mcps_init(args):
@@ -1723,6 +1823,11 @@ def main():
     # run
     p_run = sub.add_parser("run", help="Run an AI agent")
 
+    # ── Marketplace (unified listing) ────────────────────────────────────────
+    p_market = sub.add_parser("marketplace", aliases=["market"],
+                              help="Unified marketplace: list all agents + MCPs available")
+    p_market.set_defaults(func=cmd_marketplace)
+
     # ── Schedule ──────────────────────────────────────────────────────────────
     p_sched = sub.add_parser("schedule", help="Schedule an agent to run on cron")
     p_sched_sub = p_sched.add_subparsers(dest="sched_cmd")
@@ -1903,6 +2008,31 @@ def main():
     pm_dev.add_argument("mcp_id", help="MCP ID (must exist in ./mcps/<id>/)")
     pm_dev.add_argument("--port", type=int, default=8080, help="Local port (default: 8080)")
     pm_dev.set_defaults(func=cmd_mcps, mcps_cmd="dev")
+
+    pm_conn = p_mcps_sub.add_parser("connect", help="Store tenant credentials for an MCP")
+    pm_conn.add_argument("mcp_id", help="MCP ID to connect")
+    pm_conn.add_argument("--token", help="API token/key (prompted if omitted)")
+    pm_conn.set_defaults(func=cmd_mcps, mcps_cmd="connect")
+
+    # ── Trigger (event-driven agent invocation) ───────────────────────────────
+    p_trigger = sub.add_parser("trigger", help="Event triggers: MCP event → agent invocation")
+    p_trigger_sub = p_trigger.add_subparsers(dest="trigger_cmd")
+    p_trigger.set_defaults(func=cmd_trigger)
+
+    pt_set = p_trigger_sub.add_parser("set", help="Set an event trigger")
+    pt_set.add_argument("agent_id", help="Agent to invoke")
+    pt_set.add_argument("--source", required=True, help="MCP source (e.g. slack, github)")
+    pt_set.add_argument("--event", help="Event type (e.g. message, pull_request.opened)")
+    pt_set.add_argument("--filter", help="Filter: key=value,key2=value2")
+    pt_set.set_defaults(func=cmd_trigger, trigger_cmd="set")
+
+    pt_ls = p_trigger_sub.add_parser("list", aliases=["ls"], help="List triggers")
+    pt_ls.set_defaults(func=cmd_trigger, trigger_cmd="list")
+
+    pt_rm = p_trigger_sub.add_parser("remove", help="Remove a trigger")
+    pt_rm.add_argument("agent_id", help="Agent ID")
+    pt_rm.add_argument("trigger_id", help="Trigger ID to remove")
+    pt_rm.set_defaults(func=cmd_trigger, trigger_cmd="remove")
 
     # chat
     p_chat = sub.add_parser("chat", help="Interactive chat with an agent")
