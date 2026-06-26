@@ -1366,18 +1366,20 @@ def cmd_mcps(args):
         return _mcps_connect(args)
     if sub == "test":
         return _mcps_test(args)
-    # Default: list MCPs
+    # Default (bare `headlabs mcps` or `headlabs mcps list`): list MCPs
     from headlabs.client import HeadLabsClient
     client = HeadLabsClient()
-    tools = client.list_tools()
-    mcps = [t for t in tools if t.get("type") == "mcp"]
+    try:
+        mcps = client.request("GET", "/mcps")
+    except Exception:
+        mcps = []
     if not mcps:
         print("No MCPs found.")
         return
     print(f"{'ID':<28} {'Name':<30}")
     print("-" * 60)
-    for m in mcps:
-        print(f"{m.get('id',''):<28} {m.get('name',''):<30}")
+    for m in sorted(mcps, key=lambda x: x.get("id", "")):
+        print(f"{m.get('id',''):<28} {m.get('display_name','') or m.get('name',''):<30}")
 
 
 def _mcps_test(args):
@@ -2170,6 +2172,9 @@ def main():
     pm_test.add_argument("--port", type=int, default=8000, help="Local port (with --local)")
     pm_test.add_argument("--invoke", action="store_true", help="Also invoke each tool with minimal test args")
     pm_test.set_defaults(func=cmd_mcps, mcps_cmd="test")
+
+    pm_list = p_mcps_sub.add_parser("list", aliases=["ls"], help="List MCPs on the platform")
+    pm_list.set_defaults(func=cmd_mcps, mcps_cmd="list")
 
     # ── Trigger (event-driven agent invocation) ───────────────────────────────
     p_trigger = sub.add_parser("trigger", help="Event triggers: MCP event → agent invocation")
