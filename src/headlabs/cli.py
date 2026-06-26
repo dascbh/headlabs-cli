@@ -909,11 +909,26 @@ def cmd_agents_test(args):
 
     print(f"\n  {color}Overall: {score}/100 — {verdict}\033[0m")
 
-    # Deterministic metrics (measured, not LLM-judged)
-    latency_color = "\033[32m" if exec_time < 30 else ("\033[33m" if exec_time < 60 else "\033[31m")
-    print(f"\n  \033[1mPerformance (measured):\033[0m")
-    print(f"    Latency:     {latency_color}{exec_time:.1f}s\033[0m")
-    print(f"    Tool calls:  {n_tool_calls}")
+    # Deterministic dimensions (measured, same visual as above)
+    # Latency: 100=instant (<5s), 0=very slow (>120s)
+    lat_score = max(0, min(100, int(100 - (exec_time / 120) * 100)))
+    lat_blocks = lat_score // 10
+    lat_bar = "█" * lat_blocks + "░" * (10 - lat_blocks)
+    lat_c = "\033[32m" if lat_score >= 70 else ("\033[33m" if lat_score >= 40 else "\033[31m")
+    print(f"  {'latency':<22} {lat_c}{lat_bar} {lat_score:>3}/100\033[0m  {exec_time:.1f}s")
+    # Tool calls: score based on efficiency (1-5 calls=100, 6-15=70, 16+=40, 0=50)
+    if n_tool_calls == 0:
+        tc_score = 50
+    elif n_tool_calls <= 5:
+        tc_score = 100
+    elif n_tool_calls <= 15:
+        tc_score = 70
+    else:
+        tc_score = max(20, 100 - n_tool_calls * 2)
+    tc_blocks = tc_score // 10
+    tc_bar = "█" * tc_blocks + "░" * (10 - tc_blocks)
+    tc_c = "\033[32m" if tc_score >= 70 else ("\033[33m" if tc_score >= 40 else "\033[31m")
+    print(f"  {'tool_calls':<22} {tc_c}{tc_bar} {tc_score:>3}/100\033[0m  {n_tool_calls} calls")
 
     issues = evaluation.get("top_issues", [])
     if issues:
