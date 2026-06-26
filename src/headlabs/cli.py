@@ -521,9 +521,26 @@ def _agents_test_reasoning(client, agent_id, profile, args):
     try:
         agent = client.request("GET", f"/agents/{agent_id}")
         manifest = agent.get("manifest", {})
+        # Discover actual MCP tools available
+        mcp_tools_available = {}
+        for mcp_entry in manifest.get("mcp", []):
+            mcp_id = mcp_entry.get("server", mcp_entry) if isinstance(mcp_entry, dict) else mcp_entry
+            try:
+                import httpx, json as _jj
+                resp = httpx.post(f"https://mcps.headlabs.ai/{mcp_id}/mcp",
+                                  json={"jsonrpc": "2.0", "id": 99, "method": "tools/list", "params": {}},
+                                  headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+                                  timeout=15)
+                for line in resp.text.split("\n"):
+                    if line.startswith("data:"):
+                        body = _jj.loads(line[5:].strip())
+                        mcp_tools_available[mcp_id] = [t.get("name") for t in body.get("result", {}).get("tools", [])]
+            except Exception:
+                pass
         contract = (f"Agent: {agent_id}\nDescription: {agent.get('description','')}\n"
                     f"Tools: {manifest.get('tools_native',[])}\n"
                     f"MCPs: {manifest.get('mcp',[])}\n"
+                    f"MCP Tools Available: {mcp_tools_available}\n"
                     f"Prompt (truncated): {agent.get('prompt','')[:2000]}")
     except Exception:
         contract = f"Agent: {agent_id} (contract unavailable)"
@@ -723,6 +740,50 @@ def _agents_test_tools(client, agent_id, profile, args):
         print(f"  \033[31m  {n_fail} tool(s) falharam — verifique credenciais/conectividade do MCP.\033[0m")
     else:
         print(f"  \033[32m  Todas as tools funcionaram.\033[0m")
+
+    # MCP Coverage: check if the agent used the tools its MCPs expose
+    if expected_mcps:
+        print(f"\n  \033[1mMCP Coverage:\033[0m")
+        tools_used = set(tc["name"] for tc in tool_calls)
+        for mcp_entry in expected_mcps:
+            mcp_id = mcp_entry.get("server", mcp_entry) if isinstance(mcp_entry, dict) else mcp_entry
+            # Fetch tools available from MCP
+            try:
+                import httpx
+                resp = httpx.post(f"https://mcps.headlabs.ai/{mcp_id}/mcp",
+                                  json={"jsonrpc": "2.0", "id": 99, "method": "tools/list", "params": {}},
+                                  headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+                                  timeout=15)
+                mcp_tools = []
+                for line in resp.text.split("\n"):
+                    if line.startswith("data:"):
+                        import json as _j
+                        body = _j.loads(line[5:].strip())
+                        for t in body.get("result", {}).get("tools", []):
+                            mcp_tools.append(t.get("name", ""))
+            except Exception:
+                mcp_tools = []
+
+            if not mcp_tools:
+                print(f"    {mcp_id}: \033[33m⚠ could not fetch tools\033[0m")
+                continue
+
+            used = tools_used & set(mcp_tools)
+            unused = set(mcp_tools) - tools_used
+            coverage = len(used) / len(mcp_tools) * 100 if mcp_tools else 0
+            blocks = int(coverage) // 10
+            bar = "█" * blocks + "░" * (10 - blocks)
+            bc = "\033[32m" if coverage >= 50 else ("\033[33m" if coverage >= 20 else "\033[31m")
+            print(f"    {mcp_id:<22} {bc}{bar} {coverage:.0f}%\033[0m  ({len(used)}/{len(mcp_tools)} tools used)")
+            if unused and coverage < 80:
+                relevant = [t for t in unused if not t.startswith("_")][:5]
+                if relevant:
+                    print(f"    \033[33m  ⚠ Unused: {', '.join(relevant)}\033[0m")
+                    # Check if unused tools are relevant to the scenario
+                    scenario_lower = scenario.lower()
+                    missed = [t for t in relevant if any(k in t for k in ["odd", "bet", "price", "score", "live"])]
+                    if missed:
+                        print(f"    \033[31m  ✗ Likely needed but not called: {', '.join(missed)}\033[0m")
 
 
 def cmd_agents_test(args):
