@@ -1176,6 +1176,106 @@ def cmd_agents_pull(args):
     print(f"  \033[2mEdite e faça push: headlabs agents push {agent_id}\033[0m")
 
 
+def cmd_schedule(args):
+    """Schedule commands: set, remove, list."""
+    from headlabs.client import HeadLabsClient
+    client = HeadLabsClient()
+    sub = getattr(args, "sched_cmd", None)
+
+    if sub == "set":
+        r = client.request("POST", f"/agents/{args.agent_id}/schedule",
+                           json={"cron": args.cron, "question": getattr(args, "question", "") or ""})
+        print(f"\033[32m✓ Schedule: {args.agent_id} → {r.get('cron')}\033[0m")
+        print(f"\033[2m  Rule: {r.get('schedule_name')}\033[0m")
+    elif sub == "remove":
+        client.request("DELETE", f"/agents/{args.agent_id}/schedule")
+        print(f"\033[32m✓ Schedule removido: {args.agent_id}\033[0m")
+    else:
+        items = client.request("GET", "/schedules")
+        if not items:
+            print("Nenhum schedule configurado.")
+            return
+        print(f"{'AGENT':<28} {'CRON':<20} {'ENABLED':<8}")
+        print("-" * 58)
+        for s in items:
+            print(f"{s.get('agent_id',''):<28} {s.get('cron',''):<20} {s.get('enabled','')}")
+
+
+def cmd_webhook(args):
+    """Webhook commands: create, get, remove."""
+    from headlabs.client import HeadLabsClient
+    client = HeadLabsClient()
+    sub = getattr(args, "hook_cmd", None)
+
+    if sub == "create":
+        r = client.request("POST", f"/agents/{args.agent_id}/webhook")
+        print(f"\033[32m✓ Webhook criado\033[0m")
+        print(f"  URL:   {r.get('url')}")
+        print(f"  Token: {r.get('auth_token')}")
+        print(f"\033[2m  Uso: curl -X POST {r.get('url')} -H 'Authorization: Bearer {r.get('auth_token')}' -d '{{...}}'\033[0m")
+    elif sub == "get":
+        r = client.request("GET", f"/agents/{args.agent_id}/webhook")
+        print(f"  Hook: {r.get('hook_id')}")
+        print(f"  Agent: {r.get('agent_id')}")
+        print(f"  Enabled: {r.get('enabled')}")
+    elif sub == "remove":
+        client.request("DELETE", f"/hooks/{args.hook_id}")
+        print(f"\033[32m✓ Webhook removido\033[0m")
+    else:
+        print("Use: headlabs webhook create <agent_id>")
+
+
+def cmd_pipeline(args):
+    """Pipeline commands: create, run, list, status."""
+    import json as _json
+    from headlabs.client import HeadLabsClient
+    client = HeadLabsClient()
+    sub = getattr(args, "pipe_cmd", None)
+
+    if sub == "create":
+        agents = [a.strip() for a in args.steps.split(",") if a.strip()]
+        steps = [{"agent": a, "output_key": f"step_{i}_{a}"} for i, a in enumerate(agents)]
+        # Thread: each step gets input_from the previous
+        for i in range(1, len(steps)):
+            steps[i]["input_from"] = steps[i-1]["output_key"]
+        r = client.request("POST", "/pipelines", json={
+            "name": args.name, "steps": steps,
+            "description": getattr(args, "description", "") or ""})
+        print(f"\033[32m✓ Pipeline criada: {r.get('pipeline_id')}\033[0m")
+        print(f"  {' → '.join(agents)}")
+    elif sub == "run":
+        inp = {}
+        if getattr(args, "input", None):
+            try:
+                inp = _json.loads(args.input)
+            except Exception:
+                inp = {"question": args.input}
+        r = client.request("POST", f"/pipelines/{args.pipeline_id}/run", json={"input": inp})
+        print(f"\033[32m✓ Pipeline executando: {r.get('run_id')}\033[0m ({r.get('steps')} steps)")
+        print(f"\033[2m  Status: headlabs pipeline status {args.pipeline_id}\033[0m")
+    elif sub == "status":
+        r = client.request("GET", f"/pipelines/{args.pipeline_id}")
+        print(f"Pipeline: {r.get('name')} ({r.get('pipeline_id')})")
+        print(f"Steps: {' → '.join(s.get('agent','') for s in r.get('steps',[]))}")
+        last = r.get("last_run")
+        if last:
+            print(f"\nÚltimo run: {last.get('run_id')} — {last.get('status')}")
+            for res in last.get("results", []):
+                st = "✓" if res.get("status") == "succeeded" else "✗"
+                print(f"  {st} {res.get('agent')}")
+        else:
+            print("\n\033[2m  Nenhum run ainda. Execute: headlabs pipeline run {}\033[0m".format(args.pipeline_id))
+    else:
+        items = client.request("GET", "/pipelines")
+        if not items:
+            print("Nenhuma pipeline.")
+            return
+        print(f"{'ID':<20} {'NAME':<30} {'STEPS'}")
+        print("-" * 58)
+        for p in items:
+            print(f"{p.get('pipeline_id',''):<20} {p.get('name',''):<30} {p.get('steps','')}")
+
+
 def cmd_mcps(args):
     """MCP lifecycle: init, push, pull, dev."""
     sub = getattr(args, "mcps_cmd", None)
@@ -1622,6 +1722,64 @@ def main():
 
     # run
     p_run = sub.add_parser("run", help="Run an AI agent")
+
+    # ── Schedule ──────────────────────────────────────────────────────────────
+    p_sched = sub.add_parser("schedule", help="Schedule an agent to run on cron")
+    p_sched_sub = p_sched.add_subparsers(dest="sched_cmd")
+    p_sched.set_defaults(func=cmd_schedule)
+
+    ps_set = p_sched_sub.add_parser("set", help="Create/update a schedule")
+    ps_set.add_argument("agent_id", help="Agent ID")
+    ps_set.add_argument("--cron", required=True, help="Cron expression (e.g. '0 8 * * 1')")
+    ps_set.add_argument("--question", help="Question to ask each run")
+    ps_set.set_defaults(func=cmd_schedule, sched_cmd="set")
+
+    ps_rm = p_sched_sub.add_parser("remove", help="Remove a schedule")
+    ps_rm.add_argument("agent_id", help="Agent ID")
+    ps_rm.set_defaults(func=cmd_schedule, sched_cmd="remove")
+
+    ps_ls = p_sched_sub.add_parser("list", aliases=["ls"], help="List schedules")
+    ps_ls.set_defaults(func=cmd_schedule, sched_cmd="list")
+
+    # ── Webhook ───────────────────────────────────────────────────────────────
+    p_hook = sub.add_parser("webhook", help="Create a webhook trigger for an agent")
+    p_hook_sub = p_hook.add_subparsers(dest="hook_cmd")
+    p_hook.set_defaults(func=cmd_webhook)
+
+    ph_create = p_hook_sub.add_parser("create", help="Create webhook")
+    ph_create.add_argument("agent_id", help="Agent ID")
+    ph_create.set_defaults(func=cmd_webhook, hook_cmd="create")
+
+    ph_get = p_hook_sub.add_parser("get", help="Get webhook for agent")
+    ph_get.add_argument("agent_id", help="Agent ID")
+    ph_get.set_defaults(func=cmd_webhook, hook_cmd="get")
+
+    ph_rm = p_hook_sub.add_parser("remove", help="Remove webhook")
+    ph_rm.add_argument("hook_id", help="Hook ID")
+    ph_rm.set_defaults(func=cmd_webhook, hook_cmd="remove")
+
+    # ── Pipeline ──────────────────────────────────────────────────────────────
+    p_pipe = sub.add_parser("pipeline", help="Agent composition (A → B → C)")
+    p_pipe_sub = p_pipe.add_subparsers(dest="pipe_cmd")
+    p_pipe.set_defaults(func=cmd_pipeline)
+
+    pp_create = p_pipe_sub.add_parser("create", help="Create a pipeline")
+    pp_create.add_argument("--name", required=True, help="Pipeline name")
+    pp_create.add_argument("--steps", required=True, help="Agents comma-separated (A,B,C)")
+    pp_create.add_argument("--description", help="Description")
+    pp_create.set_defaults(func=cmd_pipeline, pipe_cmd="create")
+
+    pp_run = p_pipe_sub.add_parser("run", help="Execute a pipeline")
+    pp_run.add_argument("pipeline_id", help="Pipeline ID")
+    pp_run.add_argument("--input", help="JSON input for first step")
+    pp_run.set_defaults(func=cmd_pipeline, pipe_cmd="run")
+
+    pp_ls = p_pipe_sub.add_parser("list", aliases=["ls"], help="List pipelines")
+    pp_ls.set_defaults(func=cmd_pipeline, pipe_cmd="list")
+
+    pp_get = p_pipe_sub.add_parser("status", help="Get pipeline / last run")
+    pp_get.add_argument("pipeline_id", help="Pipeline ID")
+    pp_get.set_defaults(func=cmd_pipeline, pipe_cmd="status")
     p_run.add_argument("agent", help="Agent name (e.g. finops)")
     p_run.add_argument("--profile", required=True, help="AWS profile name")
     p_run.add_argument("--account-id", help="Target AWS account ID (defaults to profile's account)")
