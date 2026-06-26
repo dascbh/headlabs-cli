@@ -207,6 +207,8 @@ def cmd_agents(args):
         return cmd_agents_push(args)
     if hasattr(args, 'subcmd') and args.subcmd == 'pull':
         return cmd_agents_pull(args)
+    if hasattr(args, 'subcmd') and args.subcmd == 'update':
+        return cmd_agents_update(args)
 
     client = HeadLabsClient()
     remote = client.list_remote_agents()
@@ -375,6 +377,78 @@ def cmd_agent_create_interactive(args):
                 break
     except KeyboardInterrupt:
         pass
+
+
+def cmd_agents_update(args):
+    """Incrementally adjust an agent via NLP instruction.
+
+    Reads the agent's current state (prompt, tools, skills, schema), sends it
+    to the architect with the instruction, and applies the INCREMENTAL change
+    (patch prompt, add/remove tool, adjust schema) — without recreating."""
+    import uuid
+    from headlabs.client import HeadLabsClient
+    from headlabs.progress import ProgressReporter
+    from headlabs.config import get_tenant
+
+    client = HeadLabsClient()
+    agent_id = args.id
+    instruction = args.instruction
+
+    # Get current agent state
+    try:
+        agent = client.request("GET", f"/agents/{agent_id}")
+    except Exception as exc:
+        print(f"\033[31merro: agente '{agent_id}' não encontrado: {exc}\033[0m")
+        sys.exit(2)
+
+    manifest = agent.get("manifest", {})
+    current_state = (
+        f"Agent ID: {agent_id}\n"
+        f"Display name: {agent.get('display_name','')}\n"
+        f"Description: {agent.get('description','')}\n"
+        f"Type: {agent.get('agent_type','declarative')}\n"
+        f"Tools: {manifest.get('tools_native', [])}\n"
+        f"Skills: {manifest.get('skills', [])}\n"
+        f"Prompt (current):\n{agent.get('prompt','')[:3000]}\n"
+    )
+
+    # Send to architect as an UPDATE operation
+    message = (
+        f"[INSTRUÇÃO DO SISTEMA: Faça um AJUSTE INCREMENTAL no agente existente. "
+        f"NÃO recrie do zero. Leia o estado atual, aplique APENAS a mudança pedida, "
+        f"e use PATCH /agents/{agent_id} para atualizar. Mantenha tudo que não foi "
+        f"mencionado INTACTO.]\n\n"
+        f"ESTADO ATUAL DO AGENTE:\n{current_state}\n\n"
+        f"INSTRUÇÃO DE AJUSTE: {instruction}\n\n"
+        f"Aplique o ajuste via a API (PATCH /agents/{agent_id} com apenas os campos alterados)."
+    )
+
+    session_id = str(uuid.uuid4())
+    tenant_id = getattr(args, "tenant", None) or get_tenant()
+    reporter = ProgressReporter(quiet=False, verbose=False)
+    reporter.begin_wait("Aplicando ajuste…")
+
+    answer = ""
+    try:
+        for event in client.chat_stream(_ARCHITECT_AGENT_ID, session_id, message,
+                                         context={}, history=[], tenant_id=tenant_id):
+            et = event.get("type", "")
+            if et == "progress":
+                reporter.event(event["event"])
+            elif et == "done":
+                answer = event.get("message", "")
+            elif et == "error":
+                reporter.finish("failed")
+                print(f"  x {event.get('error')}")
+                sys.exit(1)
+        reporter.finish("succeeded")
+    except Exception as exc:
+        reporter.finish("failed")
+        print(f"  x {exc}")
+        sys.exit(1)
+
+    print(f"\n{answer}\n")
+    print("\033[32m✓ Ajuste aplicado.\033[0m")
 
 
 def cmd_agents_deploy(args):
@@ -1379,6 +1453,12 @@ def main():
     p_ac.add_argument("--tenant", help="Tenant ID for polling the wizard session")
     p_ac.add_argument("--verbose", action="store_true", help="Show every progress event")
     p_ac.set_defaults(func=cmd_agents, subcmd="create")
+
+    # agents update — incremental adjustment via NLP instruction
+    p_au = p_agents_sub.add_parser("update", help="Incrementally adjust an agent via NLP instruction")
+    p_au.add_argument("--id", required=True, help="Agent ID to update")
+    p_au.add_argument("--instruction", "-i", required=True, help="What to change (natural language)")
+    p_au.set_defaults(func=cmd_agents, subcmd="update")
 
     # agents deploy
     p_ad = p_agents_sub.add_parser("deploy", help="Deploy an agent (build+push+update runtime)")
