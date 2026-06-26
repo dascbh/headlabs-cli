@@ -774,10 +774,10 @@ def cmd_agents_test(args):
 
     # 2. Invoke the target agent (real execution)
     import time as _time
-    print(f"\033[2m  Executando {agent_id}…\033[0m")
     scenario = getattr(args, "scenario", None)
     _t0 = _time.time()
     n_tool_calls = 0
+    reporter.begin_wait(f"Executando {agent_id}…")
     try:
         if profile:
             result = client.run(agent_id, profile, days=30,
@@ -789,14 +789,14 @@ def cmd_agents_test(args):
                 "intent": scenario or "análise completa",
                 "tenant_id": "ALL",
             })
-            result = client.poll(exec_id, tenant_id=tenant_id, stream_id=stream_id)
+            result = client.poll(exec_id, tenant_id=tenant_id, stream_id=stream_id, reporter=reporter)
             output_text = _json.dumps(result.raw_output, ensure_ascii=False, default=str)[:6000]
             n_tool_calls = getattr(result, "tool_calls", 0) or (result.raw_output.get("tool_calls", 0) if hasattr(result, "raw_output") and isinstance(result.raw_output, dict) else 0)
+        reporter.finish("succeeded")
     except Exception as exc:
+        reporter.finish("failed")
         output_text = f"ERRO NA EXECUÇÃO: {str(exc)[:500]}"
     exec_time = _time.time() - _t0
-
-    print(f"\033[2m  Output capturado ({len(output_text)} chars, {exec_time:.1f}s, {n_tool_calls} tool calls)\033[0m")
 
     # 3. Send to critic with STRICT schema and fixed dimensions
     DIMENSIONS = [
