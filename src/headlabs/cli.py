@@ -296,7 +296,14 @@ def cmd_agent_create_interactive(args):
         return
 
     history = []
-    pending = user_input
+    # Prefix: force one-shot behavior regardless of prompt cache state
+    pending = (
+        "[INSTRUÇÃO DO SISTEMA: Crie o agente/MCP AGORA, em uma única rodada. "
+        "NÃO pergunte modo (sempre AMBOS), NÃO pergunte descrição (infira do pedido), "
+        "NÃO faça entrevista. Pesquise, projete e crie. Se precisar de algo crítico "
+        "após pesquisar, pergunte UMA vez.]\n\n"
+        f"PEDIDO DO DEV: {user_input}"
+    )
 
     try:
         while True:
