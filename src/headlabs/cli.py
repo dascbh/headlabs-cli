@@ -496,6 +496,99 @@ def cmd_agents_update(args):
         print("\033[32m✓ Ajuste aplicado.\033[0m")
 
 
+
+def _agents_test_tools(client, agent_id, profile, args):
+    """Invoke the agent and report tool call success/failure."""
+    import json as _json, time
+    from headlabs.config import get_tenant
+
+    scenario = getattr(args, "scenario", None) or "Execute sua função principal e use todas as tools disponíveis."
+
+    print(f"\033[1m  Tool Test: {agent_id}\033[0m")
+    print(f"  Scenario: {scenario}")
+    print()
+
+    # Get agent info (tools/MCPs configured)
+    try:
+        agent = client.request("GET", f"/agents/{agent_id}")
+        manifest = agent.get("manifest", {})
+        expected_tools = manifest.get("tools_native", [])
+        expected_mcps = manifest.get("mcp", [])
+        print(f"  \033[2mTools configuradas: {expected_tools or '(nenhuma nativa)'}\033[0m")
+        print(f"  \033[2mMCPs: {[m.get('server','?') if isinstance(m,dict) else m for m in expected_mcps] or '(nenhum)'}\033[0m")
+        print()
+    except Exception:
+        expected_tools = []
+        expected_mcps = []
+
+    # Invoke agent via chat_stream and capture tool calls from progress events
+    import re as _re, uuid
+    tool_calls = []  # [{name, elapsed, status, error}]
+    t0 = time.time()
+    session_id = str(uuid.uuid4())
+    tenant_id = get_tenant()
+
+    print(f"  \033[2mInvocando {agent_id}…\033[0m")
+    try:
+        for event in client.chat_stream(agent_id, session_id, scenario,
+                                        context={}, history=[], tenant_id=tenant_id):
+            etype = event.get("type", "")
+            if etype == "progress":
+                ev = event.get("event", {})
+                if isinstance(ev, dict):
+                    stage = ev.get("stage", "")
+                    if stage in ("tool_call", "tool_use") or ev.get("type") == "tool_use":
+                        tc = {"name": ev.get("tool", ev.get("name", "?")),
+                              "elapsed": ev.get("elapsed", 0), "status": "ok", "error": None}
+                        if ev.get("error"):
+                            tc["status"] = "error"
+                            tc["error"] = str(ev["error"])[:100]
+                        tool_calls.append(tc)
+                elif isinstance(ev, str):
+                    m = _re.match(r'\s*-\s+(\S+)\s+\+(\d+):(\d+)', ev)
+                    if m:
+                        tool_calls.append({"name": m.group(1),
+                                          "elapsed": int(m.group(2))*60+int(m.group(3)),
+                                          "status": "ok", "error": None})
+            elif etype == "tool_use":
+                tool_calls.append({"name": event.get("name", "?"), "elapsed": 0,
+                                   "status": "ok", "error": None})
+            elif etype == "error":
+                print(f"  \033[31m✗ Agent error: {event.get('error','?')}\033[0m")
+                break
+    except Exception as exc:
+        print(f"  \033[31m✗ Invocation failed: {exc}\033[0m")
+
+    total_time = time.time() - t0
+
+    # Report
+    if not tool_calls:
+        print(f"  \033[33m⚠ Nenhum tool call detectado ({total_time:.1f}s)\033[0m")
+        print(f"  \033[2m  O agente pode não ter usado tools neste cenário.\033[0m")
+        return
+
+    print(f"  {'TOOL':<30} {'TIME':<8} {'STATUS'}")
+    print(f"  {'-'*60}")
+    n_ok = 0
+    n_fail = 0
+    for tc in tool_calls:
+        name = tc["name"]
+        elapsed = f"{tc['elapsed']:.1f}s" if tc["elapsed"] else "—"
+        if tc["status"] == "ok":
+            print(f"  {name:<30} {elapsed:<8} \033[32m✓\033[0m")
+            n_ok += 1
+        else:
+            print(f"  {name:<30} {elapsed:<8} \033[31m✗ {tc['error'][:50]}\033[0m")
+            n_fail += 1
+
+    print()
+    print(f"  \033[1mSummary:\033[0m {len(tool_calls)} calls, {n_ok} ok, {n_fail} failed, {total_time:.1f}s total")
+    if n_fail > 0:
+        print(f"  \033[31m  {n_fail} tool(s) falharam — verifique credenciais/conectividade do MCP.\033[0m")
+    else:
+        print(f"  \033[32m  Todas as tools funcionaram.\033[0m")
+
+
 def cmd_agents_test(args):
     """Adversarial autocritical test: the critic agent evaluates another agent.
 
@@ -504,6 +597,8 @@ def cmd_agents_test(args):
     3. Sends contract + output to the critic for adversarial evaluation
     4. Renders: score, dimensions, gaps, recommendations
     5. If --fix: auto-applies recommendations via update
+
+    With --tools: runs the agent and reports tool call success/failure (no critic).
     """
     import json as _json
     import uuid
@@ -514,6 +609,10 @@ def cmd_agents_test(args):
     client = HeadLabsClient()
     agent_id = args.agent_id
     profile = getattr(args, "profile", None)
+
+    # --tools mode: invoke agent and report tool call results
+    if getattr(args, "tools", False):
+        return _agents_test_tools(client, agent_id, profile, args)
 
     # 1. Read target agent contract
     try:
@@ -2081,6 +2180,7 @@ def main():
     p_at.add_argument("--profile", help="AWS profile (for invoking the agent)")
     p_at.add_argument("--fix", action="store_true", help="Auto-apply recommendations via update")
     p_at.add_argument("--scenario", help="Custom test scenario (otherwise critic generates them)")
+    p_at.add_argument("--tools", action="store_true", help="Focus on tool/MCP connectivity: invoke and report which tools succeed/fail")
     p_at.set_defaults(func=cmd_agents, subcmd="test")
 
     # agents deploy
