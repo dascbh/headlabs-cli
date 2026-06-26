@@ -2293,6 +2293,9 @@ def cmd_chat(args):
         print(f"! Could not resolve AWS profile '{args.profile}': {exc}")
 
     context = {"input": agent_input}
+    # Language from config (default pt-BR)
+    _lang = load_config().get("language", "pt-BR")
+    context["language"] = _lang
     history = []  # client-side conversation history (user + assistant turns)
 
     # Tenant used to poll the chat execution. The /chat endpoint may not echo
@@ -2394,6 +2397,8 @@ def cmd_config(args):
     config = load_config()
     if args.key:
         config["api_key"] = args.key
+    if getattr(args, "language", None):
+        config["language"] = args.language
     save_config(config)
     print("Configuration saved to ~/.headlabs/config.json")
 
@@ -2651,6 +2656,7 @@ def main():
     # config
     p_config = sub.add_parser("config", help="Configure HeadLabs CLI")
     p_config.add_argument("--key", help="API key")
+    p_config.add_argument("--language", help="Output language (e.g. pt-BR, en, es)")
     p_config.set_defaults(func=cmd_config)
 
     # report
