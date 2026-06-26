@@ -497,6 +497,139 @@ def cmd_agents_update(args):
 
 
 
+
+def _agents_test_reasoning(client, agent_id, profile, args):
+    """Evaluate agent reasoning & action quality using LLM-as-judge (5 dimensions).
+
+    Based on DeepEval/AgentEval framework patterns:
+    1. Task Completion — did the agent accomplish the goal?
+    2. Reasoning Relevancy — each reasoning step ties to the user request?
+    3. Reasoning Coherence — logical, step-by-step process?
+    4. Tool Correctness — right tools called for the task?
+    5. Step Efficiency — avoided unnecessary loops/retries?
+    """
+    import json as _json, uuid, time
+    from headlabs.config import get_tenant
+
+    scenario = getattr(args, "scenario", None) or "Execute sua tarefa principal com raciocínio explícito."
+
+    print(f"\033[1m  Reasoning Test: {agent_id}\033[0m")
+    print(f"  Scenario: {scenario}")
+    print()
+
+    # 1. Get agent contract
+    try:
+        agent = client.request("GET", f"/agents/{agent_id}")
+        manifest = agent.get("manifest", {})
+        contract = (f"Agent: {agent_id}\nDescription: {agent.get('description','')}\n"
+                    f"Tools: {manifest.get('tools_native',[])}\n"
+                    f"MCPs: {manifest.get('mcp',[])}\n"
+                    f"Prompt (truncated): {agent.get('prompt','')[:2000]}")
+    except Exception:
+        contract = f"Agent: {agent_id} (contract unavailable)"
+
+    # 2. Invoke agent and capture full trace (reasoning + tool calls + output)
+    session_id = str(uuid.uuid4())
+    tenant_id = get_tenant()
+    trace = []  # [{type, content}]
+    final_output = ""
+    t0 = time.time()
+
+    print(f"  \033[2mInvocando {agent_id}…\033[0m")
+    try:
+        for event in client.chat_stream(agent_id, session_id, scenario,
+                                        context={}, history=[], tenant_id=tenant_id):
+            etype = event.get("type", "")
+            if etype == "progress":
+                ev = event.get("event", {})
+                trace.append({"type": "progress", "content": str(ev)[:300]})
+            elif etype == "done":
+                final_output = event.get("message", "")
+            elif etype == "error":
+                trace.append({"type": "error", "content": event.get("error", "?")})
+                break
+    except Exception as exc:
+        print(f"  \033[31m✗ Invocation failed: {exc}\033[0m")
+        return
+
+    elapsed = time.time() - t0
+    print(f"  \033[2mCompleted in {elapsed:.1f}s, {len(trace)} trace events\033[0m")
+    print()
+
+    # 3. Send trace + output to critic for 5-dimension evaluation
+    trace_text = "\n".join(f"[{t['type']}] {t['content']}" for t in trace[:50])
+    eval_prompt = (
+        f"You are an AI agent evaluator. Score this agent execution on 5 dimensions (0-10 each).\n\n"
+        f"═══ AGENT CONTRACT ═══\n{contract}\n\n"
+        f"═══ USER SCENARIO ═══\n{scenario}\n\n"
+        f"═══ EXECUTION TRACE ({len(trace)} events) ═══\n{trace_text[:4000]}\n\n"
+        f"═══ FINAL OUTPUT ═══\n{final_output[:3000]}\n\n"
+        f"Score STRICTLY on these 5 dimensions:\n"
+        f"1. task_completion (0-10): Did the agent accomplish the user's goal?\n"
+        f"2. reasoning_relevancy (0-10): Each reasoning step ties to the request?\n"
+        f"3. reasoning_coherence (0-10): Logical, consistent chain of thought?\n"
+        f"4. tool_correctness (0-10): Called the right tools with right params?\n"
+        f"5. step_efficiency (0-10): Avoided unnecessary loops, retries, calls?\n\n"
+        f"Return ONLY valid JSON:\n"
+        f'{{"task_completion":{{"score":N,"evidence":"..."}}, '
+        f'"reasoning_relevancy":{{"score":N,"evidence":"..."}}, '
+        f'"reasoning_coherence":{{"score":N,"evidence":"..."}}, '
+        f'"tool_correctness":{{"score":N,"evidence":"..."}}, '
+        f'"step_efficiency":{{"score":N,"evidence":"..."}}, '
+        f'"overall_score":N, "verdict":"PASS|NEEDS_WORK|FAIL", "summary":"..."}}'
+    )
+
+    print(f"  \033[2mAvaliando com LLM-as-judge…\033[0m")
+    eval_session = str(uuid.uuid4())
+    answer = ""
+    try:
+        for event in client.chat_stream("agent-critic", eval_session, eval_prompt,
+                                        context={}, history=[], tenant_id=tenant_id):
+            if event.get("type") == "done":
+                answer = event.get("message", "")
+    except Exception as exc:
+        print(f"  \033[31m✗ Critic failed: {exc}\033[0m")
+        return
+
+    # 4. Parse and render results
+    import re
+    evaluation = None
+    try:
+        json_match = re.search(r'\{[\s\S]*"overall_score"[\s\S]*\}', answer)
+        if json_match:
+            evaluation = _json.loads(json_match.group())
+    except Exception:
+        pass
+
+    if not evaluation:
+        print(f"  \033[33m⚠ Could not parse evaluation. Raw response:\033[0m")
+        print(f"  {answer[:500]}")
+        return
+
+    dims = ["task_completion", "reasoning_relevancy", "reasoning_coherence",
+            "tool_correctness", "step_efficiency"]
+
+    overall = evaluation.get("overall_score", 0)
+    verdict = evaluation.get("verdict", "?")
+    color = "\033[32m" if verdict == "PASS" else ("\033[33m" if verdict == "NEEDS_WORK" else "\033[31m")
+
+    print(f"\n  \033[1m{'DIMENSION':<25} {'SCORE':<8} EVIDENCE\033[0m")
+    print(f"  {'-'*70}")
+    for dim in dims:
+        d = evaluation.get(dim, {})
+        score = d.get("score", 0) if isinstance(d, dict) else 0
+        evidence = d.get("evidence", "") if isinstance(d, dict) else ""
+        bar = "█" * score + "░" * (10 - score)
+        sc = "\033[32m" if score >= 7 else ("\033[33m" if score >= 4 else "\033[31m")
+        print(f"  {dim:<25} {sc}{bar} {score}/10\033[0m  {evidence[:50]}")
+
+    print(f"\n  {color}Overall: {overall}/10 — {verdict}\033[0m")
+    summary = evaluation.get("summary", "")
+    if summary:
+        print(f"  {summary[:200]}")
+    print()
+
+
 def _agents_test_tools(client, agent_id, profile, args):
     """Invoke the agent and report tool call success/failure."""
     import json as _json, time
@@ -616,6 +749,10 @@ def cmd_agents_test(args):
     # --tools mode: invoke agent and report tool call results
     if getattr(args, "tools", False):
         return _agents_test_tools(client, agent_id, profile, args)
+
+    # --reasoning mode: evaluate reasoning/action quality via LLM-as-judge
+    if getattr(args, "reasoning", False):
+        return _agents_test_reasoning(client, agent_id, profile, args)
 
     # 1. Read target agent contract
     try:
@@ -2184,6 +2321,7 @@ def main():
     p_at.add_argument("--fix", action="store_true", help="Auto-apply recommendations via update")
     p_at.add_argument("--scenario", help="Custom test scenario (otherwise critic generates them)")
     p_at.add_argument("--tools", action="store_true", help="Focus on tool/MCP connectivity: invoke and report which tools succeed/fail")
+    p_at.add_argument("--reasoning", action="store_true", help="Evaluate reasoning quality: task completion, coherence, relevancy, efficiency (LLM-as-judge)")
     p_at.set_defaults(func=cmd_agents, subcmd="test")
 
     # agents deploy
