@@ -823,12 +823,29 @@ def cmd_agents_test(args):
         sys.exit(2)
 
     manifest = agent.get("manifest", {})
+    # Discover actual MCP tools available
+    mcp_tools_info = {}
+    for mcp_entry in manifest.get("mcp", []):
+        mcp_id = mcp_entry.get("server", mcp_entry) if isinstance(mcp_entry, dict) else mcp_entry
+        try:
+            import httpx
+            resp = httpx.post(f"https://mcps.headlabs.ai/{mcp_id}/mcp",
+                              json={"jsonrpc": "2.0", "id": 99, "method": "tools/list", "params": {}},
+                              headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+                              timeout=15)
+            for line in resp.text.split("\n"):
+                if line.startswith("data:"):
+                    body = _json.loads(line[5:].strip())
+                    mcp_tools_info[mcp_id] = [t.get("name") for t in body.get("result", {}).get("tools", [])]
+        except Exception:
+            pass
     contract = (
         f"AGENT ID: {agent_id}\n"
         f"DESCRIPTION: {agent.get('description','')}\n"
         f"TYPE: {agent.get('agent_type','')}\n"
-        f"TOOLS: {manifest.get('tools_native',[])}\n"
+        f"TOOLS (native): {manifest.get('tools_native',[])}\n"
         f"MCPS: {manifest.get('mcp',[])}\n"
+        f"MCP TOOLS AVAILABLE: {mcp_tools_info}\n"
         f"SKILLS: {manifest.get('skills',[])}\n"
         f"PROMPT:\n{agent.get('prompt','')[:4000]}\n"
     )
