@@ -209,6 +209,8 @@ def cmd_agents(args):
         return cmd_agents_pull(args)
     if hasattr(args, 'subcmd') and args.subcmd == 'update':
         return cmd_agents_update(args)
+    if hasattr(args, 'subcmd') and args.subcmd == 'test':
+        return cmd_agents_test(args)
 
     client = HeadLabsClient()
     remote = client.list_remote_agents()
@@ -492,6 +494,161 @@ def cmd_agents_update(args):
         cmd_agents_deploy(deploy_args)
     else:
         print("\033[32m✓ Ajuste aplicado.\033[0m")
+
+
+def cmd_agents_test(args):
+    """Adversarial autocritical test: the critic agent evaluates another agent.
+
+    1. Reads target agent's contract (prompt, tools, skills, schema)
+    2. Invokes the target agent (real execution)
+    3. Sends contract + output to the critic for adversarial evaluation
+    4. Renders: score, dimensions, gaps, recommendations
+    5. If --fix: auto-applies recommendations via update
+    """
+    import json as _json
+    import uuid
+    from headlabs.client import HeadLabsClient
+    from headlabs.progress import ProgressReporter
+    from headlabs.config import get_tenant
+
+    client = HeadLabsClient()
+    agent_id = args.agent_id
+    profile = getattr(args, "profile", None)
+
+    # 1. Read target agent contract
+    try:
+        agent = client.request("GET", f"/agents/{agent_id}")
+    except Exception as exc:
+        print(f"\033[31merro: agente '{agent_id}' não encontrado\033[0m")
+        sys.exit(2)
+
+    manifest = agent.get("manifest", {})
+    contract = (
+        f"AGENT ID: {agent_id}\n"
+        f"DESCRIPTION: {agent.get('description','')}\n"
+        f"TYPE: {agent.get('agent_type','')}\n"
+        f"TOOLS: {manifest.get('tools_native',[])}\n"
+        f"MCPS: {manifest.get('mcp',[])}\n"
+        f"SKILLS: {manifest.get('skills',[])}\n"
+        f"PROMPT:\n{agent.get('prompt','')[:4000]}\n"
+    )
+
+    # 2. Invoke the target agent (real execution)
+    print(f"\033[2m  Executando {agent_id}…\033[0m")
+    scenario = getattr(args, "scenario", None)
+    try:
+        if profile:
+            # Use the run path (with AWS creds)
+            result = client.run(agent_id, profile, days=30,
+                                question=scenario or None)
+            output_text = _json.dumps(result.raw_output, ensure_ascii=False, default=str)[:6000]
+        else:
+            # Invoke without AWS (for agents that don't need it)
+            exec_id, tenant_id, stream_id = client.invoke(agent_id, {
+                "intent": scenario or "análise completa",
+                "tenant_id": "ALL",
+            })
+            result = client.poll(exec_id, tenant_id=tenant_id, stream_id=stream_id)
+            output_text = _json.dumps(result.raw_output, ensure_ascii=False, default=str)[:6000]
+    except Exception as exc:
+        output_text = f"ERRO NA EXECUÇÃO: {str(exc)[:500]}"
+
+    print(f"\033[2m  Output capturado ({len(output_text)} chars)\033[0m")
+
+    # 3. Send to critic
+    critic_input = (
+        f"[INSTRUÇÃO: Avalie o output deste agente de forma adversarial. "
+        f"Score 0-100 em 8 dimensões. Seja implacável.]\n\n"
+        f"═══ CONTRATO DO AGENTE ═══\n{contract}\n\n"
+        f"═══ OUTPUT REAL DA EXECUÇÃO ═══\n{output_text}\n\n"
+        f"Avalie. Retorne JSON com schema: "
+        f"{{score, verdict, dimensions[{{name,score,evidence,gap}}], "
+        f"top_gaps[], recommendations[], adversarial_scenarios[]}}"
+    )
+
+    session_id = str(uuid.uuid4())
+    tenant_id = get_tenant()
+    reporter = ProgressReporter(quiet=False, verbose=False)
+    print(f"\n\033[1m  Avaliação adversarial: {agent_id}\033[0m")
+    reporter.begin_wait("Critic analisando…")
+
+    answer = ""
+    try:
+        for event in client.chat_stream("agent-critic", session_id, critic_input,
+                                         context={}, history=[], tenant_id=tenant_id):
+            et = event.get("type", "")
+            if et == "progress":
+                reporter.event(event["event"])
+            elif et == "done":
+                answer = event.get("message", "")
+            elif et == "error":
+                reporter.finish("failed")
+                print(f"  x {event.get('error')}")
+                sys.exit(1)
+        reporter.finish("succeeded")
+    except Exception as exc:
+        reporter.finish("failed")
+        print(f"  x {exc}")
+        sys.exit(1)
+
+    # 4. Render results
+    # Try to parse JSON from the answer
+    evaluation = None
+    try:
+        # Find JSON block in the answer
+        import re
+        json_match = re.search(r'\{[\s\S]*"score"[\s\S]*\}', answer)
+        if json_match:
+            evaluation = _json.loads(json_match.group())
+    except Exception:
+        pass
+
+    if evaluation:
+        score = evaluation.get("score", 0)
+        verdict = evaluation.get("verdict", "?")
+        color = "\033[32m" if verdict == "PASS" else ("\033[33m" if verdict == "NEEDS_WORK" else "\033[31m")
+
+        print(f"\n  {color}{'━' * 50}\033[0m")
+        print(f"  {color}  SCORE: {score}/100  ·  VERDICT: {verdict}\033[0m")
+        print(f"  {color}{'━' * 50}\033[0m\n")
+
+        dims = evaluation.get("dimensions", [])
+        if dims:
+            print("  \033[1mDimensões:\033[0m")
+            for d in dims:
+                s = d.get("score", 0)
+                dc = "\033[32m" if s >= 80 else ("\033[33m" if s >= 60 else "\033[31m")
+                print(f"    {dc}{s:>3}\033[0m  {d.get('name','')}")
+                if d.get("gap"):
+                    print(f"         \033[2m↳ {d['gap'][:120]}\033[0m")
+            print()
+
+        gaps = evaluation.get("top_gaps", [])
+        if gaps:
+            print("  \033[1mTop gaps:\033[0m")
+            for g in gaps[:5]:
+                print(f"    \033[31m✗\033[0m {g[:150]}")
+            print()
+
+        recs = evaluation.get("recommendations", [])
+        if recs:
+            print("  \033[1mRecomendações:\033[0m")
+            for r in recs[:5]:
+                print(f"    \033[36m→\033[0m {r[:150]}")
+            print()
+    else:
+        # Fallback: print raw answer
+        print(f"\n{answer}\n")
+
+    # 5. Auto-fix if requested
+    if getattr(args, "fix", False) and evaluation and evaluation.get("recommendations"):
+        recs = evaluation["recommendations"]
+        instruction = "; ".join(recs[:3])
+        print(f"\033[2m  Aplicando fix: {instruction[:100]}…\033[0m")
+        from types import SimpleNamespace
+        fix_args = SimpleNamespace(id=agent_id, instruction=instruction,
+                                   profile=profile, tenant=None)
+        cmd_agents_update(fix_args)
 
 
 def cmd_agents_deploy(args):
@@ -1503,6 +1660,14 @@ def main():
     p_au.add_argument("--instruction", "-i", required=True, help="What to change (natural language)")
     p_au.add_argument("--profile", help="AWS profile (for deploy if code agent)")
     p_au.set_defaults(func=cmd_agents, subcmd="update")
+
+    # agents test — adversarial autocritical evaluation
+    p_at = p_agents_sub.add_parser("test", help="Adversarial test: critic agent evaluates another agent")
+    p_at.add_argument("agent_id", help="Agent ID to test")
+    p_at.add_argument("--profile", help="AWS profile (for invoking the agent)")
+    p_at.add_argument("--fix", action="store_true", help="Auto-apply recommendations via update")
+    p_at.add_argument("--scenario", help="Custom test scenario (otherwise critic generates them)")
+    p_at.set_defaults(func=cmd_agents, subcmd="test")
 
     # agents deploy
     p_ad = p_agents_sub.add_parser("deploy", help="Deploy an agent (build+push+update runtime)")
