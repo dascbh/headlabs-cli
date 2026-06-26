@@ -881,40 +881,39 @@ def cmd_agents_test(args):
         print(f"  {answer[:400]}")
         return
 
-    # 5. Render results (deterministic format)
+    # 5. Render results (same UX as --reasoning)
     score = evaluation.get("score", 0)
     verdict = evaluation.get("verdict", "?")
     color = "\033[32m" if verdict == "PASS" else ("\033[33m" if verdict == "NEEDS_WORK" else "\033[31m")
 
-    print(f"\n  {color}{'━' * 50}\033[0m")
-    print(f"  {color}  SCORE: {score}/100  ·  {verdict}\033[0m")
-    print(f"  {color}{'━' * 50}\033[0m\n")
+    print(f"\n  \033[1m{'DIMENSION':<22} {'SCORE':<12} EVIDENCE\033[0m")
+    print(f"  {'-'*70}")
 
     dims = evaluation.get("dimensions", {})
     if isinstance(dims, dict):
-        print(f"  {'DIMENSION':<22} {'SCORE':<7} EVIDENCE")
-        print(f"  {'-'*65}")
         for dname in DIMENSIONS:
             d = dims.get(dname, {})
             s = d.get("score", 0) if isinstance(d, dict) else 0
             ev = d.get("evidence", "") if isinstance(d, dict) else ""
-            dc = "\033[32m" if s >= 80 else ("\033[33m" if s >= 60 else "\033[31m")
-            print(f"  {dname:<22} {dc}{s:>3}/100\033[0m  {ev[:55]}")
-        print()
+            blocks = s // 10
+            bar = "█" * blocks + "░" * (10 - blocks)
+            sc = "\033[32m" if s >= 80 else ("\033[33m" if s >= 60 else "\033[31m")
+            print(f"  {dname:<22} {sc}{bar} {s:>3}/100\033[0m  {ev[:45]}")
+
+    print(f"\n  {color}Overall: {score}/100 — {verdict}\033[0m")
 
     issues = evaluation.get("top_issues", [])
     if issues:
-        print("  \033[1mIssues:\033[0m")
+        print(f"\n  \033[1mIssues:\033[0m")
         for g in issues[:5]:
-            print(f"    \033[31m✗\033[0m {g[:140]}")
-        print()
+            print(f"    \033[31m✗\033[0m {g[:130]}")
 
     fixes = evaluation.get("fix_instructions", [])
     if fixes:
-        print("  \033[1mFix instructions:\033[0m")
+        print(f"\n  \033[1mFix instructions:\033[0m")
         for f in fixes[:5]:
-            print(f"    \033[36m→\033[0m {f[:140]}")
-        print()
+            print(f"    \033[36m→\033[0m {f[:130]}")
+    print()
 
     # 6. Auto-fix: apply fix_instructions + re-validate
     if getattr(args, "fix", False) and fixes:
