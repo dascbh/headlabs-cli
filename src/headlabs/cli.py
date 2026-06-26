@@ -282,103 +282,191 @@ _ARCHITECT_AGENT_ID = "agent-architect"
 
 
 def cmd_agent_create_interactive(args):
-    """One-shot agent creation: send the dev's intent, the architect researches
-    and creates in a single invocation. If the architect needs clarification
-    (critical gap after research), it asks once and the dev responds."""
-    import uuid
+    """Structured wizard for agent creation: rigid steps + agentic autocomplete."""
+    import uuid, json as _json
     from headlabs.client import HeadLabsClient
     from headlabs.progress import ProgressReporter
-    from headlabs.config import get_tenant
+    from headlabs.config import get_tenant, load_config
 
     client = HeadLabsClient()
-    session_id = str(uuid.uuid4())
     tenant_id = getattr(args, "tenant", None) or get_tenant()
 
-    print("HeadLabs · criação de agente")
+    print("\033[1m  HeadLabs · Agent Creation Wizard\033[0m\n")
 
-    # Inline mode: intent already provided
+    # ── STEP 1: Type ──────────────────────────────────────────────────────────
+    print("  \033[1mSTEP 1\033[0m  Tipo de agente")
+    print("    1. single     — agente standalone com tools/MCPs")
+    print("    2. supervisor — coordena outros agentes (multi-agent)")
+    print("    3. worker     — executado por um supervisor")
     inline = getattr(args, "_inline_intent", None)
     if inline:
-        user_input = inline
-        print(f"   → {user_input}\n")
+        agent_type = "single"
+        print(f"    → {agent_type} (inline mode)\n")
     else:
-        print("   Descreva o que você quer. O architect pesquisa e cria.\n")
+        choice = input("    [1/2/3] (default: 1): ").strip()
+        agent_type = {"2": "supervisor", "3": "worker"}.get(choice, "single")
+        print()
+
+    # ── STEP 2: Intent ────────────────────────────────────────────────────────
+    print("  \033[1mSTEP 2\033[0m  Descreva o que o agente deve fazer (linguagem natural)")
+    if inline:
+        intent = inline
+        print(f"    → {intent}\n")
+    else:
         try:
-            user_input = input("→ ").strip()
+            intent = input("    → ").strip()
         except (EOFError, KeyboardInterrupt):
             return
-        if not user_input:
+        if not intent:
             return
+        print()
 
-    history = []
-    # Prefix: force one-shot behavior regardless of prompt cache state
-    pending = (
-        "[INSTRUÇÃO DO SISTEMA: Crie o agente/MCP AGORA, em uma única rodada. "
-        "NÃO pergunte modo (sempre AMBOS), NÃO pergunte descrição (infira do pedido), "
-        "NÃO faça entrevista. Pesquise, projete e crie. Se precisar de algo crítico "
-        "após pesquisar, pergunte UMA vez.]\n\n"
-        f"PEDIDO DO DEV: {user_input}"
+    # ── STEP 3: Agentic draft (AI proposes based on intent + platform resources)
+    print("  \033[1mSTEP 3\033[0m  Projetando agente…")
+    reporter = ProgressReporter(quiet=False, verbose=False)
+    reporter.begin_wait("Pesquisando recursos e gerando draft…")
+
+    # Gather platform resources for the architect
+    try:
+        mcps_available = [m.get("id") for m in client.request("GET", "/mcps")]
+    except Exception:
+        mcps_available = []
+    try:
+        agents_available = [a.get("id") for a in client.list_remote_agents() if a.get("id") != "agent-architect"]
+    except Exception:
+        agents_available = []
+
+    draft_prompt = (
+        "You are an agent architect. Generate a COMPLETE agent specification as JSON.\n\n"
+        f"USER INTENT: {intent}\n"
+        f"AGENT TYPE: {agent_type}\n"
+        f"AVAILABLE MCPs: {mcps_available}\n"
+        f"AVAILABLE AGENTS (for invoke_agent if supervisor): {agents_available}\n"
+        f"AVAILABLE NATIVE TOOLS: web_search, web_fetch, invoke_agent, table_get, table_put, kb_retrieve\n\n"
+        "Return ONLY this JSON (no other text):\n"
+        "{\n"
+        '  "id": "<kebab-case-id>",\n'
+        '  "name": "<display name>",\n'
+        '  "description": "<one-line description>",\n'
+        '  "tools_native": ["<tool1>", ...],\n'
+        '  "mcps": ["<mcp-id>", ...],\n'
+        '  "workers": ["<agent-id>", ...],\n'
+        '  "prompt": "<full system prompt for the agent>"\n'
+        "}\n\n"
+        "RULES:\n"
+        "- tools_native: only include tools the agent NEEDS. If supervisor, include invoke_agent.\n"
+        "- mcps: select from AVAILABLE MCPs that are relevant. Include ALL tools each MCP exposes in the prompt.\n"
+        "- workers: if supervisor, list which agents it coordinates. Otherwise empty.\n"
+        "- prompt: be specific. Include MCP tool names, expected output format, role, constraints.\n"
+        "- id: short, descriptive, kebab-case.\n"
     )
 
+    session_id = str(uuid.uuid4())
+    answer = ""
     try:
-        while True:
-            reporter = ProgressReporter(quiet=False, verbose=getattr(args, "verbose", False))
-            reporter.begin_wait("Criando…")
-            answer, err = None, None
-            try:
-                for event in client.chat_stream(_ARCHITECT_AGENT_ID, session_id, pending,
-                                                 context={}, history=history, tenant_id=tenant_id):
-                    et = event.get("type", "")
-                    if et == "progress":
-                        reporter.event(event["event"])
-                    elif et == "done":
-                        answer = event.get("message", "")
-                    elif et == "error":
-                        err = event.get("error", "?")
-                reporter.finish("failed" if err else "succeeded")
-            except KeyboardInterrupt:
-                reporter.finish("cancelled")
-                break
-            except Exception as exc:
-                reporter.finish("failed")
-                print(f"  x {exc}")
-                break
+        for event in client.chat_stream("agent-architect", session_id, draft_prompt,
+                                        context={}, history=[], tenant_id=tenant_id):
+            if event.get("type") == "progress":
+                reporter.event(event["event"])
+            elif event.get("type") == "done":
+                answer = event.get("message", "")
+        reporter.finish("succeeded")
+    except Exception as exc:
+        reporter.finish("failed")
+        print(f"  \033[31m✗ {exc}\033[0m")
+        return
 
-            if err:
-                print(f"  x {err}")
-                break
-            if not answer or not answer.strip():
-                print("\033[33m  (timeout — tentando novamente)\033[0m")
-                continue
-
-            print(f"\n{answer}\n")
-            history.append({"role": "user", "content": pending})
-            history.append({"role": "assistant", "content": answer})
-
-            # Auto-exit when creation is done
-            _done_signals = ("push_agent_source", "create_agent", "push_mcp_source",
-                             "agente criado", "agent criado", "mcp criado",
-                             "headlabs agents deploy", "headlabs mcps deploy",
-                             "headlabs run", "headlabs chat",
-                             "runtime", "ativado")
-            if any(s in (answer or "").lower() for s in _done_signals):
-                print("\033[32m✓ Pronto.\033[0m")
-                break
-
-            # Architect is asking for clarification — let dev respond
-            if "?" in answer:
-                try:
-                    user_input = input("→ ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    break
-                if not user_input or user_input in ("/exit", "/quit"):
-                    break
-                pending = user_input
-            else:
-                # No question, no creation signal — done
-                break
-    except KeyboardInterrupt:
+    # Parse the draft
+    import re
+    draft = None
+    try:
+        cleaned = answer.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r'^```\w*\n?', '', cleaned)
+            cleaned = re.sub(r'\n?```$', '', cleaned)
+        brace = cleaned.find("{")
+        if brace >= 0:
+            depth = 0
+            for i in range(brace, len(cleaned)):
+                if cleaned[i] == "{": depth += 1
+                elif cleaned[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        draft = _json.loads(cleaned[brace:i+1])
+                        break
+    except Exception:
         pass
+
+    if not draft:
+        print(f"  \033[31m✗ Não consegui gerar draft. Raw:\033[0m")
+        print(f"  {answer[:300]}")
+        return
+
+    # ── STEP 4: Review & edit each field ──────────────────────────────────────
+    print(f"\n  \033[1mSTEP 4\033[0m  Review (Enter para aceitar, ou digite novo valor)\n")
+
+    def _ask(label, default, multiline=False):
+        display = default[:80] + "…" if len(str(default)) > 80 else default
+        if multiline:
+            print(f"    \033[2m{label}:\033[0m")
+            print(f"    \033[2m{str(default)[:200]}…\033[0m" if len(str(default)) > 200 else f"    \033[2m{default}\033[0m")
+            v = input(f"    (Enter=aceitar, e=editar): ").strip()
+            if v.lower() == "e":
+                print("    (Cole o novo prompt, termine com linha vazia)")
+                lines = []
+                while True:
+                    l = input("    ")
+                    if l == "":
+                        break
+                    lines.append(l)
+                return "\n".join(lines) if lines else default
+            return default
+        v = input(f"    {label} [{display}]: ").strip()
+        return v if v else default
+
+    agent_id = _ask("ID", draft.get("id", ""))
+    name = _ask("Nome", draft.get("name", ""))
+    description = _ask("Descrição", draft.get("description", ""))
+    tools = _ask("Tools nativas", ", ".join(draft.get("tools_native", [])))
+    tools_list = [t.strip() for t in tools.split(",") if t.strip()]
+    mcps = _ask("MCPs", ", ".join(draft.get("mcps", [])))
+    mcps_list = [m.strip() for m in mcps.split(",") if m.strip()]
+    if agent_type == "supervisor":
+        workers = _ask("Workers", ", ".join(draft.get("workers", [])))
+    prompt = _ask("Prompt", draft.get("prompt", ""), multiline=True)
+
+    # ── STEP 5: Create ────────────────────────────────────────────────────────
+    print(f"\n  \033[1mSTEP 5\033[0m  Criando…")
+
+    mcp_manifest = [{"server": m} for m in mcps_list]
+    if agent_type == "supervisor" and "invoke_agent" not in tools_list:
+        tools_list.append("invoke_agent")
+
+    try:
+        result = client.create_agent(
+            agent_id=agent_id,
+            display_name=name,
+            prompt=prompt,
+            tools=tools_list,
+            description=description,
+        )
+        # Update manifest with MCPs
+        if mcps_list:
+            client.request("PATCH", f"/agents/{agent_id}", {
+                "manifest": {"tools_native": tools_list, "mcp": mcp_manifest}})
+
+        status = result.get("status", "?")
+        print(f"\n  \033[32m✓ Agent '{agent_id}' created (status={status})\033[0m")
+        print(f"    Type: {agent_type}")
+        print(f"    Tools: {tools_list}")
+        print(f"    MCPs: {mcps_list}")
+        if agent_type == "supervisor":
+            print(f"    Workers: {workers}")
+        if result.get("runtime_id"):
+            print(f"    Runtime: {result['runtime_id']}")
+        print(f"\n    \033[2mTest: headlabs agents test {agent_id} --tools\033[0m")
+    except Exception as exc:
+        print(f"  \033[31m✗ {exc}\033[0m")
 
 
 def cmd_agents_update(args):
