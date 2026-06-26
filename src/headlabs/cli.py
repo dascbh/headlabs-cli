@@ -2254,7 +2254,16 @@ def cmd_chat(args):
             if err:
                 print(f"  x Error: {err}")
             elif answer:
-                print(f"\nAgent: {answer}\n")
+                try:
+                    from rich.console import Console
+                    from rich.markdown import Markdown
+                    from rich.panel import Panel
+                    _console = Console(width=min(Console().width, 100))
+                    _console.print()
+                    _console.print(Panel(Markdown(answer), title="Agent", border_style="dim", padding=(1, 2)))
+                    _console.print()
+                except ImportError:
+                    print(f"\nAgent: {answer}\n")
                 history.append({"role": "user", "content": user_input})
                 history.append({"role": "assistant", "content": answer})
                 history = history[-20:]  # cap context window
