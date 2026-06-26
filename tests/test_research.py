@@ -144,7 +144,7 @@ def test_render_findings_empty_points_to_status(monkeypatch):
     monkeypatch.setattr("sys.stdout", buf)
     L._render_findings({"loop_id": "loop_1"})
     text = buf.getvalue()
-    assert "sem findings" in text.lower()
+    assert "finalizados" in text.lower()       # findings are being finalized (not "missing")
     assert "status loop_1" in text
 
 
