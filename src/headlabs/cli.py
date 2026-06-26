@@ -282,8 +282,8 @@ _ARCHITECT_AGENT_ID = "agent-architect"
 
 
 def cmd_agent_create_interactive(args):
-    """Structured wizard for agent creation: rigid steps + agentic autocomplete."""
-    import uuid, json as _json
+    """Structured wizard: describe → AI drafts (type, tools, MCPs, prompt) → review."""
+    import uuid, json as _json, re
     from headlabs.client import HeadLabsClient
     from headlabs.progress import ProgressReporter
     from headlabs.config import get_tenant, load_config
@@ -293,22 +293,9 @@ def cmd_agent_create_interactive(args):
 
     print("\033[1m  HeadLabs · Agent Creation Wizard\033[0m\n")
 
-    # ── STEP 1: Type ──────────────────────────────────────────────────────────
-    print("  \033[1mSTEP 1\033[0m  Tipo de agente")
-    print("    1. single     — agente standalone com tools/MCPs")
-    print("    2. supervisor — coordena outros agentes (multi-agent)")
-    print("    3. worker     — executado por um supervisor")
+    # ── STEP 1: Intent ────────────────────────────────────────────────────────
+    print("  \033[1mSTEP 1\033[0m  O que o agente deve fazer?")
     inline = getattr(args, "_inline_intent", None)
-    if inline:
-        agent_type = "single"
-        print(f"    → {agent_type} (inline mode)\n")
-    else:
-        choice = input("    [1/2/3] (default: 1): ").strip()
-        agent_type = {"2": "supervisor", "3": "worker"}.get(choice, "single")
-        print()
-
-    # ── STEP 2: Intent ────────────────────────────────────────────────────────
-    print("  \033[1mSTEP 2\033[0m  Descreva o que o agente deve fazer (linguagem natural)")
     if inline:
         intent = inline
         print(f"    → {intent}\n")
@@ -321,12 +308,12 @@ def cmd_agent_create_interactive(args):
             return
         print()
 
-    # ── STEP 3: Agentic draft (AI proposes based on intent + platform resources)
-    print("  \033[1mSTEP 3\033[0m  Projetando agente…")
+    # ── STEP 2: AI drafts everything ──────────────────────────────────────────
+    print("  \033[1mSTEP 2\033[0m  Projetando…")
     reporter = ProgressReporter(quiet=False, verbose=False)
-    reporter.begin_wait("Pesquisando recursos e gerando draft…")
+    reporter.begin_wait("Analisando intent e recursos da plataforma…")
 
-    # Gather platform resources for the architect
+    # Gather platform resources
     try:
         mcps_available = [m.get("id") for m in client.request("GET", "/mcps")]
     except Exception:
@@ -337,28 +324,32 @@ def cmd_agent_create_interactive(args):
         agents_available = []
 
     draft_prompt = (
-        "You are an agent architect. Generate a COMPLETE agent specification as JSON.\n\n"
-        f"USER INTENT: {intent}\n"
-        f"AGENT TYPE: {agent_type}\n"
-        f"AVAILABLE MCPs: {mcps_available}\n"
-        f"AVAILABLE AGENTS (for invoke_agent if supervisor): {agents_available}\n"
-        f"AVAILABLE NATIVE TOOLS: web_search, web_fetch, invoke_agent, table_get, table_put, kb_retrieve\n\n"
-        "Return ONLY this JSON (no other text):\n"
+        "You are an agent architect. Based on the user's intent, generate a COMPLETE agent spec as JSON.\n\n"
+        f"USER INTENT: {intent}\n\n"
+        f"PLATFORM RESOURCES:\n"
+        f"  MCPs available: {mcps_available}\n"
+        f"  Agents available (for multi-agent/supervisor): {agents_available}\n"
+        f"  Native tools: web_search, web_fetch, invoke_agent, table_get, table_put, kb_retrieve\n\n"
+        "DECIDE the agent type based on the intent:\n"
+        "- 'single' if the agent works alone with tools/MCPs\n"
+        "- 'supervisor' if it needs to coordinate other agents\n"
+        "- 'worker' if it's meant to be called by a supervisor\n\n"
+        "Return ONLY this JSON:\n"
         "{\n"
-        '  "id": "<kebab-case-id>",\n'
+        '  "type": "single|supervisor|worker",\n'
+        '  "id": "<kebab-case>",\n'
         '  "name": "<display name>",\n'
-        '  "description": "<one-line description>",\n'
-        '  "tools_native": ["<tool1>", ...],\n'
+        '  "description": "<one line>",\n'
+        '  "tools_native": ["<tool>", ...],\n'
         '  "mcps": ["<mcp-id>", ...],\n'
         '  "workers": ["<agent-id>", ...],\n'
-        '  "prompt": "<full system prompt for the agent>"\n'
+        '  "prompt": "<full system prompt with MCP tools documented>"\n'
         "}\n\n"
         "RULES:\n"
-        "- tools_native: only include tools the agent NEEDS. If supervisor, include invoke_agent.\n"
-        "- mcps: select from AVAILABLE MCPs that are relevant. Include ALL tools each MCP exposes in the prompt.\n"
-        "- workers: if supervisor, list which agents it coordinates. Otherwise empty.\n"
-        "- prompt: be specific. Include MCP tool names, expected output format, role, constraints.\n"
-        "- id: short, descriptive, kebab-case.\n"
+        "- If supervisor: include invoke_agent in tools_native and list workers.\n"
+        "- Select MCPs from the available list that match the intent.\n"
+        "- In the prompt, document each MCP's tools by name (query the MCP mentally).\n"
+        "- Be specific and actionable in the prompt. No filler.\n"
     )
 
     session_id = str(uuid.uuid4())
@@ -376,14 +367,11 @@ def cmd_agent_create_interactive(args):
         print(f"  \033[31m✗ {exc}\033[0m")
         return
 
-    # Parse the draft
-    import re
+    # Parse draft
     draft = None
     try:
-        cleaned = answer.strip()
-        if cleaned.startswith("```"):
-            cleaned = re.sub(r'^```\w*\n?', '', cleaned)
-            cleaned = re.sub(r'\n?```$', '', cleaned)
+        cleaned = re.sub(r'^```\w*\n?', '', answer.strip())
+        cleaned = re.sub(r'\n?```$', '', cleaned)
         brace = cleaned.find("{")
         if brace >= 0:
             depth = 0
@@ -398,70 +386,69 @@ def cmd_agent_create_interactive(args):
         pass
 
     if not draft:
-        print(f"  \033[31m✗ Não consegui gerar draft. Raw:\033[0m")
-        print(f"  {answer[:300]}")
+        print(f"  \033[31m✗ Draft inválido. Raw:\033[0m\n  {answer[:300]}")
         return
 
-    # ── STEP 4: Review & edit each field ──────────────────────────────────────
-    print(f"\n  \033[1mSTEP 4\033[0m  Review (Enter para aceitar, ou digite novo valor)\n")
+    # ── STEP 3: Review ────────────────────────────────────────────────────────
+    print(f"\n  \033[1mSTEP 3\033[0m  Review (Enter=aceitar, ou digite novo valor)\n")
 
-    def _ask(label, default, multiline=False):
-        display = default[:80] + "…" if len(str(default)) > 80 else default
-        if multiline:
-            print(f"    \033[2m{label}:\033[0m")
-            print(f"    \033[2m{str(default)[:200]}…\033[0m" if len(str(default)) > 200 else f"    \033[2m{default}\033[0m")
-            v = input(f"    (Enter=aceitar, e=editar): ").strip()
-            if v.lower() == "e":
-                print("    (Cole o novo prompt, termine com linha vazia)")
-                lines = []
-                while True:
-                    l = input("    ")
-                    if l == "":
-                        break
-                    lines.append(l)
-                return "\n".join(lines) if lines else default
-            return default
-        v = input(f"    {label} [{display}]: ").strip()
-        return v if v else default
+    agent_type = draft.get("type", "single")
+    print(f"    \033[2mTipo sugerido: {agent_type}\033[0m")
+    t = input(f"    Tipo [{agent_type}]: ").strip()
+    agent_type = t if t else agent_type
 
-    agent_id = _ask("ID", draft.get("id", ""))
-    name = _ask("Nome", draft.get("name", ""))
-    description = _ask("Descrição", draft.get("description", ""))
-    tools = _ask("Tools nativas", ", ".join(draft.get("tools_native", [])))
+    agent_id = input(f"    ID [{draft.get('id','')}]: ").strip() or draft.get("id", "")
+    name = input(f"    Nome [{draft.get('name','')}]: ").strip() or draft.get("name", "")
+    description = input(f"    Descrição [{draft.get('description','')[:60]}]: ").strip() or draft.get("description", "")
+
+    tools_default = ", ".join(draft.get("tools_native", []))
+    tools = input(f"    Tools [{tools_default}]: ").strip() or tools_default
     tools_list = [t.strip() for t in tools.split(",") if t.strip()]
-    mcps = _ask("MCPs", ", ".join(draft.get("mcps", [])))
+
+    mcps_default = ", ".join(draft.get("mcps", []))
+    mcps = input(f"    MCPs [{mcps_default}]: ").strip() or mcps_default
     mcps_list = [m.strip() for m in mcps.split(",") if m.strip()]
+
+    workers_list = []
     if agent_type == "supervisor":
-        workers = _ask("Workers", ", ".join(draft.get("workers", [])))
-    prompt = _ask("Prompt", draft.get("prompt", ""), multiline=True)
+        workers_default = ", ".join(draft.get("workers", []))
+        workers = input(f"    Workers [{workers_default}]: ").strip() or workers_default
+        workers_list = [w.strip() for w in workers.split(",") if w.strip()]
 
-    # ── STEP 5: Create ────────────────────────────────────────────────────────
-    print(f"\n  \033[1mSTEP 5\033[0m  Criando…")
+    prompt = draft.get("prompt", "")
+    print(f"\n    \033[2mPrompt ({len(prompt)} chars):\033[0m")
+    print(f"    \033[2m{prompt[:150]}…\033[0m")
+    edit = input("    (Enter=aceitar, e=editar): ").strip()
+    if edit.lower() == "e":
+        print("    (Cole o prompt, termine com linha vazia)")
+        lines = []
+        while True:
+            l = input("    ")
+            if l == "": break
+            lines.append(l)
+        if lines:
+            prompt = "\n".join(lines)
 
-    mcp_manifest = [{"server": m} for m in mcps_list]
+    # ── Create ────────────────────────────────────────────────────────────────
+    print(f"\n  \033[1mCriando…\033[0m")
+
     if agent_type == "supervisor" and "invoke_agent" not in tools_list:
         tools_list.append("invoke_agent")
 
     try:
         result = client.create_agent(
-            agent_id=agent_id,
-            display_name=name,
-            prompt=prompt,
-            tools=tools_list,
-            description=description,
-        )
-        # Update manifest with MCPs
+            agent_id=agent_id, display_name=name, prompt=prompt,
+            tools=tools_list, description=description)
         if mcps_list:
             client.request("PATCH", f"/agents/{agent_id}", {
-                "manifest": {"tools_native": tools_list, "mcp": mcp_manifest}})
+                "manifest": {"tools_native": tools_list, "mcp": [{"server": m} for m in mcps_list]}})
 
-        status = result.get("status", "?")
-        print(f"\n  \033[32m✓ Agent '{agent_id}' created (status={status})\033[0m")
-        print(f"    Type: {agent_type}")
-        print(f"    Tools: {tools_list}")
-        print(f"    MCPs: {mcps_list}")
-        if agent_type == "supervisor":
-            print(f"    Workers: {workers}")
+        print(f"\n  \033[32m✓ Agent '{agent_id}' created\033[0m")
+        print(f"    Tipo:    {agent_type}")
+        print(f"    Tools:   {tools_list}")
+        print(f"    MCPs:    {mcps_list}")
+        if workers_list:
+            print(f"    Workers: {workers_list}")
         if result.get("runtime_id"):
             print(f"    Runtime: {result['runtime_id']}")
         print(f"\n    \033[2mTest: headlabs agents test {agent_id} --tools\033[0m")
