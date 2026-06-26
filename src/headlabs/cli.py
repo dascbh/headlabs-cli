@@ -502,7 +502,10 @@ def _agents_test_tools(client, agent_id, profile, args):
     import json as _json, time
     from headlabs.config import get_tenant
 
-    scenario = getattr(args, "scenario", None) or "Execute sua função principal e use todas as tools disponíveis."
+    scenario = getattr(args, "scenario", None) or (
+        "Smoke test: chame cada uma das suas tools disponíveis uma vez com parâmetros mínimos válidos. "
+        "Objetivo: verificar que todas as tools respondem. Liste o resultado de cada uma."
+    )
 
     print(f"\033[1m  Tool Test: {agent_id}\033[0m")
     print(f"  Scenario: {scenario}")
