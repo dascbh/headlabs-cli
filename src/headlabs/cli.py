@@ -774,6 +774,7 @@ def cmd_agents_test(args):
 
     # 2. Invoke the target agent (real execution)
     import time as _time
+    reporter = ProgressReporter(quiet=False, verbose=False)
     scenario = getattr(args, "scenario", None)
     _t0 = _time.time()
     n_tool_calls = 0
