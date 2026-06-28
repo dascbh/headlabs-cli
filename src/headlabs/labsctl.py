@@ -211,7 +211,7 @@ def cmd_labs(args):
     return {
         "create": _labs_create, "list": _labs_list, "ls": _labs_list,
         "get": _labs_get, "describe": _labs_describe, "repo": _labs_repo,
-        "push": _labs_push, "archive": _labs_archive,
+        "push": _labs_push, "archive": _labs_archive, "outputs": _labs_outputs,
     }.get(sub, _labs_list)(args)
 
 
@@ -262,6 +262,69 @@ def _labs_describe(args):
         print(f"\n{_c('Repositório:', 'bold')} {len(repo)} arquivo(s)  ·  headlabs labs repo {lab['lab_id']} --tree")
     except Exception as exc:  # noqa: BLE001
         print(_c(f"(detalhes indisponíveis: {exc})", "dim"))
+
+
+def _resource_endpoint(client: HeadLabsClient, base: str, kind: str, name: str) -> dict:
+    """Map a created resource (type:name) to its ready-to-use access endpoint/URL."""
+    try:
+        if kind == "function":
+            return {"endpoint": f"POST {base}/functions/{name}/invoke"}
+        if kind == "table":
+            return {"endpoint": f"{base}/tables/{name}/items",
+                    "example": "GET=listar · PUT=inserir · DELETE /items/{pk}"}
+        if kind == "agent":
+            return {"endpoint": f"POST {base}/agents/{name}/invoke"}
+        if kind in ("kb", "knowledge_base", "knowledge-base"):
+            return {"endpoint": f"POST {base}/knowledge-bases/{name}/query"}
+        if kind == "mcp":
+            return {"endpoint": f"https://mcps.headlabs.ai/{name}/mcp"}
+        if kind == "storage":
+            meta = client.request("GET", f"/storage/{name}") or {}
+            sid = meta.get("storage_id") or name
+            return {"endpoint": meta.get("url") or meta.get("site_url") or f"https://{sid}.apps.headlabs.ai/"}
+        if kind == "container":
+            st = client.request("GET", f"/containers/{name}/status") or {}
+            ep = st.get("endpoint") or st.get("url")
+            if ep:
+                return {"endpoint": ep if str(ep).startswith("http") else f"http://{ep}"}
+            return {"endpoint": "(provisionando endpoint…)"}
+    except Exception:  # noqa: BLE001 — best-effort lookup
+        return {"endpoint": "(indisponível)"}
+    return {"endpoint": ""}
+
+
+def _labs_outputs(args):
+    """CloudFormation-style Outputs: every created resource + its access endpoint."""
+    client = HeadLabsClient()
+    lab = _resolve_lab(client, args.lab)
+    lid = lab["lab_id"]
+    base = client.api_url.rstrip("/")
+    loops = client.request("GET", f"/labs-v2/{lid}/lineage") or []
+    seen: set = set()
+    outs = []
+    for lp in loops:
+        loop = client.request("GET", f"/loops/{lp.get('loop_id')}") or {}
+        for r in (loop.get("resources_created") or []):
+            if ":" not in r or r in seen:
+                continue
+            seen.add(r)
+            kind, nm = r.split(":", 1)
+            outs.append({"type": kind, "resource": nm, **_resource_endpoint(client, base, kind, nm)})
+    if getattr(args, "output", "table") == "json":
+        print(json.dumps({"lab_id": lid, "name": lab.get("name", ""), "outputs": outs},
+                         indent=2, ensure_ascii=False))
+        return
+    if not outs:
+        print(_c("Sem recursos ainda (nenhum loop concluiu criação).", "dim"))
+        return
+    print(f"\n{_c('Outputs', 'bold')}  ·  {lab.get('name','')}  ({lid})")
+    for o in sorted(outs, key=lambda x: (x["type"], x["resource"])):
+        kind = f"{o['type']:<10}"
+        res = f"{o['resource']:<24}"
+        print(f"  {_c(kind, 'cyan')} {res} {o.get('endpoint','')}")
+        if o.get("example"):
+            print(f"  {'':<10} {'':<24} {_c(o['example'], 'dim')}")
+    print(_c(f"\n  {len(outs)} recurso(s)  ·  json: headlabs labs outputs {lid} -o json", "dim"))
 
 
 def _labs_repo(args):
@@ -359,6 +422,8 @@ def cmd_research(args):
     flags are needed normally. Follow-up reuses the loop surface, which is
     mode-aware: ``headlabs status <id>``, ``headlabs loops watch <id>``,
     ``headlabs loops list --mode research``."""
+    if getattr(args, "research_cmd", None) == "build":
+        return _research_build(args)
     return _research_create(args)
 
 
@@ -395,6 +460,24 @@ def _research_create(args):
     if getattr(args, "watch", False) or getattr(args, "wait", False):
         return _follow(client, job_id, watch=getattr(args, "watch", False),
                        args=args, mode="research")
+
+
+def _research_build(args):
+    """``research build --lab <lab> -i "..."`` — build a solution from the lab's
+    research findings. Starts at architect (skips orchestrator/researcher)."""
+    client = HeadLabsClient()
+    lab = _resolve_lab(client, args.lab)
+    lab_id = lab["lab_id"]
+    gates = _gates_from_args(args)
+    body = {"intent": args.intent, "lab_id": lab_id, "mode": "research_build"}
+    if gates:
+        body["gates"] = gates
+    loop = client.request("POST", "/loops", json=body)
+    job_id = loop.get("loop_id")
+    print(f"  {_c('✓', 'green')} Build a partir da pesquisa: {_c(job_id, 'bold')}  (lab {lab_id})")
+    print(_c(f"  Acompanhe: headlabs loops watch {job_id}", "dim"))
+    if getattr(args, "watch", False) or getattr(args, "wait", False):
+        return _follow(client, job_id, watch=getattr(args, "watch", False), args=args)
 
 
 def _await_findings(client: HeadLabsClient, job_id: str, loop: dict,

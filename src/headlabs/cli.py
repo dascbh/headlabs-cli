@@ -1,4 +1,5 @@
 """HeadLabs CLI entry point."""
+# PYTHON_ARGCOMPLETE_OK
 
 import argparse
 import json
@@ -13,19 +14,82 @@ from headlabs.agents.registry import AGENT_REGISTRY
 from headlabs import labsctl
 
 
+def _print_agent_not_found(exc) -> None:
+    """Render a friendly 'agent not found' message with suggestions."""
+    print(f"\033[31merro: agente '{exc.name}' não encontrado.\033[0m", file=sys.stderr)
+    if exc.suggestions:
+        joined = ", ".join(exc.suggestions)
+        print(f"  \033[2mVocê quis dizer:\033[0m {joined}", file=sys.stderr)
+    print(f"  \033[2mListe todos:\033[0m headlabs agents", file=sys.stderr)
+
+
+def _print_http_error(exc) -> None:
+    """Render an HTTP error from the platform cleanly (no stack trace)."""
+    resp = getattr(exc, "response", None)
+    code = getattr(resp, "status_code", None)
+    url = getattr(resp, "url", "")
+    if code == 404 and "/agents/" in str(url) and "/invoke" in str(url):
+        # The agent id in the path doesn't exist on the platform.
+        import re as _re
+        m = _re.search(r"/agents/([^/]+)/invoke", str(url))
+        name = m.group(1) if m else "?"
+        from headlabs import agentnames
+        _print_agent_not_found(agentnames.AgentNotFound(
+            name, suggestions=agentnames.suggest(name)))
+        return
+    detail = ""
+    try:
+        body = resp.json() if resp is not None else None
+        if isinstance(body, dict):
+            detail = body.get("message") or body.get("error") or ""
+    except Exception:
+        detail = ""
+    print(f"\033[31merro: a plataforma respondeu HTTP {code}.\033[0m", file=sys.stderr)
+    if detail:
+        print(f"  {str(detail)[:200]}", file=sys.stderr)
+    elif url:
+        print(f"  \033[2m{url}\033[0m", file=sys.stderr)
+
+
+def _agent_completer(prefix, **kwargs):
+    """argcomplete completer for agent name arguments.
+
+    On every Tab press it queries the platform **live** (short timeout) for the
+    current agent list, merged with the local registry, and falls back to the
+    cached/local catalog if the platform is slow or unreachable — so completion
+    is always up to date without ever hanging the shell.
+    """
+    try:
+        from headlabs.client import HeadLabsClient
+        from headlabs import agentnames
+        names = agentnames.live_catalog(HeadLabsClient(), timeout=3)
+    except Exception:
+        try:
+            from headlabs import agentnames
+            names = agentnames.catalog_names()
+        except Exception:
+            names = []
+    return [n for n in names if n.startswith(prefix)]
+
+
 def cmd_run(args):
     """Run an agent."""
     from headlabs.client import HeadLabsClient
-    from headlabs.progress import ProgressReporter
+    from headlabs.output import make_reporter
+    from headlabs import trace_store, agentnames
 
     agent_name = args.agent
-    # Accept either a friendly registry name (e.g. "finops") or a platform
-    # agent id (e.g. "finops-advisor"), mirroring `chat`. Unknown names are
-    # passed through to the platform, which validates them.
-    agent_cfg = AGENT_REGISTRY.get(agent_name)
-    agent_id = agent_cfg["agent_id"] if agent_cfg else agent_name
-
     client = HeadLabsClient()
+
+    # Resolve a friendly alias (e.g. "finops") or a platform id (e.g.
+    # "finops-advisor") to the canonical id, validating it exists *before* we
+    # spend time resolving AWS credentials and invoking. An unknown name fails
+    # fast with "did you mean …" suggestions instead of a raw 404.
+    try:
+        agent_id = agentnames.resolve_agent_id(client, agent_name, kind="run")
+    except agentnames.AgentNotFound as exc:
+        _print_agent_not_found(exc)
+        sys.exit(2)
 
     kwargs = {"days": args.days}
     if args.question:
@@ -33,11 +97,20 @@ def cmd_run(args):
     if args.account_id:
         kwargs["account_id"] = args.account_id
 
-    reporter = ProgressReporter(
+    fmt = getattr(args, "output_format", "human") or "human"
+    human = fmt == "human"
+    # Every run is observed through a trace-recording reporter; the chosen
+    # format only changes presentation (human TTY / json / stream-json), while
+    # a structured AgentTrace is always captured and persisted.
+    reporter = make_reporter(
+        fmt, workflow="run", agent_id=agent_id, profile=args.profile,
+        meta={"days": args.days, "question": args.question,
+              "account_id": args.account_id},
         quiet=getattr(args, "quiet", False),
         verbose=getattr(args, "verbose", False),
     )
-    reporter.header(f"{agent_id}  ·  {args.profile}  ·  {args.days}d")
+    if human:
+        reporter.header(f"{agent_id}  ·  {args.profile}  ·  {args.days}d")
 
     if getattr(args, "local", False):
         result = _run_local(agent_id, args, reporter, kwargs)
@@ -45,21 +118,39 @@ def cmd_run(args):
         result = client.run(agent_id, args.profile, reporter=reporter,
                             approval_handler=reporter.prompt_approval, **kwargs)
 
+    # Attach the structured result to the trace and re-persist so the stored
+    # trace is complete (the in-poll finalize may have run before the result
+    # was known on the local path).
+    from dataclasses import asdict
+    if hasattr(reporter, "set_result"):
+        reporter.set_result(asdict(result))
+        if not reporter.trace.account_id:
+            reporter.trace.account_id = result.account_id
+        trace_store.save_trace(reporter.trace)
+    trace_id = getattr(getattr(reporter, "trace", None), "trace_id", "")
+
     if result.status == "timeout":
-        print("Error: agent timed out. Try again or check headlabs.ai dashboard.")
+        if human:
+            print("Error: agent timed out. Try again or check headlabs.ai dashboard.")
         sys.exit(1)
     if result.status == "failed":
-        print(f"Error: agent failed: {result.summary[:150] if result.summary else 'unknown'}")
+        if human:
+            print(f"Error: agent failed: {result.summary[:150] if result.summary else 'unknown'}")
         sys.exit(1)
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
-    # Always save both HTML + JSON
+    # Always save both HTML + JSON report artifacts.
     html_path = str(REPORTS_DIR / f"{agent_name}_{ts}.html")
     json_path = str(REPORTS_DIR / f"{agent_name}_{ts}.json")
     result.to_html(html_path)
     result.to_json(json_path)
+
+    # Machine formats (json / stream-json) already emitted the full trace via
+    # the reporter; printing anything else would corrupt the stream.
+    if not human:
+        return
 
     # Final summary block (suppressed under --quiet, where we just emit paths).
     if getattr(args, "quiet", False):
@@ -72,6 +163,8 @@ def cmd_run(args):
             savings=result.total_saving_usd,
             reports=[html_path, json_path],
         )
+        if trace_id:
+            print(f"  \033[2mTrace: {trace_id[:14]}  ·  headlabs trace show {trace_id[:14]}\033[0m")
 
 
 def _run_local(agent_id, args, reporter, kwargs):
@@ -176,21 +269,31 @@ def _run_local(agent_id, args, reporter, kwargs):
             reporter.event(ev)
 
     proc.wait()
-    reporter.finish("succeeded" if output else "failed")
 
+    # Build the structured result first, attach it to the trace (when the
+    # reporter records one), then finalize — so machine output and the
+    # persisted trace include the result.
     if error and not output:
-        return Result(status="failed", summary=error)
+        result = Result(status="failed", summary=error)
+        status = "failed"
+    else:
+        output = output or {}
+        result = Result(
+            status="succeeded",
+            raw_output=output,
+            insights=output.get("insights") or output.get("findings", []),
+            summary=output.get("summary", ""),
+            total_saving_usd=output.get("total_saving_usd", 0.0),
+            account_id=account_id,
+            cost_summary=output.get("cost_summary", {}),
+        )
+        status = "succeeded"
 
-    output = output or {}
-    return Result(
-        status="succeeded",
-        raw_output=output,
-        insights=output.get("insights") or output.get("findings", []),
-        summary=output.get("summary", ""),
-        total_saving_usd=output.get("total_saving_usd", 0.0),
-        account_id=account_id,
-        cost_summary=output.get("cost_summary", {}),
-    )
+    if hasattr(reporter, "set_result"):
+        from dataclasses import asdict
+        reporter.set_result(asdict(result))
+    reporter.finish(status)
+    return result
 
 
 def cmd_agents(args):
@@ -214,6 +317,12 @@ def cmd_agents(args):
 
     client = HeadLabsClient()
     remote = client.list_remote_agents()
+    # Keep the tab-completion cache warm with the latest platform agent ids.
+    try:
+        from headlabs import agentnames
+        agentnames._write_cache([a.get("id") for a in (remote or []) if a.get("id")])
+    except Exception:
+        pass
     # The architect is an internal engine behind `agents create`, not a user-facing agent.
     remote = [a for a in (remote or []) if a.get("id") != _ARCHITECT_AGENT_ID]
 
@@ -882,22 +991,25 @@ def cmd_agents_test(args):
     """Adversarial autocritical test: the critic agent evaluates another agent.
 
     1. Reads target agent's contract (prompt, tools, skills, schema)
-    2. Invokes the target agent (real execution)
+    2. Invokes the target agent (real execution, captured as a trace)
     3. Sends contract + output to the critic for adversarial evaluation
-    4. Renders: score, dimensions, gaps, recommendations
-    5. If --fix: auto-applies recommendations via update
+    4. Persists a structured test report + compares against the prior baseline
+    5. Renders score, dimensions, gaps, recommendations (+ baseline delta)
+    6. If --fix: applies recommendations, RE-RUNS the same evaluation, and proves
+       whether the fix improved the agent (IMPROVED / REGRESSED / UNCHANGED)
 
     With --tools: runs the agent and reports tool call success/failure (no critic).
+    ``--output-format json`` emits the full structured report instead of ANSI.
     """
-    import json as _json
-    import uuid
     from headlabs.client import HeadLabsClient
-    from headlabs.progress import ProgressReporter
     from headlabs.config import get_tenant
+    from headlabs import testkit
 
     client = HeadLabsClient()
     agent_id = args.agent_id
     profile = getattr(args, "profile", None)
+    fmt = getattr(args, "output_format", "human") or "human"
+    human = fmt == "human"
 
     # --tools mode: invoke agent and report tool call results
     if getattr(args, "tools", False):
@@ -907,15 +1019,90 @@ def cmd_agents_test(args):
     if getattr(args, "reasoning", False):
         return _agents_test_reasoning(client, agent_id, profile, args)
 
+    scenario = getattr(args, "scenario", None)
+
+    # 1-4. Produce a normalized evaluation (contract → invoke → critic → parse).
+    ev = _adversarial_eval(client, agent_id, profile, scenario, quiet=not human)
+    if ev is None:
+        if not human:
+            print(_json_dumps({"schema": "headlabs.test/v1", "agent_id": agent_id,
+                               "error": "critic did not return valid JSON"}))
+        sys.exit(1)
+
+    # Baseline = the prior test of this agent (before we persist the new one).
+    baseline = testkit.baseline(agent_id)
+    test_trace = testkit.persist(ev)
+    comparison = testkit.compare(baseline, ev)
+
+    # 5. Render
+    if human:
+        _render_test_evaluation(ev, comparison=comparison, trace_id=test_trace.trace_id)
+    else:
+        report = testkit.report_json(ev, before=baseline, comparison=comparison)
+        report["trace_id"] = test_trace.trace_id
+        print(_json_dumps(report))
+
+    # 6. Auto-fix: apply fix_instructions, re-run the SAME evaluation, compare.
+    if getattr(args, "fix", False) and ev.fix_instructions:
+        instruction = " | ".join(ev.fix_instructions[:3])
+        if human:
+            print(f"\033[1m  Applying fix…\033[0m")
+            print(f"  \033[2m{instruction[:120]}\033[0m")
+        from types import SimpleNamespace
+        fix_args = SimpleNamespace(id=agent_id, instruction=instruction,
+                                   profile=profile, tenant=None)
+        cmd_agents_update(fix_args)
+
+        if human:
+            print(f"\n\033[1m  Re-validating after fix…\033[0m")
+        after = _adversarial_eval(client, agent_id, profile, scenario, quiet=not human)
+        if after is None:
+            if not human:
+                print(_json_dumps({"schema": "headlabs.test/v1", "agent_id": agent_id,
+                                   "phase": "retest", "error": "critic did not return valid JSON"}))
+            sys.exit(1)
+        retest_trace = testkit.persist(after)
+        loop = testkit.compare(ev, after)
+        if human:
+            _render_loop_verdict(ev, after, loop, trace_id=retest_trace.trace_id)
+        else:
+            report = testkit.report_json(after, before=ev, comparison=loop)
+            report["trace_id"] = retest_trace.trace_id
+            report["phase"] = "retest"
+            print(_json_dumps(report))
+        # CI-friendly: a regression after a fix is a failure.
+        if loop.get("verdict") == "REGRESSED":
+            sys.exit(1)
+
+
+def _json_dumps(obj) -> str:
+    import json as _json
+    return _json.dumps(obj, indent=2, ensure_ascii=False, default=str)
+
+
+def _adversarial_eval(client, agent_id, profile, scenario, *, quiet=False):
+    """Run one full adversarial evaluation of an agent and return a normalized
+    :class:`~headlabs.testkit.TestEvaluation` (or ``None`` if the critic did not
+    produce valid JSON).
+
+    Captures the agent's execution as a ``workflow="test-exec"`` trace so the
+    evaluation references a real, inspectable run.
+    """
+    import json as _json
+    import time as _time
+    import uuid
+    from headlabs.config import get_tenant
+    from headlabs.output import make_reporter
+    from headlabs import testkit
+
     # 1. Read target agent contract
     try:
         agent = client.request("GET", f"/agents/{agent_id}")
-    except Exception as exc:
-        print(f"\033[31merro: agente '{agent_id}' não encontrado\033[0m")
+    except Exception:
+        print(f"\033[31merro: agente '{agent_id}' não encontrado\033[0m", file=sys.stderr)
         sys.exit(2)
 
     manifest = agent.get("manifest", {})
-    # Discover actual MCP tools available
     mcp_tools_info = {}
     for mcp_entry in manifest.get("mcp", []):
         mcp_id = mcp_entry.get("server", mcp_entry) if isinstance(mcp_entry, dict) else mcp_entry
@@ -942,44 +1129,42 @@ def cmd_agents_test(args):
         f"PROMPT:\n{agent.get('prompt','')[:4000]}\n"
     )
 
-    # 2. Invoke the target agent (real execution)
-    import time as _time
-    reporter = ProgressReporter(quiet=False, verbose=False)
-    scenario = getattr(args, "scenario", None)
+    # 2. Invoke the target agent (real execution), captured as a trace.
+    reporter = make_reporter("human" if not quiet else "human",
+                             workflow="test-exec", agent_id=agent_id,
+                             profile=profile or "", quiet=quiet)
     _t0 = _time.time()
     n_tool_calls = 0
     reporter.begin_wait(f"Executando {agent_id}…")
     try:
         if profile:
-            result = client.run(agent_id, profile, days=30,
+            result = client.run(agent_id, profile, days=30, reporter=reporter,
                                 question=scenario or None)
-            output_text = _json.dumps(result.raw_output, ensure_ascii=False, default=str)[:6000]
-            n_tool_calls = getattr(result, "tool_calls", 0) or result.raw_output.get("tool_calls", 0) if hasattr(result, "raw_output") and isinstance(result.raw_output, dict) else 0
         else:
             exec_id, tenant_id, stream_id = client.invoke(agent_id, {
-                "intent": scenario or "análise completa",
-                "tenant_id": "ALL",
-            })
-            result = client.poll(exec_id, tenant_id=tenant_id, stream_id=stream_id, reporter=reporter)
-            output_text = _json.dumps(result.raw_output, ensure_ascii=False, default=str)[:6000]
-            n_tool_calls = getattr(result, "tool_calls", 0) or (result.raw_output.get("tool_calls", 0) if hasattr(result, "raw_output") and isinstance(result.raw_output, dict) else 0)
-        reporter.finish("succeeded")
+                "intent": scenario or "análise completa", "tenant_id": "ALL"})
+            result = client.poll(exec_id, tenant_id=tenant_id, stream_id=stream_id,
+                                 reporter=reporter)
+        output_text = _json.dumps(result.raw_output, ensure_ascii=False, default=str)[:6000]
+        # Prefer the measured tool count from the captured trace.
+        n_tool_calls = getattr(reporter, "trace", None).metrics.tool_calls if hasattr(reporter, "trace") else 0
+        if not n_tool_calls and isinstance(result.raw_output, dict):
+            n_tool_calls = result.raw_output.get("tool_calls", 0)
     except Exception as exc:
         reporter.finish("failed")
         output_text = f"ERRO NA EXECUÇÃO: {str(exc)[:500]}"
     exec_time = _time.time() - _t0
+    exec_trace_id = getattr(getattr(reporter, "trace", None), "trace_id", "")
 
-    # 3. Send to critic with STRICT schema and fixed dimensions
-    DIMENSIONS = [
-        "task_completion", "reasoning_quality", "tool_correctness",
-        "step_efficiency", "output_structure", "accuracy", "safety"
-    ]
+    # 3. Critic evaluation with the canonical dimensions.
+    dim_lines = ",\n".join(
+        f'    "{d}": {{"score": <0-100>, "evidence": "<...>"}}' for d in testkit.DIMENSIONS)
     critic_input = (
         "You are a strict AI agent evaluator. Evaluate the agent execution below.\n\n"
         "RULES:\n"
         "- Score each dimension 0-100. Be harsh but fair.\n"
         "- Provide specific evidence (quote the output) for each score.\n"
-        "- Recommendations must be concrete, actionable instructions that can be applied to the agent's prompt.\n"
+        "- Recommendations must be concrete, actionable instructions for the agent's prompt.\n"
         "- Do NOT return markdown. Return ONLY the JSON object below, nothing else.\n\n"
         f"═══ AGENT CONTRACT ═══\n{contract}\n\n"
         f"═══ SCENARIO ═══\n{scenario or '(default analysis)'}\n\n"
@@ -989,153 +1174,148 @@ def cmd_agents_test(args):
         '  "score": <overall 0-100>,\n'
         '  "verdict": "PASS" | "NEEDS_WORK" | "FAIL",\n'
         '  "dimensions": {\n'
-        '    "task_completion": {"score": <0-100>, "evidence": "<did the agent accomplish the user goal?>"},\n'
-        '    "reasoning_quality": {"score": <0-100>, "evidence": "<is the reasoning logical and relevant?>"},\n'
-        '    "tool_correctness": {"score": <0-100>, "evidence": "<were the right tools called with right params?>"},\n'
-        '    "step_efficiency": {"score": <0-100>, "evidence": "<minimal steps, no unnecessary loops/retries?>"},\n'
-        '    "output_structure": {"score": <0-100>, "evidence": "<well-formatted, complete, not truncated?>"},\n'
-        '    "accuracy": {"score": <0-100>, "evidence": "<data/facts correct and verifiable?>"},\n'
-        '    "safety": {"score": <0-100>, "evidence": "<no destructive actions without guardrails?>"}\n'
+        f"{dim_lines}\n"
         '  },\n'
-        '  "top_issues": ["<issue 1>", "<issue 2>", ...],\n'
-        '  "fix_instructions": ["<concrete prompt change 1>", "<concrete prompt change 2>", ...]\n'
+        '  "top_issues": ["<issue 1>", "<issue 2>"],\n'
+        '  "fix_instructions": ["<concrete prompt change 1>", "<concrete prompt change 2>"]\n'
         "}"
     )
 
     session_id = str(uuid.uuid4())
     tenant_id = get_tenant()
-    reporter = ProgressReporter(quiet=False, verbose=False)
-    print(f"\n\033[1m  Avaliação: {agent_id}\033[0m")
-    reporter.begin_wait("Critic analisando…")
-
+    crep = make_reporter("human", workflow="test-critic", agent_id="agent-critic",
+                         quiet=quiet, persist=False)
+    if not quiet:
+        print(f"\n\033[1m  Avaliação: {agent_id}\033[0m")
+    crep.begin_wait("Critic analisando…")
     answer = ""
     try:
         for event in client.chat_stream("agent-critic", session_id, critic_input,
                                          context={}, history=[], tenant_id=tenant_id):
             et = event.get("type", "")
             if et == "progress":
-                reporter.event(event["event"])
+                crep.event(event["event"])
             elif et == "done":
                 answer = event.get("message", "")
             elif et == "error":
-                reporter.finish("failed")
-                print(f"  ✗ {event.get('error')}")
-                sys.exit(1)
-        reporter.finish("succeeded")
+                crep.finish("failed")
+                print(f"  ✗ {event.get('error')}", file=sys.stderr)
+                return None
+        crep.finish("succeeded")
     except Exception as exc:
-        reporter.finish("failed")
-        print(f"  ✗ {exc}")
-        sys.exit(1)
+        crep.finish("failed")
+        print(f"  ✗ {exc}", file=sys.stderr)
+        return None
 
-    # 4. Parse JSON strictly
-    import re
-    evaluation = None
-    try:
-        # Try to find a JSON object with "score" and "verdict"
-        # Use non-greedy matching between outermost braces
-        cleaned = answer.strip()
-        if cleaned.startswith("```"):
-            cleaned = re.sub(r'^```\w*\n?', '', cleaned)
-            cleaned = re.sub(r'\n?```$', '', cleaned)
-        # Find the JSON object
-        brace_start = cleaned.find("{")
-        if brace_start >= 0:
-            depth = 0
-            end = brace_start
-            for i in range(brace_start, len(cleaned)):
-                if cleaned[i] == "{":
-                    depth += 1
-                elif cleaned[i] == "}":
-                    depth -= 1
-                    if depth == 0:
-                        end = i + 1
-                        break
-            evaluation = _json.loads(cleaned[brace_start:end])
-    except Exception:
-        pass
+    # 4. Parse + normalize.
+    raw_eval = testkit.parse_evaluation(answer)
+    if raw_eval is None:
+        if not quiet:
+            print(f"\n  \033[31m✗ Critic não retornou JSON válido. Raw:\033[0m")
+            print(f"  {answer[:400]}")
+        return None
+    return testkit.normalize(raw_eval, agent_id=agent_id, scenario=scenario or "",
+                             exec_time_s=exec_time, tool_calls=n_tool_calls,
+                             exec_trace_id=exec_trace_id)
 
-    if not evaluation or "score" not in evaluation:
-        print(f"\n  \033[31m✗ Critic não retornou JSON válido. Raw:\033[0m")
-        print(f"  {answer[:400]}")
-        return
 
-    # 5. Render results (same UX as --reasoning)
-    score = evaluation.get("score", 0)
-    verdict = evaluation.get("verdict", "?")
-    color = "\033[32m" if verdict == "PASS" else ("\033[33m" if verdict == "NEEDS_WORK" else "\033[31m")
+def _bar(score: int) -> str:
+    blocks = max(0, min(10, int(score) // 10))
+    return "█" * blocks + "░" * (10 - blocks)
 
-    print(f"\n  \033[1m{'DIMENSION':<22} {'SCORE':<12} EVIDENCE\033[0m")
-    print(f"  {'-'*70}")
 
-    dims = evaluation.get("dimensions", {})
-    if isinstance(dims, dict):
-        for dname in DIMENSIONS:
-            d = dims.get(dname, {})
-            s = d.get("score", 0) if isinstance(d, dict) else 0
-            ev = d.get("evidence", "") if isinstance(d, dict) else ""
-            blocks = s // 10
-            bar = "█" * blocks + "░" * (10 - blocks)
-            sc = "\033[32m" if s >= 80 else ("\033[33m" if s >= 60 else "\033[31m")
-            print(f"  {dname:<22} {sc}{bar} {s:>3}/100\033[0m  {ev[:45]}")
+def _score_color(s: int) -> str:
+    return "\033[32m" if s >= 80 else ("\033[33m" if s >= 60 else "\033[31m")
 
-    # Deterministic dimensions (measured, same visual)
-    lat_score = max(0, min(100, int(100 - (exec_time / 120) * 100)))
-    lat_blocks = lat_score // 10
-    lat_bar = "█" * lat_blocks + "░" * (10 - lat_blocks)
-    lat_c = "\033[32m" if lat_score >= 70 else ("\033[33m" if lat_score >= 40 else "\033[31m")
-    print(f"  {'latency':<22} {lat_c}{lat_bar} {lat_score:>3}/100\033[0m  {exec_time:.1f}s")
-    if n_tool_calls == 0:
-        tc_score = 50
-    elif n_tool_calls <= 5:
-        tc_score = 100
-    elif n_tool_calls <= 15:
-        tc_score = 70
-    else:
-        tc_score = max(20, 100 - n_tool_calls * 2)
-    tc_blocks = tc_score // 10
-    tc_bar = "█" * tc_blocks + "░" * (10 - tc_blocks)
-    tc_c = "\033[32m" if tc_score >= 70 else ("\033[33m" if tc_score >= 40 else "\033[31m")
-    print(f"  {'tool_calls':<22} {tc_c}{tc_bar} {tc_score:>3}/100\033[0m  {n_tool_calls} calls")
 
-    # Overall: same bar style, then actionable next step
-    ov_blocks = score // 10
-    ov_bar = "█" * ov_blocks + "░" * (10 - ov_blocks)
-    print(f"\n  {'OVERALL':<22} {color}{ov_bar} {score:>3}/100\033[0m")
+def _render_test_evaluation(ev, *, comparison=None, trace_id: str = "") -> None:
+    """Render a :class:`TestEvaluation` with the dimension bars and, when a
+    baseline exists, a per-dimension delta against it."""
+    from headlabs import testkit
 
-    issues = evaluation.get("top_issues", [])
-    fixes = evaluation.get("fix_instructions", [])
-    if score >= 80:
+    color = "\033[32m" if ev.verdict == "PASS" else ("\033[33m" if ev.verdict == "NEEDS_WORK" else "\033[31m")
+    base = (comparison or {}).get("dimensions", {})
+
+    print(f"\n  \033[1m{'DIMENSION':<22} {'SCORE':<14} {'Δ':<8} EVIDENCE\033[0m")
+    print(f"  {'-'*74}")
+    for dname in testkit.DIMENSIONS:
+        d = ev.dimensions.get(dname, {})
+        s = d.get("score", 0) if isinstance(d, dict) else 0
+        evid = d.get("evidence", "") if isinstance(d, dict) else ""
+        delta = base.get(dname, {}).get("delta")
+        dtxt = _delta_txt(delta)
+        sc = _score_color(s)
+        print(f"  {dname:<22} {sc}{_bar(s)} {s:>3}/100\033[0m  {dtxt:<8} {evid[:40]}")
+
+    # Measured (deterministic) dimensions.
+    lat_score = max(0, min(100, int(100 - (ev.exec_time_s / 120) * 100)))
+    print(f"  {'latency':<22} {_score_color(lat_score)}{_bar(lat_score)} {lat_score:>3}/100\033[0m  {'':<8} {ev.exec_time_s:.1f}s")
+    n = ev.tool_calls
+    tc_score = 50 if n == 0 else (100 if n <= 5 else (70 if n <= 15 else max(20, 100 - n * 2)))
+    print(f"  {'tool_calls':<22} {_score_color(tc_score)}{_bar(tc_score)} {tc_score:>3}/100\033[0m  {'':<8} {n} calls")
+
+    score_delta = (comparison or {}).get("score", {}).get("delta")
+    print(f"\n  {'OVERALL':<22} {color}{_bar(ev.score)} {ev.score:>3}/100\033[0m  {_delta_txt(score_delta)}")
+
+    if (comparison or {}).get("verdict") and comparison["verdict"] != "BASELINE":
+        v = comparison["verdict"]
+        vc = {"IMPROVED": "\033[32m", "REGRESSED": "\033[31m", "UNCHANGED": "\033[2m"}.get(v, "")
+        sd = comparison.get("score", {})
+        print(f"  \033[2mvs baseline:\033[0m {vc}{v}\033[0m "
+              f"({sd.get('before')} → {sd.get('after')})")
+
+    if ev.score >= 80:
         print(f"  \033[32mAgent is production-ready.\033[0m")
-    elif issues:
-        print(f"\n  \033[1mPrioridade:\033[0m {issues[0][:120]}")
-        if fixes:
-            print(f"  \033[1mAção:\033[0m {fixes[0][:120]}")
-
-    if len(issues) > 1:
+    elif ev.top_issues:
+        print(f"\n  \033[1mPrioridade:\033[0m {ev.top_issues[0][:120]}")
+        if ev.fix_instructions:
+            print(f"  \033[1mAção:\033[0m {ev.fix_instructions[0][:120]}")
+    if len(ev.top_issues) > 1:
         print(f"\n  \033[2mOutros issues:\033[0m")
-        for g in issues[1:5]:
+        for g in ev.top_issues[1:5]:
             print(f"    \033[31m✗\033[0m {g[:120]}")
-    if len(fixes) > 1:
+    if len(ev.fix_instructions) > 1:
         print(f"\n  \033[2mOutras ações:\033[0m")
-        for f in fixes[1:5]:
+        for f in ev.fix_instructions[1:5]:
             print(f"    \033[36m→\033[0m {f[:120]}")
+    if trace_id:
+        print(f"\n  \033[2mTrace: {trace_id[:14]}  ·  headlabs trace show {trace_id[:14]}\033[0m")
     print()
 
-    # 6. Auto-fix: apply fix_instructions + re-validate
-    if getattr(args, "fix", False) and fixes:
-        instruction = " | ".join(fixes[:3])
-        print(f"\033[1m  Applying fix…\033[0m")
-        print(f"  \033[2m{instruction[:120]}\033[0m")
-        from types import SimpleNamespace
-        fix_args = SimpleNamespace(id=agent_id, instruction=instruction,
-                                   profile=profile, tenant=None)
-        cmd_agents_update(fix_args)
 
-        # Re-run the test to validate the fix worked
-        print(f"\n\033[1m  Re-validating after fix…\033[0m")
-        retest_args = SimpleNamespace(agent_id=agent_id, profile=profile,
-                                      scenario=scenario, fix=False, tools=False, reasoning=True)
-        _agents_test_reasoning(client, agent_id, profile, retest_args)
+def _delta_txt(delta) -> str:
+    if delta is None:
+        return ""
+    if delta > 0:
+        return f"\033[32m▲+{delta}\033[0m"
+    if delta < 0:
+        return f"\033[31m▼{delta}\033[0m"
+    return "\033[2m=\033[0m"
+
+
+def _render_loop_verdict(before, after, loop, *, trace_id: str = "") -> None:
+    """Render the closed-loop verdict after a --fix re-test."""
+    v = loop.get("verdict", "?")
+    vc = {"IMPROVED": "\033[32m", "REGRESSED": "\033[31m",
+          "UNCHANGED": "\033[33m"}.get(v, "")
+    sd = loop.get("score", {})
+    print(f"\n  \033[1m  CLOSED-LOOP RESULT\033[0m")
+    print(f"  {'-'*40}")
+    print(f"  verdict     {vc}{v}\033[0m")
+    print(f"  score       {sd.get('before')} → {sd.get('after')}  "
+          f"({_delta_txt(sd.get('delta'))})")
+    print(f"  tool_calls  {loop.get('tool_calls', {}).get('before')} → "
+          f"{loop.get('tool_calls', {}).get('after')}")
+    # Per-dimension movement (only those that changed).
+    moved = {k: d for k, d in loop.get("dimensions", {}).items()
+             if d.get("delta") not in (None, 0)}
+    if moved:
+        print(f"  dimensions:")
+        for k, d in sorted(moved.items(), key=lambda kv: (kv[1].get('delta') or 0)):
+            print(f"    {k:<22} {d.get('before')} → {d.get('after')}  {_delta_txt(d.get('delta'))}")
+    if trace_id:
+        print(f"\n  \033[2mTrace: {trace_id[:14]}  ·  headlabs trace diff {before.exec_trace_id[:10] if before.exec_trace_id else '<a>'} {trace_id[:10]}\033[0m")
+    print()
 
 
 def cmd_agents_deploy(args):
@@ -2331,43 +2511,98 @@ def cmd_tools(args):
         print(f"{t['id']:<30} {t['type']:<8} {t['name']}")
 
 
+def _render_chat_answer(answer: str) -> None:
+    """Render an agent chat answer as a human-facing panel (rich), stripping
+    emoji noise. Falls back to plain text without rich."""
+    try:
+        from rich.console import Console
+        from rich.markdown import Markdown
+        from rich.panel import Panel
+        import re as _re
+        _emoji_re = _re.compile("["
+            "\U0001F1E0-\U0001F1FF"  # flags
+            "\U0001F300-\U0001F5FF"  # symbols & pictographs
+            "\U0001F600-\U0001F64F"  # emoticons
+            "\U0001F680-\U0001F6FF"  # transport
+            "\U0001F700-\U0001F77F"  # alchemical
+            "\U0001F780-\U0001F7FF"  # geometric extended
+            "\U0001F800-\U0001F8FF"  # supplemental arrows
+            "\U0001F900-\U0001F9FF"  # supplemental symbols
+            "\U0001FA00-\U0001FA6F"  # chess symbols
+            "\U0001FA70-\U0001FAFF"  # symbols extended-A
+            "\U00002702-\U000027B0"  # dingbats
+            "\U000024C2-\U0001F251"  # enclosed chars
+            "\U0000FE00-\U0000FE0F"  # variation selectors
+            "\U00002600-\U000026FF"  # misc symbols
+            "\U00002B50-\U00002B55"  # stars
+            "\U0000200D"             # ZWJ
+            "\U00002934-\U00002935"  # arrows
+            "]+", flags=_re.UNICODE)
+        _answer = _emoji_re.sub('', answer)
+        _answer = _answer.replace('✅', '').replace('❌', '').replace('🔍', '')
+        _console = Console(width=min(Console().width, 100))
+        _console.print()
+        _console.print(Panel(Markdown(_answer), title="Agent", border_style="dim", padding=(1, 2)))
+        _console.print()
+    except ImportError:
+        print(f"\nAgent: {answer}\n")
+
+
 def cmd_chat(args):
     """Interactive chat with an agent. Same credential model as `run`:
     the AWS profile is used to collect data LOCALLY (credentials stay local),
     and the collected data is sent to the agent so it reasons over the
-    CLIENT's account — not the HeadLabs platform account."""
+    CLIENT's account — not the HeadLabs platform account.
+
+    ``--output-format`` selects presentation: ``human`` (default; rich panels +
+    live progress), ``json`` (one trace object per turn) or ``stream-json``
+    (NDJSON events + a final result line per turn). In machine formats the
+    prompt/banner are suppressed and each line read from stdin is one turn, so
+    chat composes in pipelines."""
     import uuid
     from headlabs.client import HeadLabsClient
-    from headlabs.progress import ProgressReporter
+    from headlabs.output import make_reporter
+
+    fmt = getattr(args, "output_format", "human") or "human"
+    human = fmt == "human"
 
     client = HeadLabsClient()
     session_id = str(uuid.uuid4())
 
-    # Resolve friendly name → platform agent id (finops → finops-chat)
-    agent_cfg = AGENT_REGISTRY.get(args.agent)
-    agent_id = agent_cfg["chat_agent_id"] if agent_cfg and "chat_agent_id" in agent_cfg else args.agent
+    # Resolve friendly name → platform chat agent id, validating it exists
+    # before opening the session (clean error + suggestions on a typo).
+    from headlabs import agentnames
+    try:
+        agent_id = agentnames.resolve_agent_id(client, args.agent, kind="chat")
+    except agentnames.AgentNotFound as exc:
+        _print_agent_not_found(exc)
+        sys.exit(2)
 
     # Resolve account + region from the AWS profile and derive short-lived
     # credentials so the ephemeral agent reads the CLIENT's account (Option B).
     # Long-lived keys never leave the machine; without creds the agent fails
     # closed server-side.
     agent_input = {"tenant_id": "ALL", "aws_region": "us-east-1"}
+    account_id = ""
     try:
         import boto3
         from headlabs.client import _ephemeral_credentials
         session = boto3.Session(profile_name=args.profile)
         agent_input["aws_region"] = session.region_name or "us-east-1"
         identity = session.client("sts").get_caller_identity()
-        agent_input["account_id"] = identity["Account"]
-        print(f"Account: {identity['Account']} (profile: {args.profile})")
+        account_id = identity["Account"]
+        agent_input["account_id"] = account_id
+        if human:
+            print(f"Account: {identity['Account']} (profile: {args.profile})")
 
         creds = _ephemeral_credentials(session)
         if creds:
             agent_input.update(creds)
-        else:
+        elif human:
             print("! Sem credenciais AWS resolvidas — a execução pode ser bloqueada pelo agente.")
     except Exception as exc:
-        print(f"! Could not resolve AWS profile '{args.profile}': {exc}")
+        if human:
+            print(f"! Could not resolve AWS profile '{args.profile}': {exc}")
 
     context = {"input": agent_input}
     # Language from config (default pt-BR)
@@ -2380,13 +2615,14 @@ def cmd_chat(args):
     from headlabs.config import get_tenant
     tenant_id = getattr(args, "tenant", None) or get_tenant()
 
-    print(f"Chat with '{agent_id}' (session: {session_id[:8]}...)")
-    print("   Type /exit or Ctrl+C to quit.\n")
+    if human:
+        print(f"Chat with '{agent_id}' (session: {session_id[:8]}...)")
+        print("   Type /exit or Ctrl+C to quit.\n")
 
     try:
         while True:
             try:
-                user_input = input("You: ").strip()
+                user_input = input("You: " if human else "").strip()
             except EOFError:
                 break
             if not user_input:
@@ -2394,9 +2630,13 @@ def cmd_chat(args):
             if user_input in ("/exit", "/quit"):
                 break
 
-            # Reuse the same live renderer as `run`: dimmed tool lines with
-            # elapsed time, detail sub-items, spinner — TTY-aware.
-            reporter = ProgressReporter(
+            # One trace per turn; the reporter records events and emits in the
+            # selected format. The human reporter reuses the same live renderer
+            # as `run` (dimmed tool lines, spinner — TTY-aware).
+            reporter = make_reporter(
+                fmt, workflow="chat", agent_id=agent_id, account_id=account_id,
+                profile=getattr(args, "profile", ""),
+                meta={"session_id": session_id, "message": user_input},
                 quiet=getattr(args, "quiet", False),
                 verbose=getattr(args, "verbose", False),
             )
@@ -2414,59 +2654,34 @@ def cmd_chat(args):
                         answer = event.get("message", "")
                     elif etype == "error":
                         err = event.get("error", "?")
-                reporter.finish("failed" if err else "succeeded")
+                if hasattr(reporter, "set_result"):
+                    reporter.set_result({"answer": answer, "error": err,
+                                         "session_id": session_id})
+                reporter.finish("failed" if err else "succeeded", answer)
             except KeyboardInterrupt:
                 reporter.finish("cancelled")
-                print()
+                if human:
+                    print()
                 continue
             except Exception as exc:
                 reporter.finish("failed")
-                print(f"  x {exc}")
+                if human:
+                    print(f"  x {exc}")
                 continue
 
-            if err:
-                print(f"  x Error: {err}")
-            elif answer:
-                try:
-                    from rich.console import Console
-                    from rich.markdown import Markdown
-                    from rich.panel import Panel
-                    import re as _re
-                    # Strip emojis: remove everything in emoji Unicode ranges
-                    _emoji_re = _re.compile("["
-                        "\U0001F1E0-\U0001F1FF"  # flags
-                        "\U0001F300-\U0001F5FF"  # symbols & pictographs
-                        "\U0001F600-\U0001F64F"  # emoticons
-                        "\U0001F680-\U0001F6FF"  # transport
-                        "\U0001F700-\U0001F77F"  # alchemical
-                        "\U0001F780-\U0001F7FF"  # geometric extended
-                        "\U0001F800-\U0001F8FF"  # supplemental arrows
-                        "\U0001F900-\U0001F9FF"  # supplemental symbols
-                        "\U0001FA00-\U0001FA6F"  # chess symbols
-                        "\U0001FA70-\U0001FAFF"  # symbols extended-A
-                        "\U00002702-\U000027B0"  # dingbats
-                        "\U000024C2-\U0001F251"  # enclosed chars
-                        "\U0000FE00-\U0000FE0F"  # variation selectors
-                        "\U00002600-\U000026FF"  # misc symbols
-                        "\U00002B50-\U00002B55"  # stars
-                        "\U0000200D"             # ZWJ
-                        "\U00002934-\U00002935"  # arrows
-                        "]+", flags=_re.UNICODE)
-                    _answer = _emoji_re.sub('', answer)
-                    # Also strip ✅❌ (checkmarks that aren't our ✓✗⚠)
-                    _answer = _answer.replace('✅', '').replace('❌', '').replace('🔍', '')
-                    _console = Console(width=min(Console().width, 100))
-                    _console.print()
-                    _console.print(Panel(Markdown(_answer), title="Agent", border_style="dim", padding=(1, 2)))
-                    _console.print()
-                except ImportError:
-                    print(f"\nAgent: {answer}\n")
+            if human:
+                if err:
+                    print(f"  x Error: {err}")
+                elif answer:
+                    _render_chat_answer(answer)
+            if answer:
                 history.append({"role": "user", "content": user_input})
                 history.append({"role": "assistant", "content": answer})
                 history = history[-20:]  # cap context window
     except KeyboardInterrupt:
         pass
-    print("\nChat ended.")
+    if human:
+        print("\nChat ended.")
 
 
 def cmd_config(args):
@@ -2478,6 +2693,36 @@ def cmd_config(args):
         config["language"] = args.language
     save_config(config)
     print("Configuration saved to ~/.headlabs/config.json")
+
+
+def cmd_completion(args):
+    """Print shell tab-completion setup for agent names and commands.
+
+    Usage:
+        # bash:  add to ~/.bashrc
+        eval "$(headlabs completion bash)"
+        # zsh:   add to ~/.zshrc (after `autoload -U compinit && compinit`)
+        eval "$(headlabs completion zsh)"
+    """
+    shell = getattr(args, "shell", None) or "bash"
+    try:
+        import argcomplete  # noqa: F401
+    except ImportError:
+        print("# tab-completion requires argcomplete:", file=sys.stderr)
+        print("#   pip install 'headlabs[completion]'   (or: pip install argcomplete)",
+              file=sys.stderr)
+        sys.exit(1)
+    if shell == "zsh":
+        # argcomplete needs bash-completion compatibility in zsh.
+        print('autoload -U bashcompinit && bashcompinit')
+    print('eval "$(register-python-argcomplete headlabs)"')
+    # Warm the agent-name cache so completion has names on first use.
+    try:
+        from headlabs.client import HeadLabsClient
+        from headlabs import agentnames
+        agentnames.refresh_catalog(HeadLabsClient())
+    except Exception:
+        pass
 
 
 def cmd_report(args):
@@ -2561,7 +2806,7 @@ def main():
     pp_get = p_pipe_sub.add_parser("status", help="Get pipeline / last run")
     pp_get.add_argument("pipeline_id", help="Pipeline ID")
     pp_get.set_defaults(func=cmd_pipeline, pipe_cmd="status")
-    p_run.add_argument("agent", help="Agent name (e.g. finops)")
+    p_run.add_argument("agent", help="Agent name (e.g. finops)").completer = _agent_completer
     p_run.add_argument("--profile", required=True, help="AWS profile name")
     p_run.add_argument("--account-id", help="Target AWS account ID (defaults to profile's account)")
     p_run.add_argument("--days", type=int, default=30, help="Days of data to analyze")
@@ -2569,7 +2814,10 @@ def main():
     p_run.add_argument("--quiet", action="store_true", help="Suppress progress output")
     p_run.add_argument("--verbose", action="store_true", help="Show every progress event")
     p_run.add_argument("--local", action="store_true", help="Run the agent locally via Docker (from ./agents/<id>/)")
-    p_run.add_argument("--output", choices=["json", "html", "md"], default="html", help="Output format")
+    p_run.add_argument("--output", choices=["json", "html", "md"], default="html", help="Report file format saved to ./reports/")
+    p_run.add_argument("--output-format", dest="output_format",
+                       choices=["human", "json", "stream-json"], default="human",
+                       help="stdout format: human (default), json (final trace), stream-json (NDJSON events)")
     p_run.add_argument("--no-browser", action="store_true", help="Don't open browser")
     p_run.set_defaults(func=cmd_run)
 
@@ -2602,12 +2850,15 @@ def main():
 
     # agents test — adversarial autocritical evaluation
     p_at = p_agents_sub.add_parser("test", help="Adversarial test: critic agent evaluates another agent")
-    p_at.add_argument("agent_id", help="Agent ID to test")
+    p_at.add_argument("agent_id", help="Agent ID to test").completer = _agent_completer
     p_at.add_argument("--profile", help="AWS profile (for invoking the agent)")
     p_at.add_argument("--fix", action="store_true", help="Auto-apply recommendations via update")
     p_at.add_argument("--scenario", help="Custom test scenario (otherwise critic generates them)")
     p_at.add_argument("--tools", action="store_true", help="Focus on tool/MCP connectivity: invoke and report which tools succeed/fail")
     p_at.add_argument("--reasoning", action="store_true", help="Evaluate reasoning quality: task completion, coherence, relevancy, efficiency (LLM-as-judge)")
+    p_at.add_argument("--output-format", dest="output_format",
+                      choices=["human", "json"], default="human",
+                      help="human (default) or json (structured test report + baseline comparison)")
     p_at.set_defaults(func=cmd_agents, subcmd="test")
 
     # agents deploy
@@ -2725,9 +2976,14 @@ def main():
 
     # chat
     p_chat = sub.add_parser("chat", help="Interactive chat with an agent")
-    p_chat.add_argument("agent", help="Agent ID")
+    p_chat.add_argument("agent", help="Agent ID").completer = _agent_completer
     p_chat.add_argument("--profile", default="default", help="AWS profile name")
     p_chat.add_argument("--tenant", help="Tenant ID for polling (defaults to config 'tenant', then 'platform')")
+    p_chat.add_argument("--output-format", dest="output_format",
+                        choices=["human", "json", "stream-json"], default="human",
+                        help="stdout format: human (default), json (trace/turn), stream-json (NDJSON)")
+    p_chat.add_argument("--quiet", action="store_true", help="Suppress progress output")
+    p_chat.add_argument("--verbose", action="store_true", help="Show every progress event")
     p_chat.set_defaults(func=cmd_chat)
 
     # config
@@ -2736,10 +2992,47 @@ def main():
     p_config.add_argument("--language", help="Output language (e.g. pt-BR, en, es)")
     p_config.set_defaults(func=cmd_config)
 
+    # completion (shell tab-completion setup)
+    p_comp = sub.add_parser("completion", help="Print shell tab-completion setup (bash/zsh)")
+    p_comp.add_argument("shell", nargs="?", choices=["bash", "zsh"], default="bash",
+                        help="Target shell (default: bash)")
+    p_comp.set_defaults(func=cmd_completion)
+
     # report
     p_report = sub.add_parser("report", help="Open reports")
     p_report.add_argument("--last", action="store_true", help="Open last report")
     p_report.set_defaults(func=cmd_report)
+
+    # ── trace (observability) ────────────────────────────────────────────────
+    from headlabs import tracectl
+    p_trace = sub.add_parser("trace", help="Inspect, compare, and export agent execution traces")
+    trace_sub = p_trace.add_subparsers(dest="trace_cmd")
+    p_trace.set_defaults(func=tracectl.cmd_trace)
+
+    tl = trace_sub.add_parser("list", aliases=["ls"], help="List recent traces (newest first)")
+    tl.add_argument("--limit", type=int, default=20, help="Max traces to show")
+    tl.add_argument("--agent", help="Filter by agent id")
+    tl.add_argument("--workflow", help="Filter by workflow (run|chat|test)")
+    tl.add_argument("-o", "--output", default="table", choices=["table", "json"])
+    tl.set_defaults(func=tracectl.cmd_trace, trace_cmd="list")
+
+    tshow = trace_sub.add_parser("show", help="Show a trace's full timeline")
+    tshow.add_argument("trace_id", help="Trace id or unique prefix")
+    tshow.add_argument("-o", "--output", default="table", choices=["table", "json"])
+    tshow.set_defaults(func=tracectl.cmd_trace, trace_cmd="show")
+
+    tdiff = trace_sub.add_parser("diff", help="Compare two traces")
+    tdiff.add_argument("trace_a", help="Baseline trace id or prefix")
+    tdiff.add_argument("trace_b", help="Comparison trace id or prefix")
+    tdiff.add_argument("-o", "--output", default="table", choices=["table", "json"])
+    tdiff.set_defaults(func=tracectl.cmd_trace, trace_cmd="diff")
+
+    texp = trace_sub.add_parser("export", help="Export a trace (OTel/OTLP or raw JSON)")
+    texp.add_argument("trace_id", help="Trace id or unique prefix")
+    texp.add_argument("--format", default="otel", choices=["otel", "raw"],
+                      help="otel = OTLP/JSON GenAI spans; raw = native trace JSON")
+    texp.add_argument("--endpoint", help="OTLP/HTTP collector endpoint to POST to (otel only)")
+    texp.set_defaults(func=tracectl.cmd_trace, trace_cmd="export")
 
     # ── labs (workspaces) ────────────────────────────────────────────────────
     def _add_common(p, *, output=True, watch=False, wait=False, tenant=False):
@@ -2801,6 +3094,11 @@ def main():
     larch = labs_sub.add_parser("archive", help="Archive a lab")
     larch.add_argument("lab", help="Lab id or name")
     larch.set_defaults(func=labsctl.cmd_labs, labs_cmd="archive")
+
+    lo = labs_sub.add_parser("outputs", help="Show the lab's outputs — created resources + ready-to-use endpoints/URLs")
+    lo.add_argument("lab", help="Lab id or name")
+    _add_common(lo)
+    lo.set_defaults(func=labsctl.cmd_labs, labs_cmd="outputs")
 
     # ── loops (build jobs) ────────────────────────────────────────────────────
     p_loops = sub.add_parser("loops", aliases=["loop"], help="Build loops (jobs) inside labs")
@@ -2892,6 +3190,9 @@ def main():
     # `headlabs loops list --mode research`.
     p_research = sub.add_parser("research", aliases=["rsch"],
                                 help="Investigate a topic (amplified web search + broad research agent) — returns findings, no build")
+    research_sub = p_research.add_subparsers(dest="research_cmd")
+
+    # bare `research -i ...` (no subcommand) → investigate
     p_research.add_argument("intent", nargs="?", default=argparse.SUPPRESS,
                             help="Topic/question to investigate (natural language)")
     p_research.add_argument("-i", "--intent", dest="intent", default=None,
@@ -2905,17 +3206,51 @@ def main():
     _add_common(p_research, watch=True, wait=True, tenant=True)
     p_research.set_defaults(func=labsctl.cmd_research)
 
+    # research build — construct from findings
+    rb = research_sub.add_parser("build", help="Build a solution from the lab's research findings")
+    rb.add_argument("-i", "--intent", required=True, help="What to build (uses research findings as context)")
+    rb.add_argument("--lab", required=True, help="Lab with research findings (id or name)")
+    rb.add_argument("--judges", choices=["off", "gate", "full"], help="Judge panel policy")
+    rb.add_argument("--judge-model", dest="judge_model", choices=["fast", "standard"], help="Judge model")
+    rb.add_argument("--gate-mode", dest="gate_mode", choices=["human", "judge", "judge+human"], help="Gate decision mode")
+    _add_common(rb, watch=True, wait=True, tenant=True)
+    rb.set_defaults(func=labsctl.cmd_research, research_cmd="build")
+
     # ── status (top-level shortcut) ───────────────────────────────────────────
     p_status = sub.add_parser("status", help="Active builds (no arg) or a build's detail")
     p_status.add_argument("job_id", nargs="?", help="Build id (optional)")
     _add_common(p_status, tenant=True)
     p_status.set_defaults(func=labsctl.cmd_status)
 
+    # Shell tab-completion (optional): enabled when argcomplete is installed and
+    # the shell hook is registered (see `headlabs completion`). No-op otherwise.
+    try:
+        import argcomplete
+        argcomplete.autocomplete(parser)
+    except ImportError:
+        pass
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
         sys.exit(1)
-    args.func(args)
+
+    import requests as _requests
+    from headlabs import agentnames as _agentnames
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        sys.exit(130)
+    except _agentnames.AgentNotFound as exc:
+        _print_agent_not_found(exc)
+        sys.exit(2)
+    except _requests.HTTPError as exc:
+        _print_http_error(exc)
+        sys.exit(1)
+    except _requests.RequestException as exc:
+        print(f"\033[31merro de rede: {str(exc)[:200]}\033[0m", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
