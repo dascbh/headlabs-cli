@@ -439,38 +439,40 @@ def _render_findings(loop: dict) -> None:
     key = findings.get("key_findings") or findings.get("themes") or findings.get("findings") or []
     if key:
         print(f"\n{_c('Principais achados', 'bold')} ({len(key)})")
-        for f in key[:12]:
+        for f in key:
             if isinstance(f, dict):
                 title = f.get("title") or f.get("finding") or f.get("detail") or ""
                 detail = f.get("detail") if f.get("title") else None
             else:
                 title, detail = str(f), None
-            print(f"  {_c('●', 'cyan')} {_trunc(title, 96)}")
+            print(f"  {_c('●', 'cyan')} {title}")
             if detail and detail != title:
-                print(f"      {_c(_trunc(detail, 100), 'dim')}")
+                import textwrap as _tw
+                for ln in _tw.wrap(str(detail), width=90):
+                    print(f"      {_c(ln, 'dim')}")
 
     opps = findings.get("opportunities") or findings.get("ideas") or findings.get("paths") or []
     if opps:
         print(f"\n{_c('Caminhos / ideias', 'bold')} ({len(opps)})")
-        for o in opps[:10]:
+        for o in opps:
             if isinstance(o, dict):
                 title = o.get("title") or o.get("idea") or o.get("detail") or ""
                 conf = o.get("confidence")
                 tail = _c(f"   ({conf})", "dim") if conf else ""
             else:
                 title, tail = str(o), ""
-            print(f"  {_c('→', 'green')} {_trunc(title, 90)}{tail}")
+            print(f"  {_c('→', 'green')} {title}{tail}")
 
     sources = findings.get("sources") or []
     if sources:
         print(f"\n{_c('Fontes', 'bold')} ({len(sources)})")
-        for s in sources[:12]:
+        for s in sources:
             if isinstance(s, dict):
                 title = s.get("title") or s.get("name") or ""
                 url = s.get("url") or s.get("href") or ""
-                print(f"  {_c('-', 'dim')} {_trunc(title or url, 70)}  {_c(url if title else '', 'dim')}")
+                print(f"  {_c('-', 'dim')} {title or url}  {_c(url if title else '', 'dim')}")
             else:
-                print(f"  {_c('-', 'dim')} {_trunc(str(s), 90)}")
+                print(f"  {_c('-', 'dim')} {s}")
 
     report = findings.get("report_path") or findings.get("report")
     if report and loop.get("lab_id"):
