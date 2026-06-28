@@ -3190,9 +3190,6 @@ def main():
     # `headlabs loops list --mode research`.
     p_research = sub.add_parser("research", aliases=["rsch"],
                                 help="Investigate a topic (amplified web search + broad research agent) — returns findings, no build")
-    research_sub = p_research.add_subparsers(dest="research_cmd")
-
-    # bare `research -i ...` (no subcommand) → investigate
     p_research.add_argument("intent", nargs="?", default=argparse.SUPPRESS,
                             help="Topic/question to investigate (natural language)")
     p_research.add_argument("-i", "--intent", dest="intent", default=None,
@@ -3204,10 +3201,11 @@ def main():
                             help="Investigation depth (default: deep)")
     p_research.add_argument("--sources", help="Restrict sources, comma-separated (default: all available, e.g. web,docs,repo)")
     _add_common(p_research, watch=True, wait=True, tenant=True)
-    p_research.set_defaults(func=labsctl.cmd_research)
+    p_research.set_defaults(func=labsctl.cmd_research, research_cmd=None)
 
-    # research build — construct from findings
-    rb = research_sub.add_parser("build", help="Build a solution from the lab's research findings")
+    # research build — top-level sibling (avoids subparser conflict with positional intent)
+    rb = sub.add_parser("research-build", aliases=["rb"],
+                        help="Build a solution from a lab's research findings (starts at architect)")
     rb.add_argument("-i", "--intent", required=True, help="What to build (uses research findings as context)")
     rb.add_argument("--lab", required=True, help="Lab with research findings (id or name)")
     rb.add_argument("--judges", choices=["off", "gate", "full"], help="Judge panel policy")
@@ -3230,7 +3228,13 @@ def main():
     except ImportError:
         pass
 
-    args = parser.parse_args()
+    # Pre-route: `research build ...` → `research-build ...` (avoids argparse
+    # subparser conflict with the positional intent argument).
+    _argv = sys.argv[1:]
+    if len(_argv) >= 2 and _argv[0] in ("research", "rsch") and _argv[1] == "build":
+        _argv = ["research-build"] + _argv[2:]
+
+    args = parser.parse_args(_argv)
     if not args.command:
         parser.print_help()
         sys.exit(1)
