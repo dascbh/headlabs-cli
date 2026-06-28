@@ -94,3 +94,15 @@ def test_summary_block():
     assert "reports/x.html" in out
     # sorted by savings: critical ($360) before low ($12)
     assert out.index("EKS ext support") < out.index("logs sem retention")
+
+
+def test_thinking_shows_full_reasoning_no_truncation():
+    """Full preview: long multi-paragraph reasoning must NOT be truncated."""
+    r, b = _rep()
+    r.begin_wait()
+    long_text = ("Passo 1: criar tabelas. " * 20) + "\nPasso final: ENTREGAR_TUDO_COMPLETO"
+    r.event({"type": "thinking", "detail": {"seconds": 2, "text": long_text}})
+    out = b.getvalue()
+    # the tail (which the old 240-char cap would have dropped) must be present
+    assert "ENTREGAR_TUDO_COMPLETO" in out
+    assert "╰ " in out

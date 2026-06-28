@@ -210,15 +210,32 @@ class ProgressReporter:
         return f"{pre}  {dot} {_DIM}{head}{_RESET}" if self.tty else f"{pre}  {_DOT} {head}"
 
     def _thinking_detail(self, ev: dict, pre: str = "") -> list[str]:
-        """The reasoning text as a '╰' continuation, if the event carries it."""
+        """The reasoning text as a '╰' continuation. Shown in FULL — wrapped across
+        multiple aligned lines (no truncation), preserving paragraph breaks."""
         detail = ev.get("detail") if isinstance(ev.get("detail"), dict) else {}
         text = detail.get("text") or detail.get("reasoning") or detail.get("summary")
         if not text and ev.get("label") not in (None, "thinking"):
             text = ev.get("label")
         if not text:
             return []
-        text = str(text).strip().replace("\n", " ")[:240]
-        return [f"{pre}      {_DIM}╰ {text}{_RESET}" if self.tty else f"{pre}      ╰ {text}"]
+        import textwrap, shutil
+        try:
+            cols = shutil.get_terminal_size((100, 20)).columns
+        except Exception:  # noqa: BLE001
+            cols = 100
+        width = max(40, cols - len(pre) - 8)
+        indent = f"{pre}      "
+        out: list[str] = []
+        first = True
+        for para in str(text).strip().split("\n"):
+            para = para.rstrip()
+            if not para:
+                continue
+            for ln in (textwrap.wrap(para, width=width) or [""]):
+                lead = "╰ " if first else "  "
+                out.append(f"{indent}{_DIM}{lead}{ln}{_RESET}" if self.tty else f"{indent}{lead}{ln}")
+                first = False
+        return out
 
     def _detail_lines(self, ev: dict, pre: str = "") -> list[str]:
         """Indented sub-lines for a tool call — only when the backend provides
