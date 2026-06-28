@@ -295,14 +295,15 @@ def _resource_endpoint(client: HeadLabsClient, base: str, kind: str, name: str) 
 
 
 def _labs_outputs(args):
-    """CloudFormation-style Outputs: every created resource + its access endpoint."""
+    """Outputs: published sites (browser URLs), API endpoints, and files — grouped."""
     client = HeadLabsClient()
     lab = _resolve_lab(client, args.lab)
     lid = lab["lab_id"]
     base = client.api_url.rstrip("/")
     loops = client.request("GET", f"/labs-v2/{lid}/lineage") or []
     seen: set = set()
-    outs = []
+    sites, apis = [], []
+    file_count = 0
     for lp in loops:
         loop = client.request("GET", f"/loops/{lp.get('loop_id')}") or {}
         for r in (loop.get("resources_created") or []):
@@ -310,22 +311,35 @@ def _labs_outputs(args):
                 continue
             seen.add(r)
             kind, nm = r.split(":", 1)
-            outs.append({"type": kind, "resource": nm, **_resource_endpoint(client, base, kind, nm)})
+            if kind == "file" or "/" in nm:      # files / sub-paths aren't standalone resources
+                file_count += 1
+                continue
+            entry = {"type": kind, "resource": nm, **_resource_endpoint(client, base, kind, nm)}
+            (sites if kind == "storage" else apis).append(entry)
+
     if getattr(args, "output", "table") == "json":
-        print(json.dumps({"lab_id": lid, "name": lab.get("name", ""), "outputs": outs},
+        print(json.dumps({"lab_id": lid, "name": lab.get("name", ""),
+                          "sites": sites, "apis": apis, "files": file_count},
                          indent=2, ensure_ascii=False))
         return
-    if not outs:
+    if not sites and not apis and not file_count:
         print(_c("Sem recursos ainda (nenhum loop concluiu criação).", "dim"))
         return
     print(f"\n{_c('Outputs', 'bold')}  ·  {lab.get('name','')}  ({lid})")
-    for o in sorted(outs, key=lambda x: (x["type"], x["resource"])):
-        kind = f"{o['type']:<10}"
-        res = f"{o['resource']:<24}"
-        print(f"  {_c(kind, 'cyan')} {res} {o.get('endpoint','')}")
-        if o.get("example"):
-            print(f"  {'':<10} {'':<24} {_c(o['example'], 'dim')}")
-    print(_c(f"\n  {len(outs)} recurso(s)  ·  json: headlabs labs outputs {lid} -o json", "dim"))
+    if sites:
+        print(f"\n{_c('🌐 Sites publicados', 'bold')}")
+        for o in sorted(sites, key=lambda x: x["resource"]):
+            print(f"  {o['resource']:<24} {o.get('endpoint','')}")
+    if apis:
+        print(f"\n{_c('API & recursos', 'bold')}")
+        for o in sorted(apis, key=lambda x: (x["type"], x["resource"])):
+            tlabel = f"{o['type']:<9}"
+            print(f"  {_c(tlabel, 'cyan')} {o['resource']:<24} {o.get('endpoint','')}")
+            if o.get("example"):
+                print(f"  {'':<9} {'':<24} {_c(o['example'], 'dim')}")
+    if file_count:
+        print(f"\n{_c('Arquivos', 'bold')}: {file_count}  ·  navegue com: headlabs labs repo {lid} --tree")
+    print(_c(f"\n  json: headlabs labs outputs {lid} -o json", "dim"))
 
 
 def _labs_rebuild(args):
