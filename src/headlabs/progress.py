@@ -151,10 +151,11 @@ class ProgressReporter:
         if etype == "tool_use":
             name = tool or label
             el = _fmt_elapsed(time.time() - self._start_ts) if self._start_ts is not None else None
+            dot = self._dot(_GREEN)
             if self.tty:
-                line = f"{pre}  {_DIM}- {name}" + (f"   +{el}" if el else "") + _RESET
+                line = f"{pre}  {dot} {name}" + (f"{_DIM}   +{el}{_RESET}" if el else "")
             else:
-                line = f"{pre}  - {name}" + (f"   +{el}" if el else "")
+                line = f"{pre}  {_DOT} {name}" + (f"   +{el}" if el else "")
             self._emit_block(line, self._detail_lines(ev, pre))
         elif etype == "thinking":
             self._emit_block(self._thinking_line(ev, pre), self._thinking_detail(ev, pre))
@@ -206,7 +207,8 @@ class ProgressReporter:
         if secs is None and isinstance(detail.get("ms"), (int, float)):
             secs = round(detail["ms"] / 1000)
         head = f"Thought for {int(secs)}s" if isinstance(secs, (int, float)) else "Thinking"
-        dot = self._dot(_DIM) if self.tty else _DOT
+        head += "..."
+        dot = self._dot(_GREEN) if self.tty else _DOT
         return f"{pre}  {dot} {_DIM}{head}{_RESET}" if self.tty else f"{pre}  {_DOT} {head}"
 
     def _thinking_detail(self, ev: dict, pre: str = "") -> list[str]:

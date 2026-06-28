@@ -17,7 +17,7 @@ def test_status_and_tool_lines():
     r.event({"type": "tool_use", "tool": "explore_costs"})
     out = b.getvalue()
     assert "● Agente rodando" in out
-    assert "- explore_costs" in out
+    assert "● explore_costs" in out
 
 
 def test_tool_detail_subitems_only_when_present():
@@ -26,7 +26,7 @@ def test_tool_detail_subitems_only_when_present():
     r.event({"type": "tool_use", "tool": "get_s3", "detail": {
         "summary": "42 buckets", "buckets": 42}})
     out = b.getvalue()
-    assert "- get_s3" in out
+    assert "● get_s3" in out
     assert "-> 42 buckets" in out
     assert "buckets=42" in out
 
@@ -49,7 +49,7 @@ def test_handoff_and_agent_indentation():
     assert "→ delega para b" in out
     assert "faça x" in out
     # b is at delegation depth 1 -> two extra leading spaces before the base line
-    assert "    - t1" in out
+    assert "    ● t1" in out
 
 
 def test_quiet_suppresses_normal_events():
