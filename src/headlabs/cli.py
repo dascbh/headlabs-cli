@@ -3100,6 +3100,14 @@ def main():
     _add_common(lo)
     lo.set_defaults(func=labsctl.cmd_labs, labs_cmd="outputs")
 
+    lrb = labs_sub.add_parser("rebuild", help="Rebuild the lab's product from an instruction (reuses research/architecture; agents decide scope)")
+    lrb.add_argument("lab", help="Lab id or name")
+    lrb.add_argument("-i", "--intent", required=True, help="Instruction: adjustment, feature, or fix (e.g. error message)")
+    lrb.add_argument("--from", dest="from_stage", choices=["executor", "architect", "research"],
+                     default="executor", help="Where to restart (optional; default: executor)")
+    _add_common(lrb, watch=True, wait=True, tenant=True)
+    lrb.set_defaults(func=labsctl.cmd_labs, labs_cmd="rebuild")
+
     # ── loops (build jobs) ────────────────────────────────────────────────────
     p_loops = sub.add_parser("loops", aliases=["loop"], help="Build loops (jobs) inside labs")
     loops_sub = p_loops.add_subparsers(dest="loops_cmd")

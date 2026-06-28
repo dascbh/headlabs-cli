@@ -212,6 +212,7 @@ def cmd_labs(args):
         "create": _labs_create, "list": _labs_list, "ls": _labs_list,
         "get": _labs_get, "describe": _labs_describe, "repo": _labs_repo,
         "push": _labs_push, "archive": _labs_archive, "outputs": _labs_outputs,
+        "rebuild": _labs_rebuild,
     }.get(sub, _labs_list)(args)
 
 
@@ -325,6 +326,29 @@ def _labs_outputs(args):
         if o.get("example"):
             print(f"  {'':<10} {'':<24} {_c(o['example'], 'dim')}")
     print(_c(f"\n  {len(outs)} recurso(s)  ·  json: headlabs labs outputs {lid} -o json", "dim"))
+
+
+def _labs_rebuild(args):
+    """Rebuild the lab's product from an instruction (reuses research/architecture/
+    resources as context). The agents interpret the instruction and decide scope."""
+    client = HeadLabsClient()
+    if not getattr(args, "intent", None):
+        _die("rebuild requer -i/--intent com a instrução (ajuste, feature ou correção)", EXIT_USAGE)
+    lab = _resolve_lab(client, args.lab)
+    lid = lab["lab_id"]
+    loops = client.request("GET", f"/labs-v2/{lid}/lineage") or []
+    loops = sorted(loops, key=lambda l: l.get("started_at") or "")
+    terminal = [l for l in loops if str(l.get("status", "")).lower() in ("complete", "failed")]
+    if not terminal:
+        _die("nenhum build concluído neste lab para rebuildar", EXIT_USAGE)
+    loop_id = terminal[-1]["loop_id"]
+    frm = getattr(args, "from_stage", None) or "executor"
+    res = client.request("POST", f"/loops/{loop_id}/rebuild",
+                         json={"instruction": args.intent, "from_stage": frm})
+    new_id = res.get("loop_id", loop_id)
+    print(_c(f"↻ rebuild (from {res.get('from_stage', frm)}): {new_id}", "green"))
+    if getattr(args, "watch", False):
+        return _follow(client, new_id, watch=True, args=args)
 
 
 def _labs_repo(args):
