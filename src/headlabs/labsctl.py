@@ -717,7 +717,12 @@ def cmd_inspect(args):
     if fixes:
         print(f"  {_c('Fixes sugeridos', 'bold')} ({len(fixes)})")
         for f in fixes:
-            print(f"    {_c('→', 'green')} {f.get('resource', '?')}: {f.get('action', '')}")
+            if isinstance(f, dict):
+                resource = f.get("resource") or f.get("priority") or ""
+                action = f.get("action") or f.get("fix") or f.get("detail") or ""
+            else:
+                resource, action = "", str(f)
+            print(f"    {_c('→', 'green')} {_c(resource, 'bold') + ': ' if resource else ''}{action}")
         print()
 
     # --fix: trigger executor fix cycle
