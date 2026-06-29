@@ -620,9 +620,13 @@ def cmd_inspect(args):
                   and l.get("status") == "complete"
                   and l.get("mode") != "research"]
         if not builds:
-            # Fallback: any complete loop in the lab (including research_build)
+            # Fallback: any complete or failed build loop (failed builds still have resources to inspect)
             builds = [l for l in loops if l.get("lab_id") == lab_id
-                      and l.get("status") == "complete"]
+                      and l.get("status") in ("complete", "failed")
+                      and l.get("mode") != "research"]
+        if not builds:
+            builds = [l for l in loops if l.get("lab_id") == lab_id
+                      and l.get("status") in ("complete", "failed")]
         if not builds:
             # Last fallback: get lab detail which may reference the latest loop
             try:
@@ -633,7 +637,18 @@ def cmd_inspect(args):
             except Exception:
                 pass
         if not builds:
-            _die(f"Nenhum build concluído no lab {lab_id}. Use --loop <id> para especificar.", EXIT_USAGE)
+            # Try to find any loop in the lab (including non-listed/paginated ones)
+            try:
+                all_loops = client.request("GET", "/loops")
+                any_in_lab = [l for l in all_loops if l.get("lab_id") == lab_id]
+                if any_in_lab:
+                    any_in_lab.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+                    builds = [any_in_lab[0]]
+            except Exception:
+                pass
+        if not builds:
+            _die(f"Nenhum build encontrado no lab {lab_id}. Use --loop <id> para especificar.\n"
+                 f"  Dica: headlabs loops list --lab {lab_id}", EXIT_USAGE)
         builds.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
         loop_id = builds[0]["loop_id"]
 
