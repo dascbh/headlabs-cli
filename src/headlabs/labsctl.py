@@ -624,6 +624,15 @@ def cmd_inspect(args):
             builds = [l for l in loops if l.get("lab_id") == lab_id
                       and l.get("status") == "complete"]
         if not builds:
+            # Last fallback: get lab detail which may reference the latest loop
+            try:
+                lab_detail = client.request("GET", f"/labs-v2/{lab_id}")
+                last_loop = lab_detail.get("last_loop_id") or lab_detail.get("loop_id")
+                if last_loop:
+                    builds = [{"loop_id": last_loop, "updated_at": ""}]
+            except Exception:
+                pass
+        if not builds:
             _die(f"Nenhum build concluído no lab {lab_id}. Use --loop <id> para especificar.", EXIT_USAGE)
         builds.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
         loop_id = builds[0]["loop_id"]
