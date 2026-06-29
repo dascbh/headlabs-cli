@@ -3222,6 +3222,16 @@ def main():
     _add_common(rb, watch=True, wait=True, tenant=True)
     rb.set_defaults(func=labsctl.cmd_research, research_cmd="build")
 
+    # ── inspect — invoke the inspector on a lab/loop ────────────────────────────
+    p_inspect = sub.add_parser("inspect", help="Run QA/specialist inspection on a lab's built product")
+    p_inspect.add_argument("--lab", required=True, help="Lab id to inspect")
+    p_inspect.add_argument("--role", choices=["qa", "ux", "security", "architect", "performance"],
+                           default="qa", help="Inspector role (default: qa)")
+    p_inspect.add_argument("--loop", help="Specific loop id (default: latest build in the lab)")
+    p_inspect.add_argument("--fix", action="store_true", help="If issues found, trigger executor fix cycle")
+    _add_common(p_inspect, watch=True, wait=True, tenant=True)
+    p_inspect.set_defaults(func=labsctl.cmd_inspect)
+
     # ── status (top-level shortcut) ───────────────────────────────────────────
     p_status = sub.add_parser("status", help="Active builds (no arg) or a build's detail")
     p_status.add_argument("job_id", nargs="?", help="Build id (optional)")

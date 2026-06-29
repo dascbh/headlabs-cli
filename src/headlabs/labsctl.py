@@ -601,6 +601,131 @@ def _render_findings(loop: dict) -> None:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
+# inspect
+# ════════════════════════════════════════════════════════════════════════════
+
+def cmd_inspect(args):
+    """Invoke the loop-inspector on a lab's built product. Runs QA/specialist
+    inspection, shows findings, and optionally triggers a fix cycle."""
+    client = HeadLabsClient()
+    lab = _resolve_lab(client, args.lab)
+    lab_id = lab["lab_id"]
+
+    # Find the latest build loop in this lab (or use --loop)
+    loop_id = getattr(args, "loop", None)
+    if not loop_id:
+        loops = client.request("GET", "/loops")
+        builds = [l for l in loops if l.get("lab_id") == lab_id
+                  and l.get("status") == "complete"
+                  and l.get("mode") != "research"]
+        if not builds:
+            _die(f"Nenhum build concluído no lab {lab_id}", EXIT_USAGE)
+        builds.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+        loop_id = builds[0]["loop_id"]
+
+    # Get loop details for resources/architecture
+    loop = client.request("GET", f"/loops/{loop_id}")
+    resources = loop.get("resources_created") or []
+    architecture = loop.get("architecture") or {}
+    role = getattr(args, "role", "qa")
+
+    # Derive endpoints
+    api_base = f"https://api.headlabs.ai/api/v1/apps/{lab_id}"
+    fn_endpoints = [f"{api_base}/functions/{r.replace('function:', '')}"
+                    for r in resources if r.startswith("function:")]
+    site_urls = [f"https://{r.replace('storage:', '')}.apps.headlabs.ai/"
+                 for r in resources if r.startswith("storage:")]
+
+    print(f"  {_c('⚙', 'cyan')} Inspecionando lab {_c(lab_id, 'bold')} (loop {loop_id})")
+    print(f"    Role: {_c(role, 'bold')} | Recursos: {len(resources)} | Sites: {len(site_urls)} | Functions: {len(fn_endpoints)}")
+
+    # Invoke inspector
+    body = {"input": {
+        "intent": loop.get("intent", ""),
+        "tenant_id": "platform",
+        "loop_id": loop_id,
+        "lab_id": lab_id,
+        "role": role,
+        "resources_created": resources,
+        "architecture": architecture,
+        "site_urls": site_urls,
+        "function_endpoints": fn_endpoints,
+    }}
+    resp = client.request("POST", "/agents/loop-inspector/invoke", json=body)
+    exec_id = resp.get("exec_id")
+    print(f"    Execução: {exec_id}")
+    print(_c("    Aguardando inspeção...", "dim"))
+
+    # Poll for result
+    import time as _time
+    result = None
+    for _ in range(20):
+        _time.sleep(12)
+        try:
+            ex = client.request("GET", f"/executions/{exec_id}?tenant_id=platform")
+            if ex.get("status") in ("succeeded", "partial", "failed"):
+                out = ex.get("output", "")
+                if isinstance(out, str) and "_s3" in out:
+                    import boto3
+                    ref = json.loads(out)["_s3"][5:]
+                    bkt, _, key = ref.partition("/")
+                    result = json.loads(boto3.client("s3", region_name="us-east-1")
+                                       .get_object(Bucket=bkt, Key=key)["Body"].read())
+                elif isinstance(out, str):
+                    try:
+                        result = json.loads(out)
+                    except Exception:
+                        result = {"summary": out}
+                elif isinstance(out, dict):
+                    result = out
+                break
+        except Exception:
+            continue
+
+    if not result:
+        print(_c("    ⏳ Inspeção ainda rodando. Verifique depois.", "yellow"))
+        return
+
+    # Render result
+    status = result.get("status", "?")
+    color = "green" if status == "pass" else ("yellow" if status == "partial" else "red")
+    print(f"\n  {_c('Inspeção concluída', 'bold')} — {_c(status.upper(), color)}")
+    print(f"  {result.get('summary', '')}\n")
+
+    issues = result.get("issues") or []
+    if issues:
+        print(f"  {_c('Issues', 'bold')} ({len(issues)})")
+        for iss in issues:
+            sev = iss.get("severity", "?")
+            scolor = "red" if sev in ("critical", "high") else ("yellow" if sev == "medium" else "dim")
+            print(f"    {_c(f'[{sev}]', scolor)} {iss.get('resource', '?')}")
+            print(f"          {iss.get('detail', '')}")
+            if iss.get("fix"):
+                print(f"          {_c('fix: ' + iss['fix'], 'dim')}")
+        print()
+
+    fixes = result.get("fixes_required") or []
+    if fixes:
+        print(f"  {_c('Fixes sugeridos', 'bold')} ({len(fixes)})")
+        for f in fixes:
+            print(f"    {_c('→', 'green')} {f.get('resource', '?')}: {f.get('action', '')}")
+        print()
+
+    # --fix: trigger executor fix cycle
+    if getattr(args, "fix", False) and issues and status in ("fail", "partial"):
+        feedback = "; ".join(f.get("action", "") for f in fixes[:5])[:1500]
+        print(_c("  Disparando ciclo de correção (executor)...", "cyan"))
+        try:
+            client.request("POST", f"/loops/{loop_id}/callback?tenant_id=platform",
+                           json={"phase": "inspector", "output": result, "status": "succeeded"},
+                           headers={"X-Internal-Token": ""})
+            print(f"  {_c('✓', 'green')} Fix cycle disparado. Acompanhe: headlabs loops watch {loop_id}")
+        except Exception as e:
+            print(f"  {_c('Não foi possível disparar fix cycle: ' + str(e), 'red')}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # loops
 # ════════════════════════════════════════════════════════════════════════════
 
