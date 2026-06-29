@@ -615,40 +615,20 @@ def cmd_inspect(args):
     # Find the latest build loop in this lab (or use --loop)
     loop_id = getattr(args, "loop", None)
     if not loop_id:
-        loops = client.request("GET", "/loops")
-        builds = [l for l in loops if l.get("lab_id") == lab_id
-                  and l.get("status") == "complete"
-                  and l.get("mode") != "research"]
+        # Query loops for this specific lab (server-side filter, paginated)
+        try:
+            lab_loops = client.request("GET", f"/loops?lab_id={lab_id}")
+        except Exception:
+            lab_loops = []
+        # Prefer non-research builds; accept failed (still has resources to inspect)
+        builds = [l for l in lab_loops if l.get("mode") != "research"
+                  and l.get("status") in ("complete", "failed", "validating", "delivering")]
         if not builds:
-            # Fallback: any complete or failed build loop (failed builds still have resources to inspect)
-            builds = [l for l in loops if l.get("lab_id") == lab_id
-                      and l.get("status") in ("complete", "failed")
-                      and l.get("mode") != "research"]
+            builds = [l for l in lab_loops if l.get("status") in ("complete", "failed")]
         if not builds:
-            builds = [l for l in loops if l.get("lab_id") == lab_id
-                      and l.get("status") in ("complete", "failed")]
+            builds = lab_loops  # last resort: any loop in this lab
         if not builds:
-            # Last fallback: get lab detail which may reference the latest loop
-            try:
-                lab_detail = client.request("GET", f"/labs-v2/{lab_id}")
-                last_loop = lab_detail.get("last_loop_id") or lab_detail.get("loop_id")
-                if last_loop:
-                    builds = [{"loop_id": last_loop, "updated_at": ""}]
-            except Exception:
-                pass
-        if not builds:
-            # Try to find any loop in the lab (including non-listed/paginated ones)
-            try:
-                all_loops = client.request("GET", "/loops")
-                any_in_lab = [l for l in all_loops if l.get("lab_id") == lab_id]
-                if any_in_lab:
-                    any_in_lab.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
-                    builds = [any_in_lab[0]]
-            except Exception:
-                pass
-        if not builds:
-            _die(f"Nenhum build encontrado no lab {lab_id}. Use --loop <id> para especificar.\n"
-                 f"  Dica: headlabs loops list --lab {lab_id}", EXIT_USAGE)
+            _die(f"Nenhum loop encontrado no lab {lab_id}. Use --loop <id>.", EXIT_USAGE)
         builds.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
         loop_id = builds[0]["loop_id"]
 
