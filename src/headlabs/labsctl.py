@@ -620,7 +620,11 @@ def cmd_inspect(args):
                   and l.get("status") == "complete"
                   and l.get("mode") != "research"]
         if not builds:
-            _die(f"Nenhum build concluído no lab {lab_id}", EXIT_USAGE)
+            # Fallback: any complete loop in the lab (including research_build)
+            builds = [l for l in loops if l.get("lab_id") == lab_id
+                      and l.get("status") == "complete"]
+        if not builds:
+            _die(f"Nenhum build concluído no lab {lab_id}. Use --loop <id> para especificar.", EXIT_USAGE)
         builds.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
         loop_id = builds[0]["loop_id"]
 
