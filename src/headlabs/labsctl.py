@@ -212,7 +212,7 @@ def cmd_labs(args):
         "create": _labs_create, "list": _labs_list, "ls": _labs_list,
         "get": _labs_get, "describe": _labs_describe, "repo": _labs_repo,
         "push": _labs_push, "archive": _labs_archive, "outputs": _labs_outputs,
-        "rebuild": _labs_rebuild,
+        "rebuild": _labs_rebuild, "backlog": _labs_backlog,
     }.get(sub, _labs_list)(args)
 
 
@@ -340,6 +340,33 @@ def _labs_outputs(args):
     if file_count:
         print(f"\n{_c('Arquivos', 'bold')}: {file_count}  ·  navegue com: headlabs labs repo {lid} --tree")
     print(_c(f"\n  json: headlabs labs outputs {lid} -o json", "dim"))
+
+
+def _labs_backlog(args):
+    """Show the lab's inspection backlog (issues/fixes from inspector runs)."""
+    client = HeadLabsClient()
+    lab = _resolve_lab(client, args.lab)
+    lab_id = lab["lab_id"]
+    try:
+        backlog = client.request("GET", f"/labs-v2/{lab_id}/backlog")
+    except Exception:
+        backlog = []
+    if not backlog:
+        print(_c("  Backlog vazio — rode headlabs inspect --lab " + lab_id + " para gerar.", "dim"))
+        return
+    open_items = [b for b in backlog if b.get("status") != "done"]
+    done_items = [b for b in backlog if b.get("status") == "done"]
+    print(f"\n  {_c('Backlog', 'bold')} · {lab.get('name', lab_id)}  ({len(open_items)} abertos, {len(done_items)} concluídos)\n")
+    for bl in open_items:
+        sev = bl.get("severity", "?")
+        scolor = "red" if sev in ("critical", "high") else ("yellow" if sev == "medium" else "dim")
+        print(f"  {_c(f'[{sev}]', scolor)} {bl.get('resource', '')}")
+        print(f"        {bl.get('description', '')}")
+        print(_c(f"        id: {bl.get('id', '?')} · fonte: {bl.get('source', '?')}", "dim"))
+    if done_items:
+        print(f"\n  {_c('Concluídos', 'dim')} ({len(done_items)})")
+        for bl in done_items[-3:]:
+            print(f"    ✓ {bl.get('resource', '')} — {bl.get('description', '')[:80]}")
 
 
 def _labs_rebuild(args):
@@ -724,6 +751,24 @@ def cmd_inspect(args):
                 resource, action = "", str(f)
             print(f"    {_c('→', 'green')} {_c(resource, 'bold') + ': ' if resource else ''}{action}")
         print()
+
+    # Persist fixes as backlog items in the lab (actionable for the team/UI)
+    backlog_items = []
+    for iss in issues:
+        backlog_items.append({
+            "severity": iss.get("severity", "medium"),
+            "resource": iss.get("resource", ""),
+            "description": iss.get("detail", ""),
+            "source": f"inspector/{role} (loop {loop_id})",
+        })
+    if backlog_items:
+        try:
+            resp = client.request("POST", f"/labs-v2/{lab_id}/backlog",
+                                  json={"items": backlog_items})
+            print(f"  {_c('📋', 'cyan')} {resp.get('added', len(backlog_items))} itens adicionados ao backlog do lab")
+            print(_c(f"     Ver: headlabs labs backlog {lab_id}", "dim"))
+        except Exception:
+            pass  # best-effort — don't break the inspect flow
 
     # --fix: trigger executor fix cycle
     if getattr(args, "fix", False) and issues and status in ("fail", "partial"):

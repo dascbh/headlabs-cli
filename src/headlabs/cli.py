@@ -3108,6 +3108,11 @@ def main():
     _add_common(lrb, watch=True, wait=True, tenant=True)
     lrb.set_defaults(func=labsctl.cmd_labs, labs_cmd="rebuild")
 
+    lbl = labs_sub.add_parser("backlog", help="Show the lab's inspection backlog (issues/fixes to address)")
+    lbl.add_argument("lab", help="Lab id or name")
+    _add_common(lbl)
+    lbl.set_defaults(func=labsctl.cmd_labs, labs_cmd="backlog")
+
     # ── loops (build jobs) ────────────────────────────────────────────────────
     p_loops = sub.add_parser("loops", aliases=["loop"], help="Build loops (jobs) inside labs")
     loops_sub = p_loops.add_subparsers(dest="loops_cmd")
