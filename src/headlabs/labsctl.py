@@ -687,6 +687,11 @@ def cmd_inspect(args):
         "site_urls": site_urls,
         "function_endpoints": fn_endpoints,
     }}
+    # User context/question for the inspector
+    user_intent = getattr(args, "inspect_intent", None)
+    if user_intent:
+        body["input"]["user_context"] = user_intent
+        body["input"]["intent"] = f"{loop.get('intent', '')} | FOCO DO USUÁRIO: {user_intent}"
     resp = client.request("POST", "/agents/loop-inspector/invoke", json=body)
     exec_id = resp.get("exec_id")
     print(f"    Execução: {exec_id}")
