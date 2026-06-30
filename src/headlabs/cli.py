@@ -3113,6 +3113,16 @@ def main():
     _add_common(lbl)
     lbl.set_defaults(func=labsctl.cmd_labs, labs_cmd="backlog")
 
+    linsp = labs_sub.add_parser("inspect", help="Run QA/specialist inspection on the lab's product")
+    linsp.add_argument("lab", help="Lab id or name")
+    linsp.add_argument("--role", choices=["qa", "ux", "security", "architect", "performance", "devops", "data", "frontend", "backend"],
+                       default="qa", help="Inspector role (default: qa)")
+    linsp.add_argument("-i", "--intent", dest="inspect_intent", help="Additional context/question for the inspector")
+    linsp.add_argument("--loop", help="Specific loop id (default: latest build in the lab)")
+    linsp.add_argument("--fix", action="store_true", help="If issues found, trigger executor fix cycle")
+    _add_common(linsp, watch=True, wait=True, tenant=True)
+    linsp.set_defaults(func=labsctl.cmd_labs, labs_cmd="inspect")
+
     # ── loops (build jobs) ────────────────────────────────────────────────────
     p_loops = sub.add_parser("loops", aliases=["loop"], help="Build loops (jobs) inside labs")
     loops_sub = p_loops.add_subparsers(dest="loops_cmd")
@@ -3226,17 +3236,6 @@ def main():
     rb.add_argument("--gate-mode", dest="gate_mode", choices=["human", "judge", "judge+human"], help="Gate decision mode")
     _add_common(rb, watch=True, wait=True, tenant=True)
     rb.set_defaults(func=labsctl.cmd_research, research_cmd="build")
-
-    # ── inspect — invoke the inspector on a lab/loop ────────────────────────────
-    p_inspect = sub.add_parser("inspect", help="Run QA/specialist inspection on a lab's built product")
-    p_inspect.add_argument("--lab", required=True, help="Lab id to inspect")
-    p_inspect.add_argument("--role", choices=["qa", "ux", "security", "architect", "performance", "devops", "data", "frontend", "backend"],
-                           default="qa", help="Inspector role (default: qa)")
-    p_inspect.add_argument("-i", "--intent", dest="inspect_intent", help="Additional context/question for the inspector")
-    p_inspect.add_argument("--loop", help="Specific loop id (default: latest build in the lab)")
-    p_inspect.add_argument("--fix", action="store_true", help="If issues found, trigger executor fix cycle")
-    _add_common(p_inspect, watch=True, wait=True, tenant=True)
-    p_inspect.set_defaults(func=labsctl.cmd_inspect)
 
     # ── status (top-level shortcut) ───────────────────────────────────────────
     p_status = sub.add_parser("status", help="Active builds (no arg) or a build's detail")

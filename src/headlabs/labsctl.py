@@ -212,7 +212,7 @@ def cmd_labs(args):
         "create": _labs_create, "list": _labs_list, "ls": _labs_list,
         "get": _labs_get, "describe": _labs_describe, "repo": _labs_repo,
         "push": _labs_push, "archive": _labs_archive, "outputs": _labs_outputs,
-        "rebuild": _labs_rebuild, "backlog": _labs_backlog,
+        "rebuild": _labs_rebuild, "backlog": _labs_backlog, "inspect": _labs_inspect,
     }.get(sub, _labs_list)(args)
 
 
@@ -353,7 +353,7 @@ def _labs_backlog(args):
     except Exception:
         backlog = []
     if not backlog:
-        print(_c("  Backlog vazio — rode headlabs inspect --lab " + lab_id + " para gerar.", "dim"))
+        print(_c("  Backlog vazio — rode headlabs labs inspect " + lab_id + " para gerar.", "dim"))
         return
     open_items = [b for b in backlog if b.get("status") != "done"]
     done_items = [b for b in backlog if b.get("status") == "done"]
@@ -368,6 +368,13 @@ def _labs_backlog(args):
         print(f"\n  {_c('Concluídos', 'dim')} ({len(done_items)})")
         for bl in done_items[-3:]:
             print(f"    ✓ {bl.get('resource', '')} — {bl.get('description', '')[:80]}")
+
+
+def _labs_inspect(args):
+    """Run QA/specialist inspection on the lab's product (wrapper for cmd_inspect)."""
+    # Map the positional 'lab' to the --lab attribute expected by cmd_inspect
+    args.lab = getattr(args, "lab", None)
+    return cmd_inspect(args)
 
 
 def _labs_rebuild(args):
