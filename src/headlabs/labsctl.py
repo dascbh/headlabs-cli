@@ -403,7 +403,8 @@ def _labs_rebuild(args):
     loop_id = terminal[-1]["loop_id"]
     frm = getattr(args, "from_stage", None) or "executor"
     res = client.request("POST", f"/loops/{loop_id}/rebuild",
-                         json={"instruction": args.intent, "from_stage": frm})
+                         json={"instruction": args.intent, "from_stage": frm,
+                               "auto_approve": bool(getattr(args, "auto_approve", False))})
     new_id = res.get("loop_id", loop_id)
     print(_c(f"↻ rebuild (from {res.get('from_stage', frm)}): {new_id}", "green"))
     if getattr(args, "watch", False):
@@ -462,15 +463,19 @@ def _labs_create(args):
     lab = client.request("POST", "/labs-v2", json={"name": name, "description": intent, "stack": stack})
     lab_id = lab["lab_id"]
     gates = _gates_from_args(args)
+    dry = getattr(args, "dry_run", False)
     loop = client.request("POST", "/loops", json={"intent": intent, "lab_id": lab_id,
-                                                   **({"gates": gates} if gates is not None else {})})
+                                                   **({"gates": gates} if gates is not None else {}),
+                                                   **({"dry_run": True} if dry else {})})
     job_id = loop.get("loop_id")
     if getattr(args, "output", "table") == "json":
         print(json.dumps({"lab_id": lab_id, "job_id": job_id, "name": name}, indent=2))
     else:
         print(_c(f"✓ Lab criado: {lab_id}", "green") + f"  ({name})")
+        tag = "  [dry-run · valida contrato, não cria recursos]" if dry else ""
         print(_c(f"✓ Build iniciado: {job_id}", "green") +
-              (_c("  [auto-approve]", "dim") if gates and not any(gates.get(g) for g in _GATE_MAP.values()) else ""))
+              (_c(tag, "yellow") if dry else
+               (_c("  [auto-approve]", "dim") if gates and not any(gates.get(g) for g in _GATE_MAP.values()) else "")))
         print(_c(f"  Acompanhe:  headlabs loops watch {job_id}", "dim"))
         print(_c(f"  ou:         headlabs status {job_id}", "dim"))
     if getattr(args, "watch", False) or getattr(args, "wait", False):
@@ -830,7 +835,8 @@ def _loops_create(args):
     lab = _resolve_lab(client, args.lab) if getattr(args, "lab", None) else None
     gates = _gates_from_args(args)
     body = {"intent": args.intent, **({"lab_id": lab["lab_id"]} if lab else {}),
-            **({"gates": gates} if gates is not None else {})}
+            **({"gates": gates} if gates is not None else {}),
+            **({"dry_run": True} if getattr(args, "dry_run", False) else {})}
     loop = client.request("POST", "/loops", json=body)
     job_id = loop.get("loop_id")
     if getattr(args, "output", "table") == "json":
@@ -915,6 +921,23 @@ def _loops_status(args):
         print(f"\n{_c('Banca', 'bold')} ({ga.get('gate')}): {_color_status(ga.get('recommendation',''))} "
               f"(agg {ga.get('aggregate_score')})  ·  {verds}")
         print(_c(f"   detalhe: headlabs loops panel {loop.get('loop_id')}", "dim"))
+    # Interface contract (architecture's declared usage surface)
+    arch = loop.get("architecture") or {}
+    if isinstance(arch, dict) and "architecture" in arch:
+        arch = arch["architecture"]
+    if isinstance(arch, dict) and arch.get("interface"):
+        print(f"\n{_c('Contrato', 'bold')}: interface={_c(arch.get('interface'), 'cyan')}  "
+              f"entrypoint={arch.get('entrypoint', '-')}")
+        planned = []
+        for kind in ("storage", "functions", "tables", "agents", "mcps", "containers", "knowledge_bases"):
+            for r in (arch.get(kind) or []):
+                if isinstance(r, dict) and r.get("name"):
+                    planned.append(f"{kind[:-1] if kind.endswith('s') else kind}:{r['name']}")
+        if planned:
+            print(f"  {_c('Planejado', 'dim')}: {', '.join(planned[:12])}")
+        if loop.get("dry_run"):
+            print(_c("  ⓘ dry-run: contrato validado, nenhum recurso criado.", "yellow"))
+
     res = loop.get("resources_created") or []
     if res:
         print(f"\n{_c('Recursos:', 'bold')} {', '.join(str(r) for r in res[:8])}")

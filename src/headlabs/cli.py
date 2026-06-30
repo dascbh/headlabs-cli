@@ -3056,6 +3056,7 @@ def main():
     lc.add_argument("--name", help="Lab name (default: slug of intent)")
     lc.add_argument("--stack", help="Tech stack, comma-separated (e.g. python,fastapi,cdk)")
     lc.add_argument("--auto-approve", dest="auto_approve", action="store_true", help="Resolve all gates automatically")
+    lc.add_argument("--dry-run", dest="dry_run", action="store_true", help="Validate contract (orchestrator→architect→planner), create NO resources")
     lc.add_argument("--gate", help="Gates to KEEP: architecture,plan,destructive")
     lc.add_argument("--judges", choices=["off", "gate", "full"], help="Judge panel policy (default off)")
     lc.add_argument("--judge-model", dest="judge_model", choices=["fast", "standard"], help="Judge model (fast=Haiku, cheaper)")
@@ -3105,6 +3106,8 @@ def main():
     lrb.add_argument("-i", "--intent", required=True, help="Instruction: adjustment, feature, or fix (e.g. error message)")
     lrb.add_argument("--from", dest="from_stage", choices=["executor", "architect", "research"],
                      default="executor", help="Where to restart (optional; default: executor)")
+    lrb.add_argument("--auto-approve", dest="auto_approve", action="store_true",
+                     help="Disable gates for this rebuild (rapid prototyping)")
     _add_common(lrb, watch=True, wait=True, tenant=True)
     lrb.set_defaults(func=labsctl.cmd_labs, labs_cmd="rebuild")
 
@@ -3132,6 +3135,7 @@ def main():
     oc.add_argument("--lab", required=True, help="Lab id or name")
     oc.add_argument("-i", "--intent", required=True, help="Build objective")
     oc.add_argument("--auto-approve", dest="auto_approve", action="store_true")
+    oc.add_argument("--dry-run", dest="dry_run", action="store_true", help="Validate contract, create NO resources")
     oc.add_argument("--gate", help="Gates to KEEP: architecture,plan,destructive")
     oc.add_argument("--judges", choices=["off", "gate", "full"], help="Judge panel policy (default off)")
     oc.add_argument("--judge-model", dest="judge_model", choices=["fast", "standard"], help="Judge model (fast=Haiku)")
