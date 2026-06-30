@@ -219,6 +219,7 @@ def cmd_labs(args):
 def _labs_list(args):
     client = HeadLabsClient()
     labs = client.request("GET", "/labs-v2") or []
+    labs.sort(key=lambda l: l.get("updated_at") or l.get("created_at") or "", reverse=True)
     if getattr(args, "quiet", False):
         for l in labs:
             print(l.get("lab_id"))

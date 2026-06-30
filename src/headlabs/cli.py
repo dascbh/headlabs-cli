@@ -3257,6 +3257,10 @@ def main():
     _argv = sys.argv[1:]
     if len(_argv) >= 2 and _argv[0] in ("research", "rsch") and _argv[1] == "build":
         _argv = ["research-build"] + _argv[2:]
+    elif len(_argv) >= 2 and _argv[0] in ("research", "rsch") and _argv[1] in ("list", "ls"):
+        _argv = ["loops", "list", "--mode", "research"] + _argv[2:]
+    elif len(_argv) >= 2 and _argv[0] in ("research", "rsch") and _argv[1] == "status":
+        _argv = ["loops", "status"] + _argv[2:]
 
     args = parser.parse_args(_argv)
     if not args.command:
