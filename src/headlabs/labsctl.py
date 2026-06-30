@@ -970,7 +970,14 @@ def _loops_iterate(args):
 
 
 def _loops_watch(args):
-    return _follow(HeadLabsClient(), args.job_id, watch=True, args=args)
+    job_id = args.job_id
+    if job_id.startswith("lab_"):
+        _die(f"'{job_id}' é um lab, não um loop.\n"
+             f"  Use: headlabs loops list --lab {job_id}\n"
+             f"  Ou:  headlabs status", EXIT_USAGE)
+    if not job_id.startswith("loop_"):
+        _die(f"'{job_id}' não parece ser um loop_id válido.", EXIT_USAGE)
+    return _follow(HeadLabsClient(), job_id, watch=True, args=args)
 
 
 def _loops_review(args):
