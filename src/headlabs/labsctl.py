@@ -827,21 +827,19 @@ def _loops_create(args):
 
 def _loops_list(args):
     client = HeadLabsClient()
-    loops = client.request("GET", "/loops") or []
+    # Build server-side query params (backend paginates correctly)
+    params = []
     if getattr(args, "lab", None):
         lab = _resolve_lab(client, args.lab)
-        loops = [l for l in loops if l.get("lab_id") == lab["lab_id"]]
-    sfilter = getattr(args, "status", None)
-    if sfilter:
-        loops = [l for l in loops if display_status(l) == sfilter or l.get("status") == sfilter]
+        params.append(f"lab_id={lab['lab_id']}")
+    if getattr(args, "mode", None):
+        params.append(f"mode={args.mode}")
+    if getattr(args, "status", None):
+        params.append(f"status={args.status}")
+    qs = "?" + "&".join(params) if params else ""
+    loops = client.request("GET", f"/loops{qs}") or []
     if getattr(args, "active", False):
         loops = [l for l in loops if l.get("status") not in _TERMINAL]
-    mfilter = getattr(args, "mode", None)
-    if mfilter:
-        if mfilter == "build":
-            loops = [l for l in loops if (l.get("mode") or "build") == "build"]
-        else:
-            loops = [l for l in loops if l.get("mode") == mfilter]
     if getattr(args, "quiet", False):
         for l in loops:
             print(l.get("loop_id"))
