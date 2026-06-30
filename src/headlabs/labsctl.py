@@ -316,7 +316,17 @@ def _labs_outputs(args):
                 file_count += 1
                 continue
             entry = {"type": kind, "resource": nm, **_resource_endpoint(client, base, kind, nm)}
-            (sites if kind == "storage" else apis).append(entry)
+            if kind == "storage":
+                # Only treat as a published site if it likely has a frontend (index.html)
+                # Data buckets (raw-*, *-artifacts, *-exports, *-snapshots) are APIs, not sites
+                data_patterns = ("raw-", "artifact", "export", "snapshot", "backup", "cache", "log")
+                if any(p in nm.lower() for p in data_patterns):
+                    entry["type"] = "data"
+                    apis.append(entry)
+                else:
+                    sites.append(entry)
+            else:
+                apis.append(entry)
 
     if getattr(args, "output", "table") == "json":
         print(json.dumps({"lab_id": lid, "name": lab.get("name", ""),
