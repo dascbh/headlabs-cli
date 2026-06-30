@@ -845,6 +845,8 @@ def _loops_list(args):
         for l in loops:
             print(l.get("loop_id"))
         return
+    # Sort by age: most recent first
+    loops.sort(key=lambda l: l.get("started_at") or l.get("updated_at") or "", reverse=True)
     cols = [
         ("JOB_ID", lambda l: l.get("loop_id", "")),
         ("LAB", lambda l: _trunc(l.get("lab_id", ""), 16)),
