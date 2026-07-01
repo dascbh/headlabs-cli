@@ -2473,6 +2473,8 @@ def cmd_skills(args):
 
     if hasattr(args, 'subcmd') and args.subcmd == 'create':
         return cmd_skills_create(args)
+    if hasattr(args, 'subcmd') and args.subcmd == 'gotcha':
+        return cmd_skills_gotcha(args)
 
     client = HeadLabsClient()
     skills = client.list_skills()
@@ -2494,6 +2496,30 @@ def cmd_skills_create(args):
     client = HeadLabsClient()
     client.create_skill(skill_id=args.id, name=name, content=content)
     print(f"✓ Skill '{args.id}' created/updated ({len(content)} chars)")
+
+
+def cmd_skills_gotcha(args):
+    """Append a learned gotcha to an inspection skill (the learning loop).
+    Reads the skill, inserts the gotcha under the ## Gotchas section, saves it back."""
+    from headlabs.client import HeadLabsClient
+    client = HeadLabsClient()
+    skill = client.request("GET", f"/resources/skill/{args.skill_id}")
+    content = skill.get("content", "")
+    bullet = f"- {args.text.strip()}"
+    if "## Gotchas" in content:
+        # Insert right after the Gotchas heading line
+        lines = content.split("\n")
+        out, inserted = [], False
+        for ln in lines:
+            out.append(ln)
+            if not inserted and ln.strip().startswith("## Gotchas"):
+                out.append(bullet)
+                inserted = True
+        content = "\n".join(out)
+    else:
+        content = content.rstrip() + "\n\n## Gotchas (learned)\n" + bullet + "\n"
+    client.request("PATCH", f"/resources/skill/{args.skill_id}", json={"content": content})
+    print(f"✓ Gotcha adicionado a '{args.skill_id}'. O inspector vai checar isso em toda inspeção futura.")
 
 
 def cmd_tools(args):
@@ -2906,6 +2932,12 @@ def main():
     p_sc.add_argument("--name", help="Display name")
     p_sc.add_argument("--file", required=True, help="Markdown file with skill content")
     p_sc.set_defaults(func=cmd_skills, subcmd="create")
+
+    # skills gotcha — append a learned failure pattern to an inspection skill
+    p_sg = p_skills_sub.add_parser("gotcha", help="Add a learned gotcha to an inspection skill (learning loop)")
+    p_sg.add_argument("skill_id", help="Skill id (e.g. qa-inspection)")
+    p_sg.add_argument("-i", "--text", required=True, help="The gotcha to encode (a failure pattern to catch)")
+    p_sg.set_defaults(func=cmd_skills, subcmd="gotcha")
 
     # tools
     p_tools = sub.add_parser("tools", help="List available tools and MCPs")
