@@ -3133,11 +3133,9 @@ def main():
     _add_common(lo)
     lo.set_defaults(func=labsctl.cmd_labs, labs_cmd="outputs")
 
-    lrb = labs_sub.add_parser("rebuild", help="Rebuild the lab's product from an instruction (reuses research/architecture; agents decide scope)")
+    lrb = labs_sub.add_parser("rebuild", help="Destroy the lab's resources and rebuild fresh from scratch (reuses research)")
     lrb.add_argument("lab", help="Lab id or name")
-    lrb.add_argument("-i", "--intent", required=True, help="Instruction: adjustment, feature, or fix (e.g. error message)")
-    lrb.add_argument("--from", dest="from_stage", choices=["executor", "architect", "research"],
-                     default="executor", help="Where to restart (optional; default: executor)")
+    lrb.add_argument("-i", "--intent", required=True, help="Instruction refining the original intent")
     lrb.add_argument("--auto-approve", dest="auto_approve", action="store_true",
                      help="Disable gates for this rebuild (rapid prototyping)")
     _add_common(lrb, watch=True, wait=True, tenant=True)

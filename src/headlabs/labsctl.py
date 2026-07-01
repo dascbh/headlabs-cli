@@ -388,11 +388,11 @@ def _labs_inspect(args):
 
 
 def _labs_rebuild(args):
-    """Rebuild the lab's product from an instruction (reuses research/architecture/
-    resources as context). The agents interpret the instruction and decide scope."""
+    """Rebuild = destroy all resources this lab created and build fresh from scratch,
+    reusing the lab's research. The instruction refines the original intent."""
     client = HeadLabsClient()
     if not getattr(args, "intent", None):
-        _die("rebuild requer -i/--intent com a instrução (ajuste, feature ou correção)", EXIT_USAGE)
+        _die("rebuild requer -i/--intent com a instrução (o que mudar/recriar)", EXIT_USAGE)
     lab = _resolve_lab(client, args.lab)
     lid = lab["lab_id"]
     loops = client.request("GET", f"/labs-v2/{lid}/lineage") or []
@@ -401,12 +401,13 @@ def _labs_rebuild(args):
     if not terminal:
         _die("nenhum build concluído neste lab para rebuildar", EXIT_USAGE)
     loop_id = terminal[-1]["loop_id"]
-    frm = getattr(args, "from_stage", None) or "executor"
+    print(_c(f"⚠  rebuild vai DESTRUIR todos os recursos do lab {lid} e reconstruir do zero.", "yellow"))
     res = client.request("POST", f"/loops/{loop_id}/rebuild",
-                         json={"instruction": args.intent, "from_stage": frm,
+                         json={"instruction": args.intent,
                                "auto_approve": bool(getattr(args, "auto_approve", False))})
     new_id = res.get("loop_id", loop_id)
-    print(_c(f"↻ rebuild (from {res.get('from_stage', frm)}): {new_id}", "green"))
+    print(_c(f"↻ rebuild: {new_id}", "green") +
+          _c(f"  ({res.get('resources_destroyed', 0)} recursos destruídos)", "dim"))
     if getattr(args, "watch", False):
         return _follow(client, new_id, watch=True, args=args)
 
