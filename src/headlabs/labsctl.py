@@ -799,17 +799,17 @@ def cmd_inspect(args):
         except Exception:
             pass  # best-effort — don't break the inspect flow
 
-    # --fix: trigger executor fix cycle
+    # --fix: trigger a targeted remediation (planner surgical fix → re-exec → re-validate)
     if getattr(args, "fix", False) and issues and status in ("fail", "partial"):
-        feedback = "; ".join(f.get("action", "") for f in fixes[:5])[:1500]
-        print(_c("  Disparando ciclo de correção (executor)...", "cyan"))
+        print(_c("  Disparando ciclo de correção (remediação)...", "cyan"))
         try:
-            client.request("POST", f"/loops/{loop_id}/callback?tenant_id=platform",
-                           json={"phase": "inspector", "output": result, "status": "succeeded"},
-                           headers={"X-Internal-Token": ""})
-            print(f"  {_c('✓', 'green')} Fix cycle disparado. Acompanhe: headlabs loops watch {loop_id}")
+            res = client.request("POST", f"/loops/{loop_id}/remediate",
+                                 json={"feedback": result.get("summary", "") or "corrigir issues da inspeção",
+                                       "issues": issues, "fixes": fixes})
+            print(f"  {_c('✓', 'green')} Remediação disparada ({res.get('issues', len(issues))} issues). "
+                  f"Acompanhe: headlabs loops watch {loop_id}")
         except Exception as e:
-            print(f"  {_c('Não foi possível disparar fix cycle: ' + str(e), 'red')}")
+            print(f"  {_c('Não foi possível disparar remediação: ' + str(e), 'red')}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
