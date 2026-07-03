@@ -60,6 +60,67 @@ def test_gates_auto_approve_zeros_all():
     assert g["before_destructive"] is False
 
 
+# ── _labs_inspect: -w/--wait must actually block (regression) ───────────────
+#
+# Bug: the poll loop had a hardcoded `for _ in range(20)` (~240s) regardless of
+# the -w/--watch or --wait flags — they were accepted by the arg parser but
+# never read inside _labs_inspect, so any inspection slower than 4min silently
+# "timed out" even when the user explicitly asked to wait for it.
+
+def _inspect_router(exec_status_sequence):
+    """Router: /labs-v2 → one lab; /loops?lab_id=... → one build; /loops/{id} →
+    that build's detail; POST /agents/loop-inspector/invoke → an exec_id; GET
+    /executions/{id} → pops the next status off exec_status_sequence each call."""
+    state = {"i": 0}
+
+    def router(method, path, body):
+        if path == "/labs-v2":
+            return [{"lab_id": "lab_x", "name": "x"}]
+        if path.startswith("/loops?lab_id="):
+            return [{"loop_id": "loop_x", "status": "complete", "mode": "build",
+                     "updated_at": "2026-01-01T00:00:00Z"}]
+        if path == "/loops/loop_x":
+            return {"loop_id": "loop_x", "intent": "test", "resources_created": [],
+                    "architecture": {}}
+        if path == "/agents/loop-inspector/invoke":
+            return {"exec_id": "exec_x"}
+        if path.startswith("/executions/exec_x"):
+            idx = min(state["i"], len(exec_status_sequence) - 1)
+            state["i"] += 1
+            status = exec_status_sequence[idx]
+            if status == "running":
+                return {"status": "running"}
+            return {"status": status, "output": '{"status": "pass", "issues": []}'}
+        return {}
+    return router
+
+
+def test_inspect_without_wait_gives_up_after_fixed_attempts(monkeypatch, fake):
+    # 30 "running" responses > the old fixed 20-attempt cap — without -w/--wait,
+    # the CLI must still stop around the same ~20-attempt default (unchanged
+    # behavior for the default/non-blocking case).
+    fake.router = _inspect_router(["running"] * 30)
+    sleeps = []
+    monkeypatch.setattr(L.time, "sleep", lambda s: sleeps.append(s))
+    L._labs_inspect(mkargs(lab="lab_x", role="qa", watch=False, wait=False))
+    assert len(sleeps) <= 21  # gave up around the old ~20-attempt ceiling
+
+
+def test_inspect_with_wait_blocks_past_old_ceiling(monkeypatch, fake):
+    # Same 30 "running" responses, but with --wait the CLI must keep polling
+    # PAST the old 20-attempt ceiling and pick up the eventual terminal status —
+    # this is the exact bug: -w/--wait must actually change behavior.
+    fake.router = _inspect_router(["running"] * 25 + ["succeeded"])
+    sleeps = []
+    monkeypatch.setattr(L.time, "sleep", lambda s: sleeps.append(s))
+    printed = []
+    monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+    L._labs_inspect(mkargs(lab="lab_x", role="qa", watch=False, wait=True))
+    assert len(sleeps) > 20, "with --wait, polling must continue past the old fixed ceiling"
+    assert any("Inspeção concluída" in p for p in printed), \
+        "with --wait the CLI must have picked up the eventual terminal result, not given up early"
+
+
 def test_gates_select_subset():
     g = L._gates_from_args(mkargs(gate="architecture,plan"))
     assert g == {"after_architect": True, "after_planner": True, "before_destructive": False}

@@ -721,31 +721,42 @@ def cmd_inspect(args):
     print(f"    Execução: {exec_id}")
     print(_c("    Aguardando inspeção...", "dim"))
 
-    # Poll for result
-    import time as _time
-    result = None
-    for _ in range(20):
-        _time.sleep(12)
+    # Poll for result. -w/--watch and --wait both mean "block until terminal" —
+    # previously this loop ALWAYS gave up after a fixed 240s regardless of these
+    # flags (they were accepted by the arg parser but never read here), so any
+    # inspection slower than 4min (labs with 20+ resources routinely are) silently
+    # timed out even when the user explicitly asked to wait.
+    follow = bool(getattr(args, "watch", False) or getattr(args, "wait", False))
+    result, attempt = None, 0
+    while True:
+        time.sleep(12)
+        attempt += 1
         try:
             ex = client.request("GET", f"/executions/{exec_id}?tenant_id=platform")
-            if ex.get("status") in ("succeeded", "partial", "failed"):
-                out = ex.get("output", "")
-                if isinstance(out, str) and "_s3" in out:
-                    import boto3
-                    ref = json.loads(out)["_s3"][5:]
-                    bkt, _, key = ref.partition("/")
-                    result = json.loads(boto3.client("s3", region_name="us-east-1")
-                                       .get_object(Bucket=bkt, Key=key)["Body"].read())
-                elif isinstance(out, str):
-                    try:
-                        result = json.loads(out)
-                    except Exception:
-                        result = {"summary": out}
-                elif isinstance(out, dict):
-                    result = out
-                break
         except Exception:
+            if not follow and attempt >= 20:
+                break
             continue
+        if ex.get("status") in ("succeeded", "partial", "failed"):
+            out = ex.get("output", "")
+            if isinstance(out, str) and "_s3" in out:
+                import boto3
+                ref = json.loads(out)["_s3"][5:]
+                bkt, _, key = ref.partition("/")
+                result = json.loads(boto3.client("s3", region_name="us-east-1")
+                                   .get_object(Bucket=bkt, Key=key)["Body"].read())
+            elif isinstance(out, str):
+                try:
+                    result = json.loads(out)
+                except Exception:
+                    result = {"summary": out}
+            elif isinstance(out, dict):
+                result = out
+            break
+        if not follow and attempt >= 20:
+            break  # default (no -w/--wait): give up after ~4min, as before
+        if follow and attempt % 5 == 0:
+            print(_c(f"    ⏳ Ainda inspecionando… ({attempt * 12}s, status={ex.get('status', '?')})", "dim"))
 
     if not result:
         print(_c("    ⏳ Inspeção ainda rodando. Verifique depois.", "yellow"))
@@ -851,17 +862,20 @@ def _loops_create(args):
 
 def _loops_list(args):
     client = HeadLabsClient()
-    # Build server-side query params (backend paginates correctly)
+    # Server-side params for lab/status let the backend paginate efficiently.
+    # `mode` is filtered client-side only: it has a default ("build" when the
+    # field is absent) that we own, so we never depend on the backend honoring
+    # it — correctness stays with the CLI.
     params = []
     if getattr(args, "lab", None):
         lab = _resolve_lab(client, args.lab)
         params.append(f"lab_id={lab['lab_id']}")
-    if getattr(args, "mode", None):
-        params.append(f"mode={args.mode}")
     if getattr(args, "status", None):
         params.append(f"status={args.status}")
     qs = "?" + "&".join(params) if params else ""
     loops = client.request("GET", f"/loops{qs}") or []
+    if getattr(args, "mode", None):
+        loops = [l for l in loops if (l.get("mode") or "build") == args.mode]
     if getattr(args, "active", False):
         loops = [l for l in loops if l.get("status") not in _TERMINAL]
     if getattr(args, "quiet", False):
