@@ -121,6 +121,83 @@ def test_inspect_with_wait_blocks_past_old_ceiling(monkeypatch, fake):
         "with --wait the CLI must have picked up the eventual terminal result, not given up early"
 
 
+# ── _labs_fix: remediate straight from the backlog, no re-inspection ────────
+
+def _fix_router(backlog, remediate_response=None, loops_response=None):
+    calls = {"remediate_body": None}
+
+    def router(method, path, body):
+        if path == "/labs-v2":
+            return [{"lab_id": "lab_x", "name": "x"}]
+        if path == "/labs-v2/lab_x/backlog":
+            return backlog
+        if path.startswith("/loops?lab_id="):
+            return loops_response or [{"loop_id": "loop_fallback", "status": "complete",
+                                       "updated_at": "2026-01-01T00:00:00Z"}]
+        if method == "POST" and path == "/loops/loop_x/remediate":
+            calls["remediate_body"] = body
+            return remediate_response or {"issues": len((body or {}).get("issues", []))}
+        if method == "POST" and path == "/loops/loop_fallback/remediate":
+            calls["remediate_body"] = body
+            return remediate_response or {"issues": len((body or {}).get("issues", []))}
+        return {}
+    return router, calls
+
+
+def test_fix_empty_backlog_does_not_call_remediate(fake):
+    fake.router, calls = _fix_router(backlog=[])
+    L._labs_fix(mkargs(lab="lab_x"))
+    assert calls["remediate_body"] is None
+
+
+def test_fix_sends_open_items_from_their_loop_with_fix_text(fake):
+    backlog = [
+        {"id": "bl_1", "resource": "function:discover-co", "severity": "critical",
+         "description": "TypeError on join", "fix": "flatten the list first",
+         "loop_id": "loop_x", "status": "open"},
+        {"id": "bl_2", "resource": "table:companies", "severity": "medium",
+         "description": "zeroed fields", "loop_id": "loop_x", "status": "open"},
+        {"id": "bl_3", "resource": "old:thing", "severity": "low",
+         "description": "stale item", "loop_id": "loop_x", "status": "done"},  # excluded: done
+    ]
+    fake.router, calls = _fix_router(backlog=backlog)
+    L._labs_fix(mkargs(lab="lab_x"))
+    body = calls["remediate_body"]
+    assert body is not None
+    assert len(body["issues"]) == 2  # only the 2 open items, not the done one
+    resources = {i["resource"] for i in body["issues"]}
+    assert resources == {"function:discover-co", "table:companies"}
+    # The fix text for discover-co must be forwarded so the planner has a
+    # concrete action, not just the problem description.
+    fixes_by_resource = {f["resource"]: f["action"] for f in body["fixes"]}
+    assert fixes_by_resource["function:discover-co"] == "flatten the list first"
+    assert "table:companies" not in fixes_by_resource  # no fix text was stored for it
+
+
+def test_fix_falls_back_to_latest_build_when_backlog_has_no_loop_id(fake):
+    # Older backlog items (pre-fix) have no loop_id — must not crash, must
+    # resolve the lab's latest completed build instead.
+    backlog = [{"id": "bl_1", "resource": "table:x", "severity": "medium",
+               "description": "issue", "status": "open"}]  # no loop_id
+    fake.router, calls = _fix_router(
+        backlog=backlog,
+        loops_response=[{"loop_id": "loop_fallback", "status": "complete",
+                         "updated_at": "2026-01-01T00:00:00Z"}])
+    L._labs_fix(mkargs(lab="lab_x"))
+    assert calls["remediate_body"] is not None
+    assert len(calls["remediate_body"]["issues"]) == 1
+
+
+def test_fix_explicit_loop_overrides_backlog_grouping(fake):
+    backlog = [{"id": "bl_1", "resource": "table:x", "severity": "medium",
+               "description": "issue", "loop_id": "loop_other", "status": "open"}]
+    fake.router, calls = _fix_router(backlog=backlog)
+    L._labs_fix(mkargs(lab="lab_x", loop="loop_x"))
+    # loop_other items are for a different build than the one explicitly
+    # requested — must be excluded (skipped), not force-applied to loop_x.
+    assert calls["remediate_body"] is None or len(calls["remediate_body"].get("issues", [])) == 0
+
+
 def test_gates_select_subset():
     g = L._gates_from_args(mkargs(gate="architecture,plan"))
     assert g == {"after_architect": True, "after_planner": True, "before_destructive": False}

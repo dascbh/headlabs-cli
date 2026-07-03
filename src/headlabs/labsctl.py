@@ -212,7 +212,7 @@ def cmd_labs(args):
         "create": _labs_create, "list": _labs_list, "ls": _labs_list,
         "get": _labs_get, "describe": _labs_describe, "repo": _labs_repo,
         "push": _labs_push, "archive": _labs_archive, "outputs": _labs_outputs,
-        "rebuild": _labs_rebuild, "backlog": _labs_backlog, "inspect": _labs_inspect,
+        "rebuild": _labs_rebuild, "backlog": _labs_backlog, "fix": _labs_fix, "inspect": _labs_inspect,
     }.get(sub, _labs_list)(args)
 
 
@@ -378,6 +378,73 @@ def _labs_backlog(args):
         print(f"\n  {_c('Concluídos', 'dim')} ({len(done_items)})")
         for bl in done_items[-3:]:
             print(f"    ✓ {bl.get('resource', '')} — {bl.get('description', '')[:80]}")
+
+
+def _labs_fix(args):
+    """Trigger a targeted remediation from the lab's OPEN backlog, without
+    re-running the inspection. Groups open items by the loop_id they came from
+    (a backlog can span several inspect runs / builds) and remediates the most
+    recent one — the loop the current build's resources actually live in."""
+    client = HeadLabsClient()
+    lab = _resolve_lab(client, args.lab)
+    lab_id = lab["lab_id"]
+    try:
+        backlog = client.request("GET", f"/labs-v2/{lab_id}/backlog")
+    except Exception:
+        backlog = []
+    open_items = [b for b in (backlog or []) if b.get("status") != "done"]
+    if not open_items:
+        print(_c("  Backlog vazio — nada para corrigir. Rode: headlabs labs inspect "
+                 + lab_id, "dim"))
+        return
+
+    # Backlog items carry loop_id since the inspect fix (older items may not —
+    # fall back to the lab's latest build so those aren't silently dropped).
+    loop_id = getattr(args, "loop", None)
+    if not loop_id:
+        with_loop = [b.get("loop_id") for b in open_items if b.get("loop_id")]
+        if with_loop:
+            loop_id = max(set(with_loop), key=with_loop.count)  # most common = current build
+        else:
+            try:
+                lab_loops = client.request("GET", f"/loops?lab_id={lab_id}")
+            except Exception:
+                lab_loops = []
+            builds = [l for l in lab_loops if l.get("status") in ("complete", "failed")]
+            if not builds:
+                _die(f"Nenhum loop concluído encontrado no lab {lab_id}. Use --loop <id>.", EXIT_USAGE)
+            builds.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+            loop_id = builds[0]["loop_id"]
+
+    targeted = [b for b in open_items if not b.get("loop_id") or b.get("loop_id") == loop_id]
+    skipped = len(open_items) - len(targeted)
+
+    issues = [{"resource": b.get("resource", ""), "severity": b.get("severity", "medium"),
+              "detail": b.get("description", "")} for b in targeted]
+    fixes = [{"resource": b.get("resource", ""), "action": b["fix"]}
+             for b in targeted if b.get("fix")]
+
+    print(f"  {_c('⚙', 'cyan')} Corrigindo {len(targeted)} item(ns) do backlog de {_c(lab_id, 'bold')} "
+          f"(loop {loop_id})")
+    if skipped:
+        print(_c(f"    ({skipped} item(ns) de outro build ignorados — use --loop para incluí-los)", "dim"))
+    for iss in issues:
+        sev = iss.get("severity", "?")
+        scolor = "red" if sev in ("critical", "high") else ("yellow" if sev == "medium" else "dim")
+        print(f"    {_c(f'[{sev}]', scolor)} {iss.get('resource', '?')}")
+
+    try:
+        res = client.request("POST", f"/loops/{loop_id}/remediate",
+                             json={"feedback": getattr(args, "intent", None)
+                                   or "corrigir issues do backlog", "issues": issues, "fixes": fixes})
+        print(f"  {_c('✓', 'green')} Remediação disparada ({res.get('issues', len(issues))} issues). "
+              f"Acompanhe: headlabs loops watch {loop_id}")
+    except Exception as e:
+        _die(f"Não foi possível disparar remediação: {e}", EXIT_FAILED)
+        return
+
+    if getattr(args, "watch", False) or getattr(args, "wait", False):
+        return _follow(client, loop_id, watch=getattr(args, "watch", False), args=args)
 
 
 def _labs_inspect(args):
@@ -792,15 +859,30 @@ def cmd_inspect(args):
             print(f"    {_c('→', 'green')} {_c(resource, 'bold') + ': ' if resource else ''}{action}")
         print()
 
-    # Persist fixes as backlog items in the lab (actionable for the team/UI)
+    # Persist fixes as backlog items in the lab (actionable for the team/UI).
+    # Pair each issue with its suggested fix by resource so `headlabs labs fix`
+    # can later trigger a remediation straight from the backlog, without
+    # re-running the inspection (the fix text and loop_id ride along).
+    fix_by_resource = {}
+    for f in fixes:
+        if isinstance(f, dict):
+            res = f.get("resource") or f.get("priority") or ""
+            action = f.get("action") or f.get("fix") or f.get("detail") or ""
+            if res and action:
+                fix_by_resource[res] = action
     backlog_items = []
     for iss in issues:
-        backlog_items.append({
+        entry = {
             "severity": iss.get("severity", "medium"),
             "resource": iss.get("resource", ""),
             "description": iss.get("detail", ""),
             "source": f"inspector/{role} (loop {loop_id})",
-        })
+            "loop_id": loop_id,
+        }
+        fix_text = fix_by_resource.get(iss.get("resource", ""))
+        if fix_text:
+            entry["fix"] = fix_text
+        backlog_items.append(entry)
     if backlog_items:
         try:
             resp = client.request("POST", f"/labs-v2/{lab_id}/backlog",

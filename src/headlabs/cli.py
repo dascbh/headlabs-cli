@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -323,8 +324,10 @@ def cmd_agents(args):
         agentnames._write_cache([a.get("id") for a in (remote or []) if a.get("id")])
     except Exception:
         pass
-    # The architect is an internal engine behind `agents create`, not a user-facing agent.
-    remote = [a for a in (remote or []) if a.get("id") != _ARCHITECT_AGENT_ID]
+    # The architects are internal engines behind `agents create`/`mcps create`,
+    # not user-facing agents.
+    _internal_architects = {_ARCHITECT_AGENT_ID, _MCP_ARCHITECT_AGENT_ID}
+    remote = [a for a in (remote or []) if a.get("id") not in _internal_architects]
 
     if remote:
         print(f"{'ID':<28} {'Status':<10} {'Type':<12} Description")
@@ -348,6 +351,13 @@ def cmd_agents_create(args):
     """
     # Agentic creation (NLP → research → create)
     intent = getattr(args, "intent", None)
+    spec_path = getattr(args, "spec", None)
+    if spec_path:
+        # Spec-driven: the file is the authoritative intent. The architect
+        # interprets it and we create straight from the draft (non-interactive).
+        args._inline_intent = _read_spec(spec_path)
+        args._auto_accept = True
+        return cmd_agent_create_interactive(args)
     if intent:
         # Inline: skip the interactive prompt, go straight
         args._inline_intent = intent
@@ -388,6 +398,298 @@ def cmd_agents_create(args):
 
 # Backend agent that powers the agentic creation wizard (not a user-facing agent).
 _ARCHITECT_AGENT_ID = "agent-architect"
+
+# Dedicated backend agent for MCP authoring (also internal, not user-facing).
+# Unlike the generic agent-architect (instructed ad-hoc via the user prompt on
+# every call), this agent's PERSONA embeds the authoring contract, so it does
+# not need to be re-taught the rules each turn — shorter prompts, less
+# narration, more consistent output. The persona text itself is assembled
+# right after _MCP_AUTHORING_KNOWLEDGE is defined (see below).
+_MCP_ARCHITECT_AGENT_ID = "mcp-architect"
+
+
+def _read_spec(path: str) -> str:
+    """Read a specification file (agent/MCP) and return its text.
+
+    Exits with a friendly message if the path is missing/unreadable/empty.
+    """
+    p = Path(os.path.expanduser(path))
+    if not p.is_file():
+        print(f"\033[31merro: spec não encontrada: {path}\033[0m", file=sys.stderr)
+        sys.exit(2)
+    try:
+        text = p.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"\033[31merro: não foi possível ler a spec: {exc}\033[0m", file=sys.stderr)
+        sys.exit(2)
+    if not text:
+        print(f"\033[31merro: spec vazia: {path}\033[0m", file=sys.stderr)
+        sys.exit(2)
+    return text
+
+
+def _slugify_id(raw: str) -> str:
+    """Normalize an identifier to a safe kebab-case slug.
+
+    Lowercases, replaces any run of non-alphanumeric chars with a single
+    hyphen, and trims leading/trailing hyphens. This neutralizes path
+    traversal (``../``) and shell/ECR-tag-unsafe characters, since the id is
+    used both as a filesystem path (``./mcps/<id>/``) and a docker image tag.
+    Returns ``""`` if nothing usable remains.
+    """
+    import re
+    return re.sub(r"[^a-z0-9]+", "-", (raw or "").lower()).strip("-")
+
+
+def _repair_json_escapes(s: str) -> str:
+    """Double any backslash that isn't part of a valid JSON escape sequence.
+
+    LLMs embedding text/code in a JSON string frequently emit invalid escapes
+    (``\\p``, ``\\d``, a lone ``\\`` before a Windows path, etc.), which makes
+    the whole object unparseable. Valid JSON escapes are ``\\" \\\\ \\/ \\b \\f
+    \\n \\r \\t \\uXXXX`` — anything else gets its backslash doubled so it
+    becomes a literal backslash instead of a fatal parse error.
+    """
+    import re
+    return re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', s)
+
+
+def _parse_json_draft(answer: str):
+    """Extract the first JSON object from an LLM answer.
+
+    Tolerates surrounding prose and ```json fences. Returns a dict, or None if
+    no valid JSON object can be parsed.
+
+    Uses ``json.JSONDecoder.raw_decode`` (string/escape aware) rather than
+    counting ``{``/``}``: naive brace-matching miscounts braces that live
+    *inside* string values. As a safety net it retries once with invalid
+    backslash escapes repaired (see :func:`_repair_json_escapes`).
+    """
+    import json as _json, re
+    if not answer:
+        return None
+    # Strip a leading ```/```json fence and any trailing fence.
+    cleaned = re.sub(r'^\s*```[^\n]*\n?', '', answer.strip())
+    cleaned = re.sub(r'\n?```\s*$', '', cleaned)
+    decoder = _json.JSONDecoder()
+    # Try the raw text first, then a repaired copy. For each, try every '{' as
+    # a start position: the first that yields a dict wins (prose or a stray '{'
+    # before the object is skipped over).
+    for candidate in (cleaned, _repair_json_escapes(cleaned)):
+        start = candidate.find("{")
+        while start != -1:
+            try:
+                obj, _ = decoder.raw_decode(candidate, start)
+                if isinstance(obj, dict):
+                    return obj
+            except _json.JSONDecodeError:
+                pass
+            start = candidate.find("{", start + 1)
+    return None
+
+
+def _extract_fenced_block(answer: str, langs) -> str | None:
+    """Return the verbatim contents of the first ```<lang> fenced code block.
+
+    ``langs`` is a tuple of accepted language tags (e.g. ``("python", "py")``).
+    Code carried in a fenced block needs no escaping, so this is the robust,
+    size-independent channel for large payloads like ``server.py`` — unlike
+    inlining code as a JSON string, which breaks on the first bad escape.
+    Returns None if no such block is present.
+    """
+    import re
+    if not answer:
+        return None
+    for lang in langs:
+        # Prefer a properly closed block: ```lang\n ... \n```
+        m = re.search(rf'```{lang}[^\n]*\n(.*?)\n```', answer,
+                      re.DOTALL | re.IGNORECASE)
+        if m:
+            return m.group(1)
+        # Fallback: an unclosed block (model forgot the closing fence).
+        m = re.search(rf'```{lang}[^\n]*\n(.*)', answer,
+                      re.DOTALL | re.IGNORECASE)
+        if m:
+            return m.group(1).rstrip("` \n")
+    return None
+
+
+def _print_bad_draft(answer: str) -> None:
+    """Report an unparseable architect draft. The full raw output is always
+    persisted to disk for debugging (never lost), but the terminal only shows
+    a short summary + the file path — dumping tens of thousands of raw JSON
+    chars on every failure is noise, not signal, for the end user."""
+    answer = answer or ""
+    drafts_dir = CONFIG_DIR / "drafts"
+    drafts_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = drafts_dir / f"bad-draft-{ts}.txt"
+    try:
+        path.write_text(answer, encoding="utf-8")
+        saved_msg = str(path)
+    except OSError as exc:
+        saved_msg = f"(falha ao salvar: {exc})"
+    preview = answer.strip().splitlines()[0][:160] if answer.strip() else ""
+    print(f"  \033[31m✗ Draft inválido ({len(answer)} chars). Não foi possível "
+          f"extrair JSON.\033[0m")
+    if preview:
+        print(f"  \033[2m{preview}{'…' if len(answer.strip()) > 160 else ''}\033[0m")
+    print(f"  \033[2mOutput bruto completo salvo em: {saved_msg}\033[0m")
+
+
+def _confirm(question: str, default: bool = False) -> bool:
+    """Terminal yes/no gate. Fail-safe: on non-interactive stdin (EOF) or an
+    empty answer, return ``default`` (which callers set to False so nothing is
+    created without an explicit 'yes'). Accepts en/pt affirmatives."""
+    suffix = " [Y/n] " if default else " [y/N] "
+    try:
+        ans = input(question + suffix).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+    if not ans:
+        return default
+    return ans in ("y", "yes", "s", "sim")
+
+
+def _review_agent_draft(agent_type, agent_id, name, description,
+                        tools_list, mcps_list, workers_list, prompt) -> None:
+    """Print the FULL proposed agent design (including the complete system
+    prompt) for the post-analysis approval gate."""
+    import textwrap
+    print("\n  \033[1mAnálise concluída — revise o agente proposto:\033[0m\n")
+    print(f"    Tipo:        {agent_type}")
+    print(f"    ID:          {agent_id}")
+    print(f"    Nome:        {name}")
+    print(f"    Descrição:   {description}")
+    print(f"    Tools:       {', '.join(tools_list) or '—'}")
+    print(f"    MCPs:        {', '.join(mcps_list) or '—'}")
+    if workers_list:
+        print(f"    Workers:     {', '.join(workers_list)}")
+    print(f"\n    \033[1mSystem prompt ({len(prompt)} chars):\033[0m")
+    print(textwrap.indent(prompt, "    "))
+
+
+def _review_mcp_draft(mcp_id, design, server_code, contract_warnings=None, behavior=None) -> None:
+    """Print the FULL proposed MCP design (metadata, deps, auth, config surface,
+    tools) plus the complete server.py, the contract lint, and the behavioral
+    verification result, for the post-analysis approval gate."""
+    import textwrap
+    tools = design.get("tools", [])
+    config = design.get("config", [])
+    auth = (design.get("auth") or {}).get("type", "none")
+    print("\n  \033[1mAnálise concluída — revise o MCP proposto:\033[0m\n")
+    print(f"    ID:           {mcp_id}")
+    print(f"    Nome:         {design.get('name', '')}")
+    print(f"    Descrição:    {design.get('description', '')}")
+    print(f"    Auth:         {auth}")
+    print(f"    Dependencies: {', '.join(design.get('dependencies') or []) or '—'}")
+    if config:
+        print(f"    Config (env):")
+        for c in config:
+            flags = []
+            if c.get("required"):
+                flags.append("required")
+            if c.get("secret"):
+                flags.append("secret")
+            tag = f" ({', '.join(flags)})" if flags else ""
+            print(f"      · {c.get('env','')}{tag}  {c.get('description','')}".rstrip())
+    print(f"    Tools ({len(tools)}):")
+    for t in tools:
+        params = ", ".join(p.get("name", "") for p in t.get("params", []))
+        effect = "write" if t.get("side_effects") else "read-only"
+        idem = "idempotente" if t.get("idempotent") else "NÃO idempotente"
+        print(f"      · {t.get('name','')}({params})  [{effect}, {idem}]")
+        if t.get("description"):
+            print(f"          {t['description']}")
+
+    if contract_warnings:
+        print(f"\n    \033[33mLint de contrato ({len(contract_warnings)} avisos):\033[0m")
+        for w in contract_warnings:
+            print(f"      ⚠ {w}")
+    else:
+        print(f"\n    \033[32mLint de contrato: sem avisos.\033[0m")
+
+    if behavior is not None:
+        if behavior.get("ok"):
+            print(f"    \033[32mVerificação comportamental: OK — protocolo MCP respondeu, "
+                  f"{len(behavior.get('tools', []))} tools descobertas.\033[0m")
+            for w in behavior.get("warnings", []):
+                print(f"      ⚠ {w}")
+        elif behavior.get("skipped"):
+            print(f"    \033[33mVerificação comportamental: não executada "
+                  f"({behavior.get('error','?')[:120]}).\033[0m")
+        else:
+            print(f"    \033[31mVerificação comportamental: FALHOU — "
+                  f"{behavior.get('error','?')[:200]}\033[0m")
+
+    lines = server_code.count("\n") + 1
+    print(f"\n    \033[1mserver.py ({lines} linhas):\033[0m")
+    print("    " + "─" * 64)
+    print(textwrap.indent(server_code.rstrip("\n"), "    "))
+    print("    " + "─" * 64)
+
+
+def _unwrap_nested_envelope(text: str) -> str:
+    """Undo a real-world model quirk: instead of returning the design/code
+    fenced blocks directly, the model sometimes emits its own reply already
+    serialized as ``{"message": "...", "answer": "...", "tools_used": []}``
+    (the SAME envelope shape ``agent_base.py`` wraps chat replies in) — as a
+    single-line JSON string, escaped ``\\n`` and all. This is model output
+    variance, not a transport bug: ``str(result)`` on the agent SDK's return
+    value can legitimately stringify to that shape.
+
+    Detects the pattern by trying to parse ``text`` as a JSON object with a
+    ``message``/``answer`` string field and, if found, returns that field's
+    (now real, unescaped) content instead of the outer wrapper. Returns
+    ``text`` unchanged if it doesn't look like this envelope, so this is safe
+    to call unconditionally before any fenced-block extraction."""
+    import json as _json
+    stripped = text.strip()
+    if not stripped.startswith("{"):
+        return text
+    try:
+        obj = _json.loads(stripped)
+    except _json.JSONDecodeError:
+        try:
+            obj = _json.loads(_repair_json_escapes(stripped))
+        except _json.JSONDecodeError:
+            return text
+    if not isinstance(obj, dict):
+        return text
+    inner = obj.get("answer") or obj.get("message") or obj.get("response")
+    if isinstance(inner, str) and inner.strip():
+        return inner
+    return text
+
+
+def _run_architect(client, draft_prompt: str, tenant_id, reporter,
+                   agent_id: str = _ARCHITECT_AGENT_ID) -> str:
+    """Stream one turn against the given architect agent and return the final
+    message (defaults to the generic agent-architect for backward
+    compatibility with the agent-creation wizard).
+
+    Progress events are forwarded to ``reporter``. Raises on transport failure
+    (the caller decides how to surface it).
+    """
+    import uuid
+    session_id = str(uuid.uuid4())
+    answer = ""
+    try:
+        for event in client.chat_stream(agent_id, session_id, draft_prompt,
+                                         context={}, history=[], tenant_id=tenant_id):
+            etype = event.get("type")
+            if etype == "progress":
+                reporter.event(event["event"])
+            elif etype == "done":
+                answer = event.get("message", "")
+            elif etype == "error":
+                raise RuntimeError(event.get("error") or "architect failed")
+        reporter.finish("succeeded")
+    except Exception:
+        reporter.finish("failed")
+        raise
+    return _unwrap_nested_envelope(answer)
 
 
 def cmd_agent_create_interactive(args):
@@ -463,44 +765,44 @@ def cmd_agent_create_interactive(args):
         "- Prefer the minimal tool set that accomplishes the goal.\n"
     )
 
-    session_id = str(uuid.uuid4())
     answer = ""
     try:
-        for event in client.chat_stream("agent-architect", session_id, draft_prompt,
-                                        context={}, history=[], tenant_id=tenant_id):
-            if event.get("type") == "progress":
-                reporter.event(event["event"])
-            elif event.get("type") == "done":
-                answer = event.get("message", "")
-        reporter.finish("succeeded")
+        answer = _run_architect(client, draft_prompt, tenant_id, reporter)
     except Exception as exc:
-        reporter.finish("failed")
         print(f"  \033[31m✗ {exc}\033[0m")
         return
 
     # Parse draft
-    draft = None
-    try:
-        cleaned = re.sub(r'^```\w*\n?', '', answer.strip())
-        cleaned = re.sub(r'\n?```$', '', cleaned)
-        brace = cleaned.find("{")
-        if brace >= 0:
-            depth = 0
-            for i in range(brace, len(cleaned)):
-                if cleaned[i] == "{": depth += 1
-                elif cleaned[i] == "}":
-                    depth -= 1
-                    if depth == 0:
-                        draft = _json.loads(cleaned[brace:i+1])
-                        break
-    except Exception:
-        pass
+    draft = _parse_json_draft(answer)
 
     if not draft:
-        print(f"  \033[31m✗ Draft inválido. Raw:\033[0m\n  {answer[:300]}")
+        _print_bad_draft(answer)
         return
 
     # ── STEP 3: Review ────────────────────────────────────────────────────────
+    # With --spec, the spec file is authoritative: we present the FULL proposed
+    # design and gate creation behind a single terminal yes/no (no field-by-
+    # field editing), then create only on explicit approval.
+    auto_accept = getattr(args, "_auto_accept", False)
+    if auto_accept:
+        agent_type = draft.get("type", "single")
+        agent_id = _slugify_id(draft.get("id", ""))
+        name = draft.get("name", "")
+        description = draft.get("description", "")
+        tools_list = [t.strip() for t in draft.get("tools_native", []) if str(t).strip()]
+        mcps_list = [m.strip() for m in draft.get("mcps", []) if str(m).strip()]
+        workers_list = [w.strip() for w in draft.get("workers", []) if str(w).strip()] \
+            if agent_type == "supervisor" else []
+        prompt = draft.get("prompt", "")
+        _review_agent_draft(agent_type, agent_id, name, description,
+                            tools_list, mcps_list, workers_list, prompt)
+        if not _confirm("\n  Autorizar criação deste agente na HeadLabs?"):
+            print("  \033[33mCriação cancelada.\033[0m")
+            return
+        return _agent_create_finalize(
+            client, agent_type, agent_id, name, description,
+            tools_list, mcps_list, workers_list, prompt)
+
     print(f"\n  \033[1mSTEP 3\033[0m  Review (Enter=aceitar, ou digite novo valor)\n")
 
     agent_type = draft.get("type", "single")
@@ -541,14 +843,28 @@ def cmd_agent_create_interactive(args):
             prompt = "\n".join(lines)
 
     # ── Create ────────────────────────────────────────────────────────────────
+    return _agent_create_finalize(
+        client, agent_type, agent_id, name, description,
+        tools_list, mcps_list, workers_list, prompt)
+
+
+def _agent_create_finalize(client, agent_type, agent_id, name, description,
+                           tools_list, mcps_list, workers_list, prompt):
+    """Create the declarative agent on the platform and print a summary.
+
+    Shared by the interactive wizard and the spec-driven (auto-accept) path.
+    """
     print(f"\n  \033[1mCriando…\033[0m")
 
+    if not agent_id:
+        print("  \033[31m✗ draft sem 'id' — não é possível criar o agente\033[0m")
+        return
     if agent_type == "supervisor" and "invoke_agent" not in tools_list:
         tools_list.append("invoke_agent")
 
     try:
         result = client.create_agent(
-            agent_id=agent_id, display_name=name, prompt=prompt,
+            agent_id=agent_id, display_name=name or agent_id, prompt=prompt,
             tools=tools_list, description=description)
         if mcps_list:
             client.request("PATCH", f"/agents/{agent_id}", {
@@ -2023,6 +2339,8 @@ def cmd_mcps(args):
     sub = getattr(args, "mcps_cmd", None)
     if sub == "init":
         return _mcps_init(args)
+    if sub == "create":
+        return _mcps_create(args)
     if sub == "push":
         return _mcps_push(args)
     if sub == "pull":
@@ -2031,6 +2349,12 @@ def cmd_mcps(args):
         return _mcps_dev(args)
     if sub == "connect":
         return _mcps_connect(args)
+    if sub == "delete":
+        return _mcps_delete(args)
+    if sub == "publish":
+        return _mcps_publish(args)
+    if sub == "unpublish":
+        return _mcps_unpublish(args)
     if sub == "test":
         return _mcps_test(args)
     # Default (bare `headlabs mcps` or `headlabs mcps list`): list MCPs
@@ -2079,11 +2403,13 @@ def _mcps_test(args):
             try:
                 from headlabs.client import HeadLabsClient
                 c = HeadLabsClient()
-                cfg = c._config()
-                api_key = cfg.get("api_key", "")
+                api_key = c.api_key or ""
                 if api_key:
                     import base64
-                    cred = base64.b64encode(f"{api_key}:".encode()).decode()
+                    # api_key is already the combined "pk_xxx:sk_xxx" pair (see
+                    # HeadLabsClient._headers) — do NOT append an extra ':', that
+                    # corrupts the secret_key the gateway parses via partition(":").
+                    cred = base64.b64encode(api_key.encode()).decode()
                     headers["Authorization"] = f"Basic {cred}"
             except Exception:
                 pass
@@ -2129,7 +2455,14 @@ def _mcps_test(args):
                         if n_params > 0 and not required:
                             tool_issues.append("no required params defined")
                         for pname, pval in props.items():
-                            if isinstance(pval, dict) and not pval.get("description") and not pval.get("type"):
+                            if isinstance(pval, dict) and not pval.get("description") and not (
+                                pval.get("type") or pval.get("anyOf") or pval.get("oneOf") or pval.get("allOf")):
+                                # `type` is absent but so is any of the union
+                                # keywords — this is a genuinely untyped param.
+                                # Optional[str]-style params compile to
+                                # {"anyOf": [{"type": "string"}, {"type": "null"}]}
+                                # (no top-level "type"), which IS typed and must
+                                # not be flagged.
                                 tool_issues.append(f"param '{pname}' lacks type")
 
                         status = "\033[32m✓ ok\033[0m" if not tool_issues else f"\033[33m⚠ {'; '.join(tool_issues)}\033[0m"
@@ -2217,6 +2550,947 @@ def _mcps_connect(args):
         print(f"\033[2m  Agentes com manifest.mcp=[{{\"server\":\"{mcp_id}\"}}] usarão este token.\033[0m")
     except Exception as exc:
         print(f"\033[31merro: {exc}\033[0m")
+
+
+def _mcps_delete(args):
+    """Hard-delete an MCP from the platform (deactivates its runtime and
+    removes the record) and the local ./mcps/<id>/ project, if present.
+
+    Local removal always runs — including when the remote call 404s (the
+    record never existed there, e.g. a `create` that failed after scaffolding
+    but before registration; see the real-world case that motivated this).
+    `--local` is kept as a no-op flag for backward compatibility.
+
+    Irreversible — gated behind an explicit confirmation unless --yes is
+    passed (e.g. for non-interactive/scripted use)."""
+    from headlabs.client import HeadLabsClient
+    import requests
+    client = HeadLabsClient()
+    mcp_id = args.mcp_id
+    mcp_dir = os.path.join(os.getcwd(), "mcps", mcp_id)
+    has_local = os.path.isdir(mcp_dir)
+
+    if not getattr(args, "yes", False):
+        print(f"\033[33m  Isto vai deletar permanentemente o MCP '{mcp_id}' na HeadLabs "
+              f"(runtime + registro).\033[0m")
+        if has_local:
+            print(f"\033[33m  Também vai remover ./mcps/{mcp_id}/ localmente.\033[0m")
+        if not _confirm(f"  Confirma a exclusão de '{mcp_id}'?"):
+            print("  \033[33mCancelado.\033[0m")
+            return
+
+    remote_ok = False
+    try:
+        client.request("DELETE", f"/mcps/{mcp_id}")
+        print(f"\033[32m✓ MCP '{mcp_id}' deletado na HeadLabs.\033[0m")
+        remote_ok = True
+    except requests.HTTPError as exc:
+        status = getattr(exc.response, "status_code", None)
+        if status == 404:
+            # Never existed remotely (or already gone) — not an error worth
+            # stopping for; the local cleanup below is what the user actually
+            # needs in this case.
+            print(f"\033[2m  MCP '{mcp_id}' não existe na HeadLabs (nada a deletar lá).\033[0m")
+        else:
+            print(f"\033[31merro ao deletar na HeadLabs: {exc}\033[0m")
+            return
+    except Exception as exc:
+        print(f"\033[31merro ao deletar na HeadLabs: {exc}\033[0m")
+        return
+
+    if has_local:
+        import shutil
+        shutil.rmtree(mcp_dir)
+        print(f"\033[32m✓ Removido: mcps/{mcp_id}/\033[0m")
+    elif remote_ok:
+        print(f"\033[2m  mcps/{mcp_id}/ não existe localmente — nada a remover.\033[0m")
+
+
+def _mcps_publish(args):
+    """Publish an MCP (visibility=public): makes it discoverable/callable.
+
+    Mirrors the platform's own gate for /publish: requires an active
+    runtime_id. Fails with a clear message rather than a raw HTTP error if
+    the MCP has no runtime yet (e.g. `mcps push` was never run)."""
+    from headlabs.client import HeadLabsClient
+    client = HeadLabsClient()
+    mcp_id = args.mcp_id
+    try:
+        item = client.request("GET", f"/mcps/{mcp_id}")
+    except Exception as exc:
+        print(f"\033[31merro: MCP '{mcp_id}' não encontrado na plataforma: {exc}\033[0m")
+        return
+    if not item.get("runtime_id"):
+        print(f"\033[31merro: '{mcp_id}' não tem runtime ativo — publique após um deploy "
+              f"bem-sucedido (headlabs mcps push {mcp_id}).\033[0m")
+        return
+    try:
+        client.publish_mcp(mcp_id)
+        print(f"\033[32m✓ MCP publicado (visibility=public): {mcp_id}\033[0m")
+    except Exception as exc:
+        print(f"\033[31merro ao publicar: {exc}\033[0m")
+
+
+def _mcps_unpublish(args):
+    """Unpublish an MCP (visibility=private): instant kill-switch."""
+    from headlabs.client import HeadLabsClient
+    client = HeadLabsClient()
+    mcp_id = args.mcp_id
+    try:
+        client.unpublish_mcp(mcp_id)
+        print(f"\033[32m✓ MCP despublicado (visibility=private): {mcp_id}\033[0m")
+    except Exception as exc:
+        print(f"\033[31merro ao despublicar: {exc}\033[0m")
+
+
+# ── MCP authoring: knowledge, design model, validation ────────────────────────
+# Injected "skill": the invariants every MCP shares + the error taxonomy + auth
+# patterns + production-readiness practices (tool naming, structured errors,
+# health checks, idempotency). Sourced from the MCP spec, Anthropic's
+# mcp-builder guidance, and documented production failure modes (SERF/CABP/
+# ATBA). Keeping this in one place makes generated MCPs consistent and lets the
+# design/codegen/repair turns share the same contract.
+_MCP_AUTHORING_KNOWLEDGE = """\
+MCP authoring contract (FastMCP, Python 3.12) — this is the EXACT contract
+validated end-to-end against the HeadLabs AgentCore MCP runtime. Deviating from
+it causes real, confirmed failures (init timeout or 421 Misdirected Request) —
+it is not a style preference.
+
+STRUCTURE (AgentCore MCP runtime contract — do not deviate)
+- Import: `from mcp.server.fastmcp import FastMCP` (NEVER `from mcp import FastMCP`
+  — that name is not exported from the top-level `mcp` package and fails at
+  import time).
+- Create ONE instance with BOTH of these arguments:
+    mcp = FastMCP("<id>", host="0.0.0.0", stateless_http=True)
+  `host="0.0.0.0"` is required for the container to be reachable; AgentCore
+  injects `Mcp-Session-Id` itself, so `stateless_http=True` keeps the server
+  portable across serverless instances — omitting either breaks the runtime.
+- Each capability is an `@mcp.tool()` function with typed arguments and a
+  JSON-serializable dict return.
+- Do NOT build a custom ASGI app, do NOT wrap the server in Starlette routes,
+  do NOT add extra HTTP endpoints (no `/health`, no `/ready`, no manual
+  `Mount`/`Route`), and do NOT serve via uvicorn. AgentCore expects the
+  container to serve MCP directly on `0.0.0.0:8000/mcp` via `mcp.run(...)`.
+  A custom ASGI/uvicorn setup produces an HTTP 307 redirect at `/mcp/` that the
+  AgentCore proxy does not follow, which surfaces as HTTP 421 (Misdirected
+  Request) — confirmed in production. `app = mcp.streamable_http_app()` may
+  still be assigned (some hosts use it), but it must never be the thing that
+  is actually run in the container entrypoint.
+
+TOOL NAMING & DESCRIPTIONS (the tool list IS the interface an agent reasons over)
+- Names: action-oriented, snake_case, unambiguous (e.g. `fetch_usage_limits`,
+  NOT `get_data` or `handler_v2`). Never suffix versions in the name
+  (`_v2`); evolve via optional fields instead.
+- Descriptions: 2-4 sentences covering what it does, when to call it, what it
+  returns, and its side effects (or explicitly "read-only, no side effects").
+  Too short forces the agent to guess; too long dilutes the signal.
+
+INPUT/OUTPUT SCHEMA
+- Every parameter is typed with an explicit required/optional distinction and
+  a one-line description. Prefer narrow, validated types (enums for closed
+  sets) over free-form strings.
+- Return structured JSON (dict) with named fields, never a single opaque string.
+
+STRUCTURED ERRORS (SERF) — never let a tool crash or return a bare string
+- On any failure, catch the exception and return a dict:
+    {"erro": {"codigo": <CODE>, "mensagem": <human-readable>,
+              "retryable": <bool>, "acao_sugerida": <concrete next step>}}
+- `acao_sugerida` is read by the calling agent's LLM — make it a concrete
+  instruction ("peça ao usuário para verificar X"), never "ocorreu um erro".
+- Stable error codes (pick the closest fit): ENTRADA_INVALIDA (retryable=false,
+  fix input), RECURSO_NAO_ENCONTRADO (retryable=false), RATE_LIMIT_LOCAL
+  (retryable=true, backoff), UPSTREAM_INDISPONIVEL (retryable=true, backoff),
+  AUTH_INVALIDO (retryable=false, escalate), TLS_INCOMPATIVEL (retryable=false).
+
+IDEMPOTENCY & SIDE EFFECTS
+- Classify every tool as read-only (safe to retry, cacheable) or
+  side-effecting (creates/modifies state). Side-effecting tools MUST document
+  this in their docstring and should be idempotent where feasible (e.g. accept
+  an idempotency key, or make repeated calls converge to the same state)
+  rather than duplicating the effect on retry.
+
+AUTH & CONFIG
+- Auth patterns: none | apikey (key/bearer header from env) | mtls (client cert
+  from env, TLS>=1.2) | oauth (client-credentials). Pick based on the spec.
+- Read ALL configuration and secrets from environment variables; never
+  hard-code secrets.
+- Prefer resilient upstream calls: explicit timeouts, graceful degradation, and
+  optional caching (memory/disk) with a TTL when a snapshot is reasonable.
+- Liveness/readiness is NOT exposed via HTTP routes on this runtime (see
+  STRUCTURE above). If a tool depends on an unhealthy upstream/cache, surface
+  that through the SERF error contract on the affected tool call instead —
+  e.g. a `status_cache`-style read-only tool is fine, an extra `/health` route
+  is not.
+
+PACKAGING
+- mcp and httpx are ALWAYS installed; list only EXTRA pip deps. Do NOT add
+  uvicorn — it is not used to run the server on this runtime.
+- End the file EXACTLY with:
+    app = mcp.streamable_http_app()
+    if __name__ == "__main__":
+        import os
+        mcp.run(transport=os.environ.get("MCP_TRANSPORT", "streamable-http"))
+"""
+
+# Full persona for the dedicated mcp-architect agent: the authoring contract IS
+# the agent's system prompt, so per-call prompts only need to carry the spec
+# and the required output format — not re-teach the rules every turn.
+_MCP_ARCHITECT_PERSONA = (
+    "You are the MCP Architect: a specialist that designs and implements "
+    "production-grade Model Context Protocol (MCP) servers using FastMCP "
+    "(Python).\n\n"
+    "You are invoked programmatically by a CLI pipeline, not by a human "
+    "chatting. Your output is parsed by code. This means:\n"
+    "- Respond with ONLY the two fenced blocks requested (```json design, "
+    "```python server.py). NO preamble, NO section titles, NO summary or "
+    "checklist after the code, NO closing remarks. Any prose outside the two "
+    "blocks is discarded and wastes tokens.\n"
+    "- Never wrap explanations around the blocks. If you must reason, do it "
+    "implicitly by producing correct output — do not narrate your reasoning.\n\n"
+    f"{_MCP_AUTHORING_KNOWLEDGE}"
+)
+
+
+def _ensure_mcp_architect(client) -> bool:
+    """Idempotently create the dedicated mcp-architect agent on the platform if
+    it doesn't exist yet. Returns True if the agent is available (already
+    existed or was just created), False if creation failed (caller falls back
+    to the generic architect).
+
+    Checks existence via a direct ``GET /agents/<id>`` rather than
+    ``list_remote_agents()``: internal architect agents are created with
+    ``visibility: private`` (matching agent-architect's pattern) and are
+    correctly excluded from the public listing — so the listing can never
+    confirm this agent exists, even after it was created.
+    """
+    try:
+        client.request("GET", f"/agents/{_MCP_ARCHITECT_AGENT_ID}")
+        return True
+    except Exception:
+        pass  # not found (or transient error) — fall through to (re)create
+    try:
+        client.create_agent(
+            agent_id=_MCP_ARCHITECT_AGENT_ID,
+            display_name="MCP Architect",
+            prompt=_MCP_ARCHITECT_PERSONA,
+            tools=["web_search", "web_fetch"],
+            description="Internal agent: designs and implements FastMCP servers from a spec.",
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _normalize_mcp_design(draft) -> dict | None:
+    """Coerce whatever the architect returned into the canonical MCP design
+    model. Tolerant by construction: accepts missing keys, strings where lists
+    are expected, dicts-or-strings for tools/params/config/errors. Returns None
+    only if there is nothing usable (no id/name, or no tools)."""
+    if not isinstance(draft, dict):
+        return None
+
+    def _s(v, d=""):
+        return str(v).strip() if v is not None else d
+
+    def _as_list(v):
+        if v is None:
+            return []
+        if isinstance(v, str):
+            return [x.strip() for x in v.split(",") if x.strip()]
+        if isinstance(v, list):
+            return v
+        return [v]
+
+    d = {}
+    d["id"] = _s(draft.get("id"))
+    d["name"] = _s(draft.get("name")) or (d["id"].replace("-", " ").title() if d["id"] else "")
+    d["description"] = _s(draft.get("description"))
+
+    d["dependencies"] = [x for x in (_s(r) for r in _as_list(
+        draft.get("dependencies") or draft.get("requirements"))) if x]
+
+    config = []
+    raw_cfg = draft.get("config") or draft.get("env") or []
+    if isinstance(raw_cfg, dict):
+        raw_cfg = [{"env": k, "default": v} for k, v in raw_cfg.items()]
+    for c in (raw_cfg if isinstance(raw_cfg, list) else []):
+        if isinstance(c, str):
+            env = _s(c)
+            if env:
+                config.append({"env": env, "secret": False, "required": False,
+                               "default": "", "description": ""})
+        elif isinstance(c, dict):
+            env = _s(c.get("env") or c.get("name") or c.get("key"))
+            if env:
+                config.append({
+                    "env": env, "secret": bool(c.get("secret", False)),
+                    "required": bool(c.get("required", False)),
+                    "default": _s(c.get("default")), "description": _s(c.get("description")),
+                })
+    d["config"] = config
+
+    auth = draft.get("auth")
+    if isinstance(auth, str):
+        auth = {"type": auth}
+    if not isinstance(auth, dict):
+        auth = {}
+    auth["type"] = _s(auth.get("type") or "none") or "none"
+    d["auth"] = auth
+
+    d["upstream"] = draft.get("upstream") if isinstance(draft.get("upstream"), dict) else {}
+    d["state"] = draft.get("state") if isinstance(draft.get("state"), dict) else {}
+
+    errors = []
+    for e in _as_list(draft.get("errors")):
+        if isinstance(e, str) and e.strip():
+            errors.append({"code": _s(e), "when": ""})
+        elif isinstance(e, dict) and _s(e.get("code")):
+            errors.append({"code": _s(e.get("code")), "when": _s(e.get("when"))})
+    d["errors"] = errors
+
+    tools = []
+    for t in _as_list(draft.get("tools")):
+        if isinstance(t, str) and t.strip():
+            tools.append({"name": _s(t), "description": "", "params": [],
+                          "returns": "", "logic": "",
+                          "side_effects": False, "idempotent": True})
+        elif isinstance(t, dict) and _s(t.get("name")):
+            params = []
+            for p in _as_list(t.get("params") or t.get("parameters")):
+                if isinstance(p, str) and p.strip():
+                    params.append({"name": _s(p), "type": "str", "required": False,
+                                   "default": "", "description": ""})
+                elif isinstance(p, dict) and _s(p.get("name")):
+                    params.append({
+                        "name": _s(p.get("name")), "type": _s(p.get("type") or "str"),
+                        "required": bool(p.get("required", False)),
+                        "default": _s(p.get("default")), "description": _s(p.get("description")),
+                    })
+            tools.append({
+                "name": _s(t.get("name")), "description": _s(t.get("description")),
+                "params": params, "returns": _s(t.get("returns")),
+                "logic": _s(t.get("logic") or t.get("implementation")),
+                "side_effects": bool(t.get("side_effects", False)),
+                "idempotent": bool(t.get("idempotent", not t.get("side_effects", False))),
+            })
+    d["tools"] = tools
+
+    if not (d["id"] or d["name"]) or not d["tools"]:
+        return None
+    return d
+
+
+def _sanitize_python_code(code: str) -> str:
+    """Deterministically undo the common corruptions that creep in when code is
+    round-tripped through the platform's transport/observability layers.
+
+    Two independent sources of corruption are neutralized here:
+
+    1. JSON-escape repair (:func:`headlabs.client._loads_tolerant`) doubles
+       invalid backslash escapes so the JSON parses, but that *preserves* a
+       stray backslash that was never meant to be in the Python source (e.g.
+       an LLM wrote ``\\@mcp.tool()`` — an invalid ``\\@`` escape). Left alone
+       it becomes ``SyntaxError: unexpected character after line continuation
+       character``.
+    2. The platform's PII scrubber treats ``@name(`` as an email/handle-like
+       pattern and redacts it to ``\\pii_<hash>()`` *before* the trace even
+       reaches this client — this has been observed replacing every
+       ``@mcp.tool()`` decorator with ``\\pii_8d9040d12a()``. Since every
+       occurrence in generated MCP code is a decorator (the only place `@`
+       starts a line in our authoring contract), it is always safe to restore
+       it to ``@mcp.tool()``. The scrubber sometimes swallows the preceding
+       newline as well, gluing ``\\pii_<hash>()`` to the tail of the previous
+       line (e.g. a ``# ===`` comment banner) instead of starting a line of
+       its own — the replacement is therefore NOT anchored to line-start and
+       always reinserts the newline before the decorator.
+
+    These fixes are localized and safe (a real Python continuation backslash
+    is at end-of-line, never before ``@``/``pii_`` or at the start of a
+    line's content)."""
+    if not code:
+        return code
+    import re
+    # Platform PII scrubbing artifact: `\pii_<hex>()` was originally
+    # `@mcp.tool()` (the only `@name(...)` pattern our authoring contract
+    # produces). The scrubber sometimes swallows the preceding newline too,
+    # leaving `\pii_<hex>()` glued to the end of the previous line (e.g. a
+    # comment banner) instead of starting its own line — so this must NOT be
+    # anchored to line-start. Insert the newline back before restoring the
+    # decorator.
+    code = re.sub(r'\\pii_[0-9a-f]+\(\)', '\n@mcp.tool()', code)
+    # `\@decorator` → `@decorator` (a backslash before '@' is never valid Python)
+    code = code.replace("\\@", "@")
+    # A stray backslash at the start of a line's content (line-continuation
+    # artifact) — drop just that leading backslash, keep the indentation.
+    code = re.sub(r'(?m)^([ \t]*)\\(?=\S)', r'\1', code)
+    return code
+
+
+_GENERIC_TOOL_NAMES = {"get_data", "getdata", "handler", "process", "run", "execute",
+                       "do_it", "action", "tool", "call", "invoke", "func", "helper"}
+
+
+def _validate_mcp_contract(design: dict, server_code: str) -> list[str]:
+    """Lint the design + server.py against production-readiness practices that
+    AST/syntax checks cannot see (tool naming, description quality, schema
+    typing, side-effect documentation, structured errors).
+
+    Returns a list of human-readable warnings (empty = no issues found). This
+    is advisory, not a hard gate — it is surfaced to the user at the approval
+    gate so they can judge severity, matching how `mcps test` reports tool
+    warnings today.
+    """
+    warnings = []
+    tools = design.get("tools", [])
+
+    for t in tools:
+        name = (t.get("name") or "").strip()
+        desc = (t.get("description") or "").strip()
+        if not name:
+            warnings.append("uma tool não tem nome")
+            continue
+        if "_v" in name.lower() and any(ch.isdigit() for ch in name):
+            warnings.append(f"tool '{name}': nome versionado (_v2) é anti-padrão — evolua via campos opcionais")
+        bare = name.lower().replace("_", "")
+        if bare in {g.replace("_", "") for g in _GENERIC_TOOL_NAMES}:
+            warnings.append(f"tool '{name}': nome genérico/ambíguo — o agente pode não conseguir decidir quando chamá-la")
+        if not desc:
+            warnings.append(f"tool '{name}': sem descrição — o agente não terá como saber quando usá-la")
+        elif len(desc) < 20:
+            warnings.append(f"tool '{name}': descrição muito curta ({len(desc)} chars) — detalhe o quê/quando/retorno/efeitos")
+        for p in t.get("params", []):
+            if not (p.get("description") or "").strip():
+                warnings.append(f"tool '{name}': parâmetro '{p.get('name','?')}' sem descrição")
+        if t.get("side_effects") and t.get("idempotent") is False:
+            warnings.append(f"tool '{name}': tem efeitos colaterais e não é idempotente — considere aceitar uma idempotency key")
+
+    if not tools:
+        warnings.append("design sem tools")
+
+    if "erro" not in server_code and "error" not in server_code.lower():
+        warnings.append("nenhum tratamento de erro estruturado detectado no código")
+
+    return warnings
+
+
+def _validate_server_code(code: str):
+    """Deterministic gate before scaffolding. Returns (ok, error_message).
+
+    Checks the server.py parses (AST) and honors the FastMCP invariants for
+    the REAL AgentCore MCP runtime contract (validated end-to-end in
+    production — see `_MCP_AUTHORING_KNOWLEDGE`): correct import path, an
+    `mcp` instance constructed with `host="0.0.0.0", stateless_http=True`, at
+    least one tool, the streamable-http entrypoint, `mcp.run(...)` as the
+    actual thing executed (not uvicorn), and no Starlette/custom ASGI wiring
+    (which causes a 307 redirect the AgentCore proxy doesn't follow -> 421).
+
+    This is a syntactic/substring check, not a runtime one — it CANNOT catch
+    every defect (e.g. an import that is spelled correctly but wrong in some
+    other way). The real backstop is `_verify_mcp_behavior`, which actually
+    runs the file; this function exists to fail fast on the common, cheap-to-
+    detect mistakes before paying for a subprocess spin-up.
+    """
+    import ast
+    import re
+    if not code or not code.strip():
+        return False, "server.py vazio"
+    try:
+        ast.parse(code)
+    except SyntaxError as exc:
+        return False, f"SyntaxError: {exc.msg} (linha {exc.lineno})"
+    missing = []
+    if "from mcp.server.fastmcp import" not in code and "mcp.server.fastmcp" not in code:
+        missing.append('import incorreto: precisa ser "from mcp.server.fastmcp import FastMCP" (não "from mcp import FastMCP")')
+    elif "FastMCP" not in code:
+        missing.append("import/instância FastMCP")
+    if "streamable_http_app" not in code:
+        missing.append("app = mcp.streamable_http_app()")
+    if "@mcp.tool" not in code and ".tool(" not in code:
+        missing.append("nenhuma @mcp.tool()")
+    if "stateless_http" not in code or "True" not in code.split("stateless_http", 1)[-1][:20]:
+        missing.append('FastMCP(...) precisa de stateless_http=True (contrato AgentCore)')
+    if 'host="0.0.0.0"' not in code and "host='0.0.0.0'" not in code:
+        missing.append('FastMCP(...) precisa de host="0.0.0.0" (contrato AgentCore)')
+    if "mcp.run(" not in code:
+        missing.append("mcp.run(transport=...) precisa ser o entrypoint executado")
+    if "uvicorn" in code.lower():
+        missing.append("uvicorn não é suportado neste runtime — remova; use apenas mcp.run(...)")
+    if "starlette" in code.lower() or "Mount(" in code or re.search(r"\bRoute\(", code):
+        missing.append("Starlette/rotas HTTP customizadas (ex.: /health, /ready) causam 421 no AgentCore — remova")
+    if missing:
+        return False, "faltando: " + "; ".join(missing)
+    return True, ""
+
+
+def _mcp_build_prompt(spec_text: str, id_hint: str, include_knowledge: bool = True) -> str:
+    """Single-turn contract: a compact DESIGN as ```json (drives deterministic
+    assembly of deps/config) PLUS the full server.py as ```python (robust,
+    escaping-free channel). Code never lives inside the JSON.
+
+    ``include_knowledge`` controls whether the full authoring contract is
+    repeated in the prompt. Skip it (False) when talking to the dedicated
+    mcp-architect agent, whose PERSONA already embeds the contract — shorter
+    prompt, less for the model to restate/narrate. Keep it (True, default) for
+    the generic agent-architect fallback, which has no domain persona."""
+    knowledge = f"{_MCP_AUTHORING_KNOWLEDGE}\n" if include_knowledge else ""
+    return (
+        "You are an MCP (Model Context Protocol) server architect. Design a "
+        "COMPLETE, self-contained MCP server from the user's specification.\n\n"
+        f"{knowledge}"
+        f"SPECIFICATION:\n{spec_text}\n\n"
+        + (f"REQUIRED SERVER ID: {id_hint}\n\n" if id_hint else "")
+        + "Return your answer in EXACTLY two parts, in this order:\n\n"
+        "PART 1 — a compact DESIGN as a JSON object in a ```json block "
+        "(structured metadata only, NO code):\n"
+        "```json\n"
+        "{\n"
+        '  "id": "<kebab-case>", "name": "...", "description": "<one line>",\n'
+        '  "dependencies": ["<extra pip pkg>"],\n'
+        '  "config": [{"env":"VAR","secret":false,"required":true,"default":"","description":"..."}],\n'
+        '  "auth": {"type":"none|apikey|bearer|mtls|oauth"},\n'
+        '  "upstream": {"base_url":"...","timeout_ms":15000},\n'
+        '  "state": {"cache":"none|memory|disk","ttl_hours":24},\n'
+        '  "errors": [{"code":"UPSTREAM_INDISPONIVEL","when":"5xx/timeout"}],\n'
+        '  "tools": [{"name":"action_oriented_snake_case","description":"2-4 sentences: what/when/returns/side-effects",'
+        '"params":[{"name":"","type":"str","required":true,"description":""}],'
+        '"returns":"...","logic":"...","side_effects":false,"idempotent":true}]\n'
+        "}\n"
+        "```\n\n"
+        "PART 2 — the COMPLETE contents of server.py in a ```python block "
+        "(raw source, no escaping), implementing the design above:\n"
+        "```python\n"
+        "# full server.py\n"
+        "```\n\n"
+        "RULES:\n"
+        "- Output ONLY the two fenced blocks below, back to back. NO preamble "
+        "  (\"I will now...\"), NO section titles, NO summary/checklist after, "
+        "  NO closing remarks. Any text outside the two ```json/```python "
+        "  blocks is wasted tokens and will be discarded.\n"
+        "- Put code ONLY in the ```python block, NEVER inside the JSON.\n"
+        "- server.py must be valid, importable Python with no placeholders/TODOs.\n"
+        "- Honor the FULL authoring contract: action-oriented tool names,\n"
+        "  2-4 sentence descriptions, typed params, structured SERF error dicts\n"
+        "  on every failure path, FastMCP(..., host=\"0.0.0.0\", stateless_http=True),\n"
+        "  and mcp.run(transport=...) as the ONLY server entrypoint (no Starlette,\n"
+        "  no uvicorn, no /health or /ready routes).\n"
+    )
+
+
+async def _probe_mcp_server(url: str, timeout: float = 10.0) -> dict:
+    """Speak the REAL MCP protocol against a running server: initialize,
+    list tools, and check each tool's schema quality. This is the same
+    behavioral check `headlabs mcps test` performs against a deployed MCP —
+    reused here so a freshly generated server is verified by actually running
+    it and talking the protocol, not just by parsing its source.
+
+    Returns {"ok": bool, "tools": [...], "warnings": [...], "error": str|None}.
+    """
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    try:
+        async with streamablehttp_client(url, timeout=timeout, terminate_on_close=False) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.list_tools()
+                tools = result.tools if hasattr(result, "tools") else []
+                warnings = []
+                for tool in tools:
+                    desc = tool.description or ""
+                    schema = tool.inputSchema if hasattr(tool, "inputSchema") else {}
+                    props = (schema.get("properties") or {}) if isinstance(schema, dict) else {}
+                    required = (schema.get("required") or []) if isinstance(schema, dict) else []
+                    if not desc:
+                        warnings.append(f"tool '{tool.name}': sem descrição no protocolo")
+                    if props and not required:
+                        warnings.append(f"tool '{tool.name}': nenhum parâmetro required no schema")
+                return {"ok": True, "tools": [t.name for t in tools],
+                       "warnings": warnings, "error": None}
+    except Exception as exc:
+        return {"ok": False, "tools": [], "warnings": [], "error": str(exc)}
+
+
+def _verify_mcp_behavior(mcp_dir: str, port: int = 0, timeout: float = 12.0) -> dict:
+    """Run the generated server.py as a real local subprocess and verify it
+    over the actual MCP protocol (initialize + tools/list + schema checks).
+
+    This is deliberately Docker-free (fast, no build step) so it runs on every
+    `mcps create`, not just as an opt-in follow-up. Returns a result dict.
+
+    Two distinct failure modes are reported differently:
+    - Infrastructure problem (Python executable missing, can't bind a port):
+      ``{"ok": False, "skipped": True, ...}`` — a soft-fail that must not
+      block creation, since it can't verify quality OR correctness.
+    - The generated server itself crashes on startup (ImportError,
+      SyntaxError-at-runtime, unhandled exception in module-level code):
+      ``{"ok": False, "skipped": False, ...}`` — a REAL failure. AST validation
+      only proves the file parses and contains the right substrings; it
+      cannot catch a wrong import path (e.g. ``from mcp import FastMCP``
+      instead of ``from mcp.server.fastmcp import FastMCP``) or any other
+      runtime-only defect. This is what actually separates "compiles" from
+      "behaves like an MCP", and the caller must treat it as blocking —
+      exactly like an AST validation failure — not as an advisory warning.
+
+    Implementation note: FastMCP does not read a ``PORT`` env var — its bind
+    port lives on ``mcp.settings.port``, set at construction time inside the
+    generated code. A tiny wrapper script imports the generated ``server``
+    module and overrides ``mcp.settings.port``/``host`` *before* calling
+    ``mcp.run()``, so verification never collides with a port the generated
+    code happened to hard-code, without needing to modify that code.
+    """
+    import socket
+    import subprocess
+    import time as _time
+
+    if port == 0:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+    if not os.path.isdir(mcp_dir):
+        return {"ok": False, "skipped": True, "error": f"diretório não encontrado: {mcp_dir}"}
+
+    wrapper_path = os.path.join(mcp_dir, "_verify_entrypoint.py")
+    wrapper_src = (
+        "import sys, importlib.util\n"
+        "spec = importlib.util.spec_from_file_location('server', 'server.py')\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "sys.modules['server'] = mod\n"
+        "spec.loader.exec_module(mod)\n"
+        f"mod.mcp.settings.port = {port}\n"
+        "mod.mcp.settings.host = '127.0.0.1'\n"
+        "mod.mcp.run(transport='streamable-http')\n"
+    )
+
+    env = dict(os.environ)
+    env["MCP_TRANSPORT"] = "streamable-http"
+    proc = None
+    try:
+        with open(wrapper_path, "w") as f:
+            f.write(wrapper_src)
+        proc = subprocess.Popen(
+            [sys.executable, "_verify_entrypoint.py"], cwd=mcp_dir, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        deadline = _time.time() + timeout
+        url = f"http://127.0.0.1:{port}/mcp"
+        last_result = None
+        while _time.time() < deadline:
+            if proc.poll() is not None:
+                # The subprocess started and then exited — this is the
+                # GENERATED CODE crashing (import error, exception at module
+                # scope, etc.), not an infra problem. Treat as a real failure.
+                _out, err = proc.communicate()
+                return {"ok": False, "skipped": False,
+                       "error": f"server.py falhou ao iniciar: {err.strip()[-500:]}"}
+            import asyncio
+            last_result = asyncio.run(_probe_mcp_server(url, timeout=3.0))
+            if last_result["ok"]:
+                return last_result
+            _time.sleep(0.5)
+        return last_result or {"ok": False, "skipped": True, "error": "timeout ao conectar"}
+    except FileNotFoundError as exc:
+        return {"ok": False, "skipped": True, "error": f"não foi possível iniciar o processo: {exc}"}
+    except Exception as exc:
+        return {"ok": False, "skipped": True, "error": str(exc)}
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        try:
+            os.remove(wrapper_path)
+        except OSError:
+            pass
+
+
+def _mcp_repair_prompt(code: str, error: str, include_knowledge: bool = True) -> str:
+    """Feed a failing server.py back with the exact validation error for one
+    deterministic repair turn. Returns corrected code in a ```python block.
+
+    See :func:`_mcp_build_prompt` for the ``include_knowledge`` rationale."""
+    knowledge = f"{_MCP_AUTHORING_KNOWLEDGE}\n" if include_knowledge else ""
+    return (
+        "The following FastMCP server.py failed validation and must be fixed.\n\n"
+        f"{knowledge}"
+        f"VALIDATION ERROR:\n{error}\n\n"
+        "CURRENT server.py:\n```python\n" + code + "\n```\n\n"
+        "Return ONLY the COMPLETE corrected server.py in a single ```python "
+        "block — no preamble, no explanation, no text before or after the "
+        "block. Fix ONLY the reported error, keep all working logic, change "
+        "nothing unnecessary.\n\n"
+        "REMINDER — do not regress any of these while fixing the error above "
+        "(a fix for one requirement must never drop another):\n"
+        '  - mcp = FastMCP("<id>", host="0.0.0.0", stateless_http=True)  '
+        "— exact three arguments, every time you touch this line\n"
+        "  - app = mcp.streamable_http_app()\n"
+        '  - if __name__ == "__main__": mcp.run(transport=os.environ.get('
+        '"MCP_TRANSPORT", "streamable-http"))\n'
+        "  - no Starlette/uvicorn/custom ASGI routes (Mount/Route//health//ready)"
+    )
+
+
+def _mcps_create(args):
+    """Create an MCP server from a spec file via a resilient pipeline:
+
+    1. Design + code (single architect turn): compact DESIGN as JSON drives
+       deterministic assembly; full server.py comes in a ```python block.
+    2. Resilient interpretation: normalize whatever came back to the canonical
+       design model; extract code from the fenced block (escaping-free).
+    3. Deterministic validation (AST + FastMCP invariants) with up to two
+       automatic repair turns feeding the exact error back to the architect.
+    4. Full-design approval gate (yes/no), then scaffold ./mcps/<id>/ and
+       create on HeadLabs (unless --no-deploy).
+    """
+    from headlabs.client import HeadLabsClient
+    from headlabs.progress import ProgressReporter
+    from headlabs.config import get_tenant
+
+    spec_path = getattr(args, "spec", None)
+    if not spec_path:
+        print("\033[31merro: --spec <arquivo> é obrigatório para mcps create\033[0m", file=sys.stderr)
+        sys.exit(2)
+    spec_text = _read_spec(spec_path)
+
+    client = HeadLabsClient()
+    tenant_id = getattr(args, "tenant", None) or get_tenant()
+    id_hint = getattr(args, "id", None) or ""
+
+    print("\033[1m  HeadLabs · MCP Creation (spec-driven)\033[0m\n")
+
+    # Prefer the dedicated mcp-architect (persona embeds the authoring
+    # contract → shorter prompts, less narration, more consistent output).
+    # Falls back to the generic agent-architect if it can't be reached/created
+    # — the pipeline must keep working even if the platform call fails.
+    architect_id = _ARCHITECT_AGENT_ID
+    use_dedicated = _ensure_mcp_architect(client)
+    if use_dedicated:
+        architect_id = _MCP_ARCHITECT_AGENT_ID
+    else:
+        print("  \033[33m⚠ mcp-architect indisponível — usando agent-architect genérico\033[0m")
+
+    def _turn(prompt, label):
+        reporter = ProgressReporter(quiet=False, verbose=False)
+        reporter.begin_wait(label)
+        return _run_architect(client, prompt, tenant_id, reporter, agent_id=architect_id)
+
+    # ── 1. Design + code ──────────────────────────────────────────────────────
+    try:
+        answer = _turn(_mcp_build_prompt(spec_text, id_hint, include_knowledge=not use_dedicated),
+                       "Interpretando a spec e projetando o MCP…")
+    except Exception as exc:
+        print(f"  \033[31m✗ {exc}\033[0m")
+        return
+
+    # ── 2. Resilient interpretation ───────────────────────────────────────────
+    # Prefer the ```json block so a '{' inside the ```python code can't be
+    # mistaken for the design object.
+    design = _normalize_mcp_design(
+        _parse_json_draft(_extract_fenced_block(answer, ("json",)) or answer))
+    if not design:
+        print("  \033[31m✗ Não foi possível interpretar o design do MCP.\033[0m")
+        _print_bad_draft(answer)
+        return
+
+    mcp_id = _slugify_id(id_hint or design["id"] or design["name"])
+    if not mcp_id:
+        print("  \033[31m✗ design sem 'id' válido — não é possível criar o MCP\033[0m")
+        return
+    design["id"] = mcp_id
+
+    server_code = _sanitize_python_code(_extract_fenced_block(answer, ("python", "py")) or "")
+
+    # ── 3. Validate (AST + behavioral) with auto-repair ───────────────────────
+    # Behavioral verification is strictly stronger than AST validation (AST
+    # only proves the file parses and contains the right substrings; it
+    # cannot catch a wrong import path or any other runtime-only defect — see
+    # `_verify_mcp_behavior`'s docstring for the real-world case that exposed
+    # this gap). Both checks feed the SAME repair loop and are equally
+    # blocking: a server that "compiles" but crashes on startup must never
+    # reach the approval gate.
+    def _check(code):
+        ok, err = _validate_server_code(code)
+        if not ok:
+            return ok, err, None
+        display_ = design["name"] or mcp_id.replace("-", " ").title()
+        desc_ = design["description"] or f"MCP server: {display_}"
+        with tempfile.TemporaryDirectory(prefix=f"headlabs-mcp-verify-{mcp_id}-") as tmp:
+            try:
+                probe_dir = _scaffold_mcp(mcp_id, display_, desc_, code,
+                                          design["dependencies"], design["config"],
+                                          base_dir=tmp)
+                behavior_ = _verify_mcp_behavior(probe_dir)
+            except Exception as exc:
+                behavior_ = {"ok": False, "skipped": True, "error": str(exc)}
+        if behavior_.get("ok") or behavior_.get("skipped"):
+            # Verified OK, or infra couldn't run it (soft-fail — not the
+            # generated code's fault, don't block on something we can't check).
+            return True, "", behavior_
+        return False, behavior_.get("error", "falha na verificação comportamental"), behavior_
+
+    print("  \033[2mVerificando comportamento (subindo o server localmente)…\033[0m")
+    ok, err, behavior = _check(server_code)
+    attempts = 0
+    while not ok and attempts < 2:
+        print(f"  \033[33m⟳ Ajustando o server.py ({err})…\033[0m")
+        try:
+            fix = _turn(_mcp_repair_prompt(server_code, err, include_knowledge=not use_dedicated),
+                        "Corrigindo o server.py…")
+        except Exception as exc:
+            print(f"  \033[31m✗ {exc}\033[0m")
+            return
+        new_code = _sanitize_python_code(_extract_fenced_block(fix, ("python", "py")) or server_code)
+        new_ok, new_err, new_behavior = _check(new_code)
+        # Convergence guard: if the repair produced identical code or the exact
+        # same error, another round won't help — stop wasting turns.
+        if new_code == server_code or (not new_ok and new_err == err):
+            server_code, ok, err, behavior = new_code, new_ok, new_err, new_behavior
+            break
+        server_code, ok, err, behavior = new_code, new_ok, new_err, new_behavior
+        attempts += 1
+    if not ok:
+        print(f"  \033[31m✗ server.py não passou na validação: {err}\033[0m")
+        _print_bad_draft(server_code)
+        return
+
+    display = design["name"] or mcp_id.replace("-", " ").title()
+    desc = design["description"] or f"MCP server: {display}"
+    contract_warnings = _validate_mcp_contract(design, server_code)
+    if behavior and behavior.get("ok"):
+        print(f"  \033[32m✓ Verificação comportamental: protocolo MCP respondeu, "
+              f"{len(behavior['tools'])} tools\033[0m")
+    elif behavior and behavior.get("skipped"):
+        print(f"  \033[33m⚠ Verificação comportamental não pôde rodar: "
+              f"{behavior.get('error','?')[:120]}\033[0m")
+
+    # ── 4. Approval gate ──────────────────────────────────────────────────────
+    _review_mcp_draft(mcp_id, design, server_code, contract_warnings, behavior)
+    if not _confirm("\n  Autorizar criação deste MCP na HeadLabs?"):
+        print("  \033[33mCriação cancelada.\033[0m")
+        return
+
+    try:
+        _scaffold_mcp(mcp_id, display, desc, server_code,
+                      design["dependencies"], design["config"])
+    except FileExistsError:
+        # The design was just approved above — don't make the user re-run the
+        # whole (slow) architect turn just because a stale local dir from a
+        # previous/aborted attempt is in the way. Offer to remove it, gated by
+        # its own explicit confirmation (this deletes a local directory only,
+        # never anything on the platform).
+        mcp_dir = Path("mcps") / mcp_id
+        if not _confirm(f"\n  mcps/{mcp_id}/ já existe localmente. Remover e recriar?"):
+            print(f"  \033[31m✗ Cancelado. Remova mcps/{mcp_id}/ manualmente ou use outro id.\033[0m")
+            return
+        import shutil
+        shutil.rmtree(mcp_dir, ignore_errors=True)
+        try:
+            _scaffold_mcp(mcp_id, display, desc, server_code,
+                          design["dependencies"], design["config"])
+        except FileExistsError:
+            print(f"  \033[31m✗ Não foi possível remover mcps/{mcp_id}/. Remova manualmente.\033[0m")
+            return
+
+    print(f"  \033[32m✓ MCP scaffolded: mcps/{mcp_id}/\033[0m")
+
+    if getattr(args, "no_deploy", False):
+        print(f"\n  Revise e publique: \033[2mheadlabs mcps push {mcp_id} --wait\033[0m")
+        return
+
+    # Create on HeadLabs (source upload + build + deploy).
+    args.mcp_id = mcp_id
+    args.display_name = display
+    args.description = desc
+    print(f"\n  \033[1mCriando na HeadLabs…\033[0m")
+    return _mcps_push(args)
+
+
+def _scaffold_mcp(mcp_id, display, desc, server_code, extra_reqs=None,
+                  config_vars=None, base_dir=None):
+    """Write a self-contained MCP project to <base_dir>/mcps/<id>/ (default:
+    ./mcps/<id>/) from generated code.
+
+    ``base_dir`` lets callers materialize the project into a scratch directory
+    for behavioral verification (see ``_verify_mcp_behavior``) without
+    touching the real ``./mcps/`` tree until after approval.
+    ``config_vars`` (the design's config surface) is materialized as an
+    ``.env.example`` so the required environment/secrets are documented.
+    Raises FileExistsError if the directory already exists.
+    """
+    mcp_dir = os.path.join(base_dir or os.getcwd(), "mcps", mcp_id)
+    if os.path.exists(mcp_dir):
+        raise FileExistsError(mcp_dir)
+
+    config_yaml = (
+        "mcp:\n"
+        f"  id: {mcp_id}\n"
+        f'  name: "{display}"\n'
+        f'  description: "{desc}"\n'
+        '  version: "1.0.0"\n'
+        "  transport: streamable-http\n"
+        "  port: 8080\n"
+    )
+    reqs = ["mcp>=1.2.0", "httpx>=0.27.0"]
+    for r in (extra_reqs or []):
+        if r not in reqs:
+            reqs.append(r)
+    requirements = "\n".join(reqs) + "\n"
+    dockerfile = (
+        # AgentCore MCP contract (validated E2E in production): container MUST
+        # serve on 0.0.0.0:8000/mcp via mcp.run() — port 8080 causes an init
+        # timeout. Built for linux/arm64 to match the platform's ECR/runtime arch.
+        "FROM --platform=linux/arm64 python:3.12-slim\n"
+        f"ENV MCP_ID={mcp_id} PORT=8000 PYTHONUNBUFFERED=1\n"
+        "WORKDIR /app\n"
+        "COPY requirements.txt /tmp/requirements.txt\n"
+        "RUN pip install --no-cache-dir -r /tmp/requirements.txt\n"
+        "COPY . /app\n"
+        "EXPOSE 8000\n"
+        'CMD ["python", "server.py"]\n'
+    )
+    test_py = (
+        '"""Smoke test: verify MCP server imports cleanly."""\n'
+        "def test_import():\n"
+        "    import server\n"
+        '    assert hasattr(server, "mcp")\n'
+    )
+
+    os.makedirs(mcp_dir, exist_ok=True)
+    os.makedirs(os.path.join(mcp_dir, "tests"), exist_ok=True)
+    files = {
+        "server.py": server_code if server_code.endswith("\n") else server_code + "\n",
+        "config.yaml": config_yaml,
+        "requirements.txt": requirements,
+        "Dockerfile": dockerfile,
+        "tests/__init__.py": "",
+        "tests/test_server.py": test_py,
+    }
+    if config_vars:
+        lines = [f"# Environment configuration for {display}", ""]
+        for c in config_vars:
+            env = c.get("env") if isinstance(c, dict) else str(c)
+            if not env:
+                continue
+            note = []
+            if isinstance(c, dict):
+                if c.get("required"):
+                    note.append("required")
+                if c.get("secret"):
+                    note.append("secret")
+                if c.get("description"):
+                    note.append(c["description"])
+            if note:
+                lines.append(f"# {' · '.join(note)}")
+            default = c.get("default", "") if isinstance(c, dict) else ""
+            lines.append(f"{env}={default}")
+            lines.append("")
+        files[".env.example"] = "\n".join(lines).rstrip("\n") + "\n"
+    for name, content in files.items():
+        with open(os.path.join(mcp_dir, name), "w") as f:
+            f.write(content)
+    return mcp_dir
 
 
 def _mcps_init(args):
@@ -2313,8 +3587,38 @@ def _mcps_push(args):
         print(f"\033[31merro: mcps/{mcp_id}/ não encontrado.\033[0m")
         sys.exit(2)
 
+    # Reject the one unsafe combination: a private MCP with no auth would be
+    # both unreachable through the platform's authorized gateway path AND,
+    # were that gate ever bypassed, unprotected. --auth none is only
+    # meaningful for a public MCP (explicitly authless by design, e.g. to add
+    # as a zero-friction custom connector).
+    visibility = getattr(args, "visibility", None) or "private"
+    auth = getattr(args, "auth", None) or "api-key"
+    if visibility == "private" and auth == "none":
+        print("\033[31merro: --auth none só é válido com --visibility public "
+              "(um MCP private sem auth não faz sentido: ele não seria "
+              "descobrível mesmo assim, e se fosse, estaria desprotegido).\033[0m")
+        sys.exit(2)
+
     client = HeadLabsClient()
     cfg = load_config()
+
+    # 0. Register the MCP as a platform asset if it isn't one yet (idempotent:
+    # skipped when it already exists, since create_mcp is NOT safe to re-call
+    # — see HeadLabsClient.create_mcp). Without this, /source and /deploy would
+    # version code and provision a runtime for an id that `mcps list` (which
+    # filters on kind="mcp") would never surface — a real regression this
+    # closes: MCPs could be built+deployed and still be invisible.
+    display_name = getattr(args, "display_name", None) or mcp_id.replace("-", " ").title()
+    description = getattr(args, "description", None) or ""
+    try:
+        client.request("GET", f"/mcps/{mcp_id}")
+    except Exception:
+        try:
+            client.create_mcp(mcp_id, display_name, description, framework="container")
+            print(f"\033[32m  ✓ MCP registrado na plataforma: {mcp_id}\033[0m")
+        except Exception as exc:
+            print(f"\033[33m  (registro do MCP: {str(exc)[:100]})\033[0m")
 
     # 1. Collect + upload source (versioned)
     files = {}
@@ -2369,13 +3673,43 @@ def _mcps_push(args):
     try:
         resp = client.request("POST", f"/mcps/{mcp_id}/deploy",
                               json={"image_tag": mcp_id}, timeout=30)
+        runtime_id = resp.get("runtime_id", "")
         print(f"\033[32m✓ MCP deployado: {mcp_id}\033[0m" +
-              (f" (runtime: {resp.get('runtime_id','')})" if resp.get("runtime_id") else ""))
+              (f" (runtime: {runtime_id})" if runtime_id else ""))
     except Exception as exc:
         # If deploy endpoint doesn't exist yet, inform
         print(f"\033[33m  Deploy endpoint pendente: {str(exc)[:80]}\033[0m")
         print(f"\033[2m  A imagem está no ECR. O EventBridge pode triggar o deploy automaticamente.\033[0m")
+        runtime_id = ""
 
+    # 4. Publish (opt-in, matches the platform's agent-visibility governance:
+    # default private, explicit publish only). The platform's own /publish
+    # gate requires an active runtime_id — mirror that check here so we never
+    # ask to publish something with no live runtime behind it.
+    visibility = getattr(args, "visibility", None) or "private"
+    auth = getattr(args, "auth", None) or "api-key"
+    if visibility == "public":
+        if not runtime_id:
+            print(f"\033[33m  ⚠ Não publicado: sem runtime_id confirmado ainda "
+                  f"(a plataforma exige um runtime ativo). Rode novamente ou "
+                  f"publique manualmente depois: headlabs mcps publish {mcp_id}\033[0m")
+        else:
+            try:
+                client.publish_mcp(mcp_id)
+                print(f"\033[32m✓ MCP publicado (visibility=public): {mcp_id}\033[0m")
+                if auth == "none":
+                    print(f"\033[2m  Authless — qualquer cliente MCP pode conectar sem "
+                          f"credencial (ex.: como custom connector no Claude).\033[0m")
+                else:
+                    print(f"\033[2m  Descoberto publicamente, mas o consumo ainda exige "
+                          f"uma API key HeadLabs (Basic auth via ~/.headlabs/config.json).\033[0m")
+            except Exception as exc:
+                print(f"\033[31m  ✗ Falha ao publicar: {str(exc)[:120]}\033[0m")
+    else:
+        print(f"\033[2m  MCP privado (default) — descoberta/consumo restritos ao seu "
+              f"tenant, autenticados pela sua API key HeadLabs "
+              f"(~/.headlabs/config.json). Publique com: "
+              f"headlabs mcps publish {mcp_id}\033[0m")
 
 def _mcps_dev(args):
     """Run MCP locally via Docker on localhost:<port>."""
@@ -2856,6 +4190,7 @@ def main():
     # agents create — no flags launches the agentic creation wizard
     p_ac = p_agents_sub.add_parser("create", help="Create an agent (inline or interactive)")
     p_ac.add_argument("intent", nargs="?", help="What you want (inline, one-shot creation)")
+    p_ac.add_argument("--spec", help="Path to a spec file; the architect interprets it and creates the agent non-interactively")
     p_ac.add_argument("--id", help="Agent ID (lowercase, hyphens). Omit for the guided wizard.")
     p_ac.add_argument("--name", help="Display name (defaults to id)")
     p_ac.add_argument("--prompt", help="System prompt (inline)")
@@ -2953,10 +4288,40 @@ def main():
     pm_init.add_argument("--description", help="What this MCP does")
     pm_init.set_defaults(func=cmd_mcps, mcps_cmd="init")
 
+    pm_create = p_mcps_sub.add_parser("create", help="Create an MCP from a spec file (architect-designed)")
+    pm_create.add_argument("--spec", required=True, help="Path to the MCP specification file")
+    pm_create.add_argument("--id", help="Force the MCP id (else derived from the spec)")
+    pm_create.add_argument("--profile", help="AWS profile for ECR auth (deploy step)")
+    pm_create.add_argument("-m", "--message", help="Version commit message")
+    pm_create.add_argument("--tenant", help="Tenant ID for the architect session")
+    pm_create.add_argument("--no-deploy", dest="no_deploy", action="store_true",
+                           help="Scaffold locally only; skip build/deploy to HeadLabs")
+    pm_create.add_argument("--visibility", choices=["private", "public"], default="private",
+                           help="private (default, safe): only your tenant can discover/call it. "
+                                "public: auto-published after a successful deploy (requires an "
+                                "active runtime — matches the platform's own /publish gate)")
+    pm_create.add_argument("--auth", choices=["api-key", "none"], default="api-key",
+                           help="Consumption auth for the MCP endpoint itself. api-key (default): "
+                                "consumers authenticate with a HeadLabs API key (Basic auth via "
+                                "~/.headlabs/config.json), required for private MCPs. none: "
+                                "authless — only valid combined with --visibility public (a private "
+                                "MCP with no auth would be unreachable AND unprotected, so this "
+                                "combination is rejected)")
+    pm_create.add_argument("--wait", action="store_true", help="Block until deploy completes")
+    pm_create.set_defaults(func=cmd_mcps, mcps_cmd="create")
+
     pm_push = p_mcps_sub.add_parser("push", help="Push local MCP to platform (version + deploy)")
     pm_push.add_argument("mcp_id", help="MCP ID (must exist in ./mcps/<id>/)")
     pm_push.add_argument("--profile", help="AWS profile for ECR auth")
     pm_push.add_argument("-m", "--message", help="Version commit message")
+    pm_push.add_argument("--display-name", dest="display_name",
+                         help="Display name if the MCP needs to be registered (default: id title-cased)")
+    pm_push.add_argument("--description", help="Description if the MCP needs to be registered")
+    pm_push.add_argument("--visibility", choices=["private", "public"], default="private",
+                         help="private (default, safe) or public (auto-published after a "
+                              "successful deploy with an active runtime)")
+    pm_push.add_argument("--auth", choices=["api-key", "none"], default="api-key",
+                         help="Consumption auth for the MCP endpoint (see `mcps create --help`)")
     pm_push.add_argument("--wait", action="store_true", help="Block until deploy completes")
     pm_push.set_defaults(func=cmd_mcps, mcps_cmd="push")
 
@@ -2974,6 +4339,21 @@ def main():
     pm_conn.add_argument("mcp_id", help="MCP ID to connect")
     pm_conn.add_argument("--token", help="API token/key (prompted if omitted)")
     pm_conn.set_defaults(func=cmd_mcps, mcps_cmd="connect")
+
+    pm_pub = p_mcps_sub.add_parser("publish", help="Publish an MCP (visibility=public; requires an active runtime)")
+    pm_pub.add_argument("mcp_id", help="MCP ID to publish")
+    pm_pub.set_defaults(func=cmd_mcps, mcps_cmd="publish")
+
+    pm_unpub = p_mcps_sub.add_parser("unpublish", help="Unpublish an MCP (visibility=private; instant kill-switch)")
+    pm_unpub.add_argument("mcp_id", help="MCP ID to unpublish")
+    pm_unpub.set_defaults(func=cmd_mcps, mcps_cmd="unpublish")
+
+    pm_delete = p_mcps_sub.add_parser("delete", aliases=["rm"], help="Delete an MCP from the platform (irreversible)")
+    pm_delete.add_argument("mcp_id", help="MCP ID to delete")
+    pm_delete.add_argument("--local", action="store_true",
+                           help="No-op (kept for backward compat) — local ./mcps/<id>/ is always removed if present")
+    pm_delete.add_argument("--yes", "-y", action="store_true", help="Skip the confirmation prompt")
+    pm_delete.set_defaults(func=cmd_mcps, mcps_cmd="delete")
 
     pm_test = p_mcps_sub.add_parser("test", help="Test an MCP: connect, discover tools, validate schemas")
     pm_test.add_argument("mcp_id", help="MCP ID to test")
@@ -3145,6 +4525,13 @@ def main():
     lbl.add_argument("lab", help="Lab id or name")
     _add_common(lbl)
     lbl.set_defaults(func=labsctl.cmd_labs, labs_cmd="backlog")
+
+    lfix = labs_sub.add_parser("fix", help="Trigger a targeted remediation from the lab's OPEN backlog (no re-inspection)")
+    lfix.add_argument("lab", help="Lab id or name")
+    lfix.add_argument("-i", "--intent", help="Additional context for the remediation")
+    lfix.add_argument("--loop", help="Specific loop id to remediate (default: the build the backlog items came from)")
+    _add_common(lfix, watch=True, wait=True, tenant=True)
+    lfix.set_defaults(func=labsctl.cmd_labs, labs_cmd="fix")
 
     linsp = labs_sub.add_parser("inspect", help="Run QA/specialist inspection on the lab's product")
     linsp.add_argument("lab", help="Lab id or name")
