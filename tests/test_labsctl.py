@@ -373,3 +373,63 @@ def test_loops_iterate_posts_iteration(fake):
     m, p, b = fake.calls[-1]
     assert (m, p) == ("POST", "/loops/loop_1/iterate")
     assert b == {"intent": "trocar para Redis no rate limit"}
+
+
+# ── _labs_rebuild: must not require a terminal loop ─────────────────────────
+#
+# Root cause: `headlabs labs rebuild` refused with "nenhum build concluído
+# neste lab para rebuildar" for a lab where every loop had ended up
+# cancelled/superseded/awaiting_approval — none complete or failed. The
+# rebuild API only needs lab_id + intent (present on ANY loop regardless of
+# status), so the CLI's terminal-only filter was an unnecessary dead end.
+
+def test_rebuild_falls_back_to_most_recent_loop_when_none_terminal(monkeypatch):
+    def router(method, path, body):
+        if path == "/labs-v2":
+            return [{"lab_id": "lab_1", "name": "x"}]
+        if path == "/labs-v2/lab_1/lineage":
+            return [
+                {"loop_id": "loop_old", "status": "superseded", "started_at": "2026-01-01T00:00:00"},
+                {"loop_id": "loop_new", "status": "cancelled", "started_at": "2026-01-02T00:00:00"},
+            ]
+        if path == "/loops/loop_new/rebuild":
+            return {"loop_id": "loop_rebuilt", "resources_destroyed": 2}
+        raise AssertionError(f"unexpected call: {method} {path}")
+    client = FakeClient(router)
+    monkeypatch.setattr(L, "HeadLabsClient", lambda *a, **k: client)
+    L._labs_rebuild(mkargs(intent="recrie tudo", lab="lab_1", auto_approve=True))
+    rebuild_calls = [c for c in client.calls if c[1] == "/loops/loop_new/rebuild"]
+    assert len(rebuild_calls) == 1, "must call rebuild on the most recent loop when none are terminal"
+
+
+def test_rebuild_prefers_terminal_loop_when_available(monkeypatch):
+    def router(method, path, body):
+        if path == "/labs-v2":
+            return [{"lab_id": "lab_1", "name": "x"}]
+        if path == "/labs-v2/lab_1/lineage":
+            return [
+                {"loop_id": "loop_complete", "status": "complete", "started_at": "2026-01-01T00:00:00"},
+                {"loop_id": "loop_cancelled", "status": "cancelled", "started_at": "2026-01-02T00:00:00"},
+            ]
+        if path == "/loops/loop_complete/rebuild":
+            return {"loop_id": "loop_rebuilt", "resources_destroyed": 2}
+        raise AssertionError(f"unexpected call: {method} {path}")
+    client = FakeClient(router)
+    monkeypatch.setattr(L, "HeadLabsClient", lambda *a, **k: client)
+    L._labs_rebuild(mkargs(intent="recrie tudo", lab="lab_1", auto_approve=True))
+    rebuild_calls = [c for c in client.calls if c[1] == "/loops/loop_complete/rebuild"]
+    assert len(rebuild_calls) == 1, "must prefer the terminal loop as intent source when one exists"
+
+
+def test_rebuild_dies_when_lab_has_no_loops_at_all(monkeypatch):
+    def router(method, path, body):
+        if path == "/labs-v2":
+            return [{"lab_id": "lab_1", "name": "x"}]
+        if path == "/labs-v2/lab_1/lineage":
+            return []
+        raise AssertionError(f"unexpected call: {method} {path}")
+    client = FakeClient(router)
+    monkeypatch.setattr(L, "HeadLabsClient", lambda *a, **k: client)
+    with pytest.raises(SystemExit) as ei:
+        L._labs_rebuild(mkargs(intent="recrie tudo", lab="lab_1", auto_approve=True))
+    assert ei.value.code == L.EXIT_USAGE

@@ -464,10 +464,16 @@ def _labs_rebuild(args):
     lid = lab["lab_id"]
     loops = client.request("GET", f"/labs-v2/{lid}/lineage") or []
     loops = sorted(loops, key=lambda l: l.get("started_at") or "")
+    if not loops:
+        _die("nenhum loop encontrado neste lab para rebuildar", EXIT_USAGE)
+    # Prefer the most recent terminal (complete/failed) loop as the intent
+    # source, but fall back to the most recent loop overall (cancelled,
+    # superseded, awaiting_approval, etc.) — the rebuild endpoint only reads
+    # lab_id + intent off it, both of which exist regardless of how the loop
+    # ended. Requiring a terminal loop meant a lab where every attempt got
+    # cancelled or superseded could never be rebuilt again.
     terminal = [l for l in loops if str(l.get("status", "")).lower() in ("complete", "failed")]
-    if not terminal:
-        _die("nenhum build concluído neste lab para rebuildar", EXIT_USAGE)
-    loop_id = terminal[-1]["loop_id"]
+    loop_id = terminal[-1]["loop_id"] if terminal else loops[-1]["loop_id"]
     print(_c(f"⚠  rebuild vai DESTRUIR todos os recursos do lab {lid} e reconstruir do zero.", "yellow"))
     res = client.request("POST", f"/loops/{loop_id}/rebuild",
                          json={"instruction": args.intent,
