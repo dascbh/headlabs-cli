@@ -433,3 +433,86 @@ def test_rebuild_dies_when_lab_has_no_loops_at_all(monkeypatch):
     with pytest.raises(SystemExit) as ei:
         L._labs_rebuild(mkargs(intent="recrie tudo", lab="lab_1", auto_approve=True))
     assert ei.value.code == L.EXIT_USAGE
+
+
+# ── _follow: "partial" must be recognized as terminal ───────────────────────
+#
+# Root cause observed live (loop_9122b3da23b0): the loop finished on the
+# backend with status="partial" (a deliverer ground-truth guard rejected the
+# build, e.g. missing entrypoint or forbidden frontend endpoint — see
+# api/routers/loops.py's deliverer callback) at 01:40 UTC, but `headlabs loops
+# watch` kept polling for ~14 hours because "partial" was never in _TERMINAL —
+# only complete/failed/cancelled were recognized. The user eventually gave up
+# and hit Ctrl+C, which _follow's KeyboardInterrupt handler then mislabeled as
+# "Cancelado", even though the loop had reached a real terminal state on the
+# backend over 13 hours earlier.
+
+def test_follow_recognizes_partial_as_terminal_immediately(monkeypatch):
+    calls = {"n": 0}
+
+    def router(method, path, body):
+        if path == "/loops/loop_x":
+            calls["n"] += 1
+            return {"status": "partial", "phase": "done", "mode": "build"}
+        return {}
+    client = FakeClient(router)
+    sleeps = []
+    monkeypatch.setattr(L.time, "sleep", lambda s: sleeps.append(s))
+    printed = []
+    monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+    with pytest.raises(SystemExit) as ei:
+        L._follow(client, "loop_x", watch=False, args=mkargs())
+    assert ei.value.code == L.EXIT_OK
+    assert sleeps == [], "must recognize partial as terminal on the FIRST poll, not keep polling forever"
+    assert calls["n"] == 1
+
+
+def test_follow_does_not_poll_forever_on_partial(monkeypatch):
+    # Regression guard for the exact 14h-hang: even if partial were somehow
+    # missed on the first poll, it must never poll indefinitely — simulate a
+    # long-but-finite sequence and confirm _follow terminates well within it.
+    statuses = ["executing"] * 5 + ["partial"]
+    state = {"i": 0}
+
+    def router(method, path, body):
+        if path == "/loops/loop_x":
+            idx = min(state["i"], len(statuses) - 1)
+            state["i"] += 1
+            return {"status": statuses[idx], "phase": "executor", "mode": "build"}
+        return {}
+    client = FakeClient(router)
+    sleeps = []
+    monkeypatch.setattr(L.time, "sleep", lambda s: sleeps.append(s))
+    with pytest.raises(SystemExit) as ei:
+        L._follow(client, "loop_x", watch=False, args=mkargs())
+    assert ei.value.code == L.EXIT_OK
+    assert state["i"] == 6, "must have stopped right after the partial status appeared"
+
+
+def test_follow_partial_prints_warning_not_generic_success(monkeypatch):
+    def router(method, path, body):
+        if path == "/loops/loop_x":
+            return {"status": "partial", "phase": "done", "mode": "build"}
+        return {}
+    client = FakeClient(router)
+    monkeypatch.setattr(L.time, "sleep", lambda s: None)
+    printed = []
+    monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+    with pytest.raises(SystemExit):
+        L._follow(client, "loop_x", watch=False, args=mkargs())
+    assert any("PARCIALMENTE" in p for p in printed), \
+        "user must be told the build only partially passed its guards, not just 'succeeded'"
+
+
+def test_follow_still_recognizes_complete_and_failed_and_cancelled(monkeypatch):
+    for status, expect_code in (("complete", L.EXIT_OK), ("failed", L.EXIT_FAILED), ("cancelled", L.EXIT_OK)):
+        def router(method, path, body, _status=status):
+            if path == "/loops/loop_x":
+                return {"status": _status, "phase": "done", "mode": "build"}
+            return {}
+        client = FakeClient(router)
+        monkeypatch.setattr(L.time, "sleep", lambda s: None)
+        with pytest.raises(SystemExit) as ei:
+            L._follow(client, "loop_x", watch=False, args=mkargs())
+        assert ei.value.code == expect_code, f"status={status} should yield code={expect_code}, got {ei.value.code}"
+

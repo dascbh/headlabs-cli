@@ -29,7 +29,19 @@ EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_REJECTED, EXIT_TIMEOUT = 0, 1, 2, 4, 8
 _TERMINAL_OK = {"complete", "completed", "succeeded", "done"}
 _TERMINAL_FAIL = {"failed", "error", "dlq", "timed_out"}
 _TERMINAL_CANCEL = {"cancelled", "canceled"}
-_TERMINAL = _TERMINAL_OK | _TERMINAL_FAIL | _TERMINAL_CANCEL
+# "partial" is a genuine terminal status the backend assigns when the
+# deliverer's ground-truth guards (entrypoint missing, frontend has no real
+# content, frontend calls a forbidden non-public endpoint, etc.) reject an
+# otherwise-finished build — see api/routers/loops.py's deliverer callback.
+# Root cause this closes: `headlabs loops watch` never recognized "partial" as
+# terminal, so it polled forever (14h observed live on loop_9122b3da23b0,
+# which actually finished in ~1h30) until the user gave up and hit Ctrl+C —
+# which _follow's KeyboardInterrupt handler then mislabeled as "Cancelado",
+# even though the loop had already reached a real terminal state on the
+# backend long before. Treated as a (non-crash) failure outcome: the build
+# produced SOMETHING but didn't fully pass its own guards.
+_TERMINAL_PARTIAL = {"partial"}
+_TERMINAL = _TERMINAL_OK | _TERMINAL_FAIL | _TERMINAL_CANCEL | _TERMINAL_PARTIAL
 
 _LOOP_PHASES = ["orchestrator", "researcher", "architect", "planner",
                 "executor", "validator", "deliverer"]
@@ -410,7 +422,7 @@ def _labs_fix(args):
                 lab_loops = client.request("GET", f"/loops?lab_id={lab_id}")
             except Exception:
                 lab_loops = []
-            builds = [l for l in lab_loops if l.get("status") in ("complete", "failed")]
+            builds = [l for l in lab_loops if l.get("status") in ("complete", "failed", "partial")]
             if not builds:
                 _die(f"Nenhum loop concluído encontrado no lab {lab_id}. Use --loop <id>.", EXIT_USAGE)
             builds.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
@@ -472,7 +484,7 @@ def _labs_rebuild(args):
     # lab_id + intent off it, both of which exist regardless of how the loop
     # ended. Requiring a terminal loop meant a lab where every attempt got
     # cancelled or superseded could never be rebuilt again.
-    terminal = [l for l in loops if str(l.get("status", "")).lower() in ("complete", "failed")]
+    terminal = [l for l in loops if str(l.get("status", "")).lower() in ("complete", "failed", "partial")]
     loop_id = terminal[-1]["loop_id"] if terminal else loops[-1]["loop_id"]
     print(_c(f"⚠  rebuild vai DESTRUIR todos os recursos do lab {lid} e reconstruir do zero.", "yellow"))
     res = client.request("POST", f"/loops/{loop_id}/rebuild",
@@ -746,9 +758,9 @@ def cmd_inspect(args):
             lab_loops = []
         # Prefer non-research builds; accept failed (still has resources to inspect)
         builds = [l for l in lab_loops if l.get("mode") != "research"
-                  and l.get("status") in ("complete", "failed", "validating", "delivering")]
+                  and l.get("status") in ("complete", "failed", "partial", "validating", "delivering")]
         if not builds:
-            builds = [l for l in lab_loops if l.get("status") in ("complete", "failed")]
+            builds = [l for l in lab_loops if l.get("status") in ("complete", "failed", "partial")]
         if not builds:
             builds = lab_loops  # last resort: any loop in this lab
         if not builds:
@@ -1235,8 +1247,18 @@ def _follow(client: HeadLabsClient, job_id: str, *, watch: bool, args=None, mode
                          f"aprove: headlabs loops approve {job_id}", "yellow"))
                 return EXIT_OK
             if status in _TERMINAL:
-                norm = "succeeded" if status in _TERMINAL_OK else ("cancelled" if status in _TERMINAL_CANCEL else "failed")
+                if status in _TERMINAL_OK:
+                    norm = "succeeded"
+                elif status in _TERMINAL_CANCEL:
+                    norm = "cancelled"
+                elif status in _TERMINAL_PARTIAL:
+                    norm = "partial"
+                else:
+                    norm = "failed"
                 reporter.finish(norm)
+                if norm == "partial":
+                    print(_c("⚠  Build concluído PARCIALMENTE — um ou mais guards de qualidade "
+                             f"rejeitaram o resultado (veja: headlabs status {job_id}).", "yellow"))
                 if norm == "succeeded" and (mode == "research" or loop.get("mode") == "research"):
                     # findings land a beat after status flips to complete — wait for them
                     loop = _await_findings(client, job_id, loop)
