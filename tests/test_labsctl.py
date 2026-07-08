@@ -593,3 +593,50 @@ def test_outputs_falls_back_to_most_recent_when_nothing_terminal(monkeypatch):
     calls = [c for c in client.calls if c[1] == "/loops/loop_older"]
     assert calls == []
     assert any("in-progress-fn" in p for p in printed)
+
+
+# ── cmd_inspect: storage resources must be classified site-vs-data ──────────
+#
+# Root cause observed live (lab_b869141c494e): a data/export bucket
+# (storage:export-files) was counted as a "Site" and passed to the inspector
+# as a browsable http_get target, alongside genuine frontend storages
+# (storage:icp-discovery-portal). `labs outputs` already distinguishes
+# sites from data buckets by name pattern (raw-/artifact/export/snapshot/
+# backup/cache/log) — cmd_inspect never applied the same classification,
+# inflating the "Sites" count and pointing the inspector at a bucket that
+# was never meant to serve HTML.
+
+def test_cmd_inspect_excludes_data_buckets_from_site_count(monkeypatch):
+    def router(method, path, body):
+        if path == "/labs-v2":
+            return [{"lab_id": "lab_x", "name": "x"}]
+        if path.startswith("/loops?lab_id="):
+            return [{"loop_id": "loop_x", "status": "complete", "mode": "build",
+                     "updated_at": "2026-01-01T00:00:00Z"}]
+        if path == "/loops/loop_x":
+            return {"loop_id": "loop_x", "intent": "test",
+                    "resources_created": ["storage:icp-discovery-portal", "storage:export-files",
+                                          "storage:company-documents", "function:x"],
+                    "architecture": {}}
+        if path == "/agents/loop-inspector/invoke":
+            return {"exec_id": "exec_x"}
+        if path.startswith("/executions/exec_x"):
+            return {"status": "succeeded", "output": '{"status": "pass", "issues": []}'}
+        return {}
+    client = FakeClient(router)
+    monkeypatch.setattr(L, "HeadLabsClient", lambda *a, **k: client)
+    printed = []
+    monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+    L.cmd_inspect(mkargs(lab="lab_x", role="qa", watch=False, wait=False))
+    summary_line = next(p for p in printed if "Recursos:" in p)
+    assert "Sites: 2" in summary_line, \
+        f"export-files is a data bucket, must not be counted as a site: {summary_line}"
+
+    # Verify the inspector body itself excludes the data bucket from site_urls too.
+    invoke_calls = [c for c in client.calls if c[1] == "/agents/loop-inspector/invoke"]
+    assert len(invoke_calls) == 1
+    site_urls = invoke_calls[0][2]["input"]["site_urls"]
+    assert "https://export-files.apps.headlabs.ai/" not in site_urls
+    assert "https://icp-discovery-portal.apps.headlabs.ai/" in site_urls
+    assert "https://company-documents.apps.headlabs.ai/" in site_urls
+

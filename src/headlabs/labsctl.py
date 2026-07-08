@@ -797,8 +797,15 @@ def cmd_inspect(args):
     api_base = f"https://api.headlabs.ai/api/v1/apps/{lab_id}"
     fn_endpoints = [f"{api_base}/functions/{r.replace('function:', '')}"
                     for r in resources if r.startswith("function:")]
-    site_urls = [f"https://{r.replace('storage:', '')}.apps.headlabs.ai/"
-                 for r in resources if r.startswith("storage:")]
+    # Same site-vs-data storage classification as `labs outputs` (labsctl.py) —
+    # a data/export bucket (raw-*, *-artifacts, *-exports, *-snapshots, etc.)
+    # is not a browsable site and was previously counted/inspected as one,
+    # inflating the "Sites" count and pointing the inspector's http_get at a
+    # bucket that was never meant to serve HTML.
+    _DATA_STORAGE_PATTERNS = ("raw-", "artifact", "export", "snapshot", "backup", "cache", "log")
+    storage_names = [r.replace("storage:", "") for r in resources if r.startswith("storage:")]
+    site_names = [nm for nm in storage_names if not any(p in nm.lower() for p in _DATA_STORAGE_PATTERNS)]
+    site_urls = [f"https://{nm}.apps.headlabs.ai/" for nm in site_names]
 
     print(f"  {_c('⚙', 'cyan')} Inspecionando lab {_c(lab_id, 'bold')} (loop {loop_id})")
     print(f"    Role: {_c(role, 'bold')} | Recursos: {len(resources)} | Sites: {len(site_urls)} | Functions: {len(fn_endpoints)}")
