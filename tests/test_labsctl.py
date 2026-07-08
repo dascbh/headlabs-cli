@@ -618,6 +618,15 @@ def test_cmd_inspect_excludes_data_buckets_from_site_count(monkeypatch):
                     "resources_created": ["storage:icp-discovery-portal", "storage:export-files",
                                           "storage:company-documents", "function:x"],
                     "architecture": {}}
+        if path == "/storage/icp-discovery-portal/files":
+            return [{"key": "index.html", "size": 100}, {"key": "app.js", "size": 50}]
+        if path == "/storage/company-documents/files":
+            # A genuine data-only storage: never had a frontend, confirmed
+            # live (403 AccessDenied forever, correctly — no index.html key
+            # for CloudFront+OAC to serve). Its name matches none of the
+            # DATA_STORAGE_PATTERNS, so only the ground-truth file check
+            # (not the name heuristic) catches this.
+            return [{"key": "test.json", "size": 14}]
         if path == "/agents/loop-inspector/invoke":
             return {"exec_id": "exec_x"}
         if path.startswith("/executions/exec_x"):
@@ -629,14 +638,17 @@ def test_cmd_inspect_excludes_data_buckets_from_site_count(monkeypatch):
     monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
     L.cmd_inspect(mkargs(lab="lab_x", role="qa", watch=False, wait=False))
     summary_line = next(p for p in printed if "Recursos:" in p)
-    assert "Sites: 2" in summary_line, \
-        f"export-files is a data bucket, must not be counted as a site: {summary_line}"
+    assert "Sites: 1" in summary_line, \
+        f"only icp-discovery-portal has a real index.html: {summary_line}"
 
-    # Verify the inspector body itself excludes the data bucket from site_urls too.
+    # Verify the inspector body itself excludes both the data bucket AND the
+    # frontend-less storage from site_urls too.
     invoke_calls = [c for c in client.calls if c[1] == "/agents/loop-inspector/invoke"]
     assert len(invoke_calls) == 1
     site_urls = invoke_calls[0][2]["input"]["site_urls"]
     assert "https://export-files.apps.headlabs.ai/" not in site_urls
+    assert "https://company-documents.apps.headlabs.ai/" not in site_urls, \
+        "company-documents never had an index.html — ground truth must exclude it even though its name isn't a data pattern"
     assert "https://icp-discovery-portal.apps.headlabs.ai/" in site_urls
-    assert "https://company-documents.apps.headlabs.ai/" in site_urls
+
 

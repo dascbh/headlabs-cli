@@ -804,8 +804,23 @@ def cmd_inspect(args):
     # bucket that was never meant to serve HTML.
     _DATA_STORAGE_PATTERNS = ("raw-", "artifact", "export", "snapshot", "backup", "cache", "log")
     storage_names = [r.replace("storage:", "") for r in resources if r.startswith("storage:")]
-    site_names = [nm for nm in storage_names if not any(p in nm.lower() for p in _DATA_STORAGE_PATTERNS)]
+    name_filtered = [nm for nm in storage_names if not any(p in nm.lower() for p in _DATA_STORAGE_PATTERNS)]
+    # Second pass: name doesn't catch every case (a data storage can have any
+    # name — e.g. 'company-documents' matched none of the DATA patterns above
+    # but genuinely never had an index.html, confirmed live: 403 AccessDenied
+    # forever, correctly, since CloudFront+OAC has no key to serve). Ground
+    # truth beats naming heuristics — check for a real index.html via the
+    # storage's own file listing before calling it a "site".
+    site_names = []
+    for nm in name_filtered:
+        try:
+            files = client.request("GET", f"/storage/{nm}/files") or []
+            if any(f.get("key") == "index.html" for f in files):
+                site_names.append(nm)
+        except Exception:  # noqa: BLE001 — best-effort; if we can't check, don't inflate the site count
+            pass
     site_urls = [f"https://{nm}.apps.headlabs.ai/" for nm in site_names]
+
 
     print(f"  {_c('⚙', 'cyan')} Inspecionando lab {_c(lab_id, 'bold')} (loop {loop_id})")
     print(f"    Role: {_c(role, 'bold')} | Recursos: {len(resources)} | Sites: {len(site_urls)} | Functions: {len(fn_endpoints)}")
