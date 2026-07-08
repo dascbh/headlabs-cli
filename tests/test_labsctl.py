@@ -516,3 +516,80 @@ def test_follow_still_recognizes_complete_and_failed_and_cancelled(monkeypatch):
             L._follow(client, "loop_x", watch=False, args=mkargs())
         assert ei.value.code == expect_code, f"status={status} should yield code={expect_code}, got {ei.value.code}"
 
+
+
+# ── _labs_outputs: source resources from the MOST RECENT terminal build ────
+#
+# Root cause observed live (lab_b869141c494e): `labs outputs` aggregated
+# resources_created from the ENTIRE lineage, including superseded/cancelled
+# loops whose resources had already been destroyed by a later rebuild's
+# teardown. This produced ghost duplicates (e.g. 'discovery-orchestrator'
+# from one rebuild attempt AND 'discovery_orchestrator' from a later one,
+# never coexisting in the same real build) and 4 of 6 "sites" reported as
+# "(indisponível)" — not a real availability problem, just stale
+# bookkeeping from resources that no longer physically exist.
+
+def test_outputs_uses_only_most_recent_complete_loop(monkeypatch):
+    def router(method, path, body):
+        if path == "/labs-v2":
+            return [{"lab_id": "lab_1", "name": "x"}]
+        if path == "/labs-v2/lab_1/lineage":
+            return [
+                {"loop_id": "loop_old", "status": "cancelled", "started_at": "2026-07-01T00:00:00"},
+                {"loop_id": "loop_new", "status": "complete", "started_at": "2026-07-08T00:00:00"},
+            ]
+        if path == "/loops/loop_new":
+            return {"resources_created": ["function:new-fn"]}
+        raise AssertionError(f"unexpected call: {method} {path}")
+    client = FakeClient(router)
+    client.api_url = "https://api.headlabs.ai/api/v1"
+    monkeypatch.setattr(L, "HeadLabsClient", lambda *a, **k: client)
+    printed = []
+    monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+    L._labs_outputs(mkargs(lab="lab_1", output="table"))
+    calls = [c for c in client.calls if c[1] == "/loops/loop_old"]
+    assert calls == [], "must never fetch the old superseded loop's resources"
+    assert any("new-fn" in p for p in printed)
+
+
+def test_outputs_prefers_partial_over_no_terminal(monkeypatch):
+    def router(method, path, body):
+        if path == "/labs-v2":
+            return [{"lab_id": "lab_1", "name": "x"}]
+        if path == "/labs-v2/lab_1/lineage":
+            return [
+                {"loop_id": "loop_a", "status": "partial", "started_at": "2026-07-08T00:00:00"},
+            ]
+        if path == "/loops/loop_a":
+            return {"resources_created": ["function:partial-fn"]}
+        raise AssertionError(f"unexpected call: {method} {path}")
+    client = FakeClient(router)
+    client.api_url = "https://api.headlabs.ai/api/v1"
+    monkeypatch.setattr(L, "HeadLabsClient", lambda *a, **k: client)
+    printed = []
+    monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+    L._labs_outputs(mkargs(lab="lab_1", output="table"))
+    assert any("partial-fn" in p for p in printed)
+
+
+def test_outputs_falls_back_to_most_recent_when_nothing_terminal(monkeypatch):
+    def router(method, path, body):
+        if path == "/labs-v2":
+            return [{"lab_id": "lab_1", "name": "x"}]
+        if path == "/labs-v2/lab_1/lineage":
+            return [
+                {"loop_id": "loop_older", "status": "executing", "started_at": "2026-07-01T00:00:00"},
+                {"loop_id": "loop_newest", "status": "executing", "started_at": "2026-07-08T00:00:00"},
+            ]
+        if path == "/loops/loop_newest":
+            return {"resources_created": ["function:in-progress-fn"]}
+        raise AssertionError(f"unexpected call: {method} {path}")
+    client = FakeClient(router)
+    client.api_url = "https://api.headlabs.ai/api/v1"
+    monkeypatch.setattr(L, "HeadLabsClient", lambda *a, **k: client)
+    printed = []
+    monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+    L._labs_outputs(mkargs(lab="lab_1", output="table"))
+    calls = [c for c in client.calls if c[1] == "/loops/loop_older"]
+    assert calls == []
+    assert any("in-progress-fn" in p for p in printed)

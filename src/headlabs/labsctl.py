@@ -308,16 +308,35 @@ def _resource_endpoint(client: HeadLabsClient, base: str, kind: str, name: str) 
 
 
 def _labs_outputs(args):
-    """Outputs: published sites (browser URLs), API endpoints, and files — grouped."""
+    """Outputs: published sites (browser URLs), API endpoints, and files —
+    grouped. Sources resources from the MOST RECENT terminal build only (not
+    the entire lineage) — a `labs rebuild` destroys everything and starts
+    fresh, so resources_created from earlier loops (superseded/cancelled)
+    describe resources that no longer physically exist. Root cause this
+    closes: aggregating the whole lineage produced ghost duplicates (e.g.
+    'discovery-orchestrator' from one rebuild attempt AND
+    'discovery_orchestrator' from a later one, neither ever coexisting in
+    the same real build) and endpoints marked '(indisponível)' for resources
+    that were correctly destroyed by a prior rebuild's teardown — not a real
+    availability problem, just stale bookkeeping from a loop that no longer
+    represents the lab's actual current state."""
     client = HeadLabsClient()
     lab = _resolve_lab(client, args.lab)
     lid = lab["lab_id"]
     base = client.api_url.rstrip("/")
     loops = client.request("GET", f"/labs-v2/{lid}/lineage") or []
+    terminal = [l for l in loops if str(l.get("status", "")).lower() in ("complete", "partial")]
+    terminal.sort(key=lambda x: x.get("started_at", ""))
+    current = [terminal[-1]] if terminal else []
+    if not current and loops:
+        # No successful build yet — fall back to the most recent loop overall
+        # so users mid-build still see partial progress instead of nothing.
+        loops_sorted = sorted(loops, key=lambda x: x.get("started_at", ""))
+        current = [loops_sorted[-1]]
     seen: set = set()
     sites, apis = [], []
     file_count = 0
-    for lp in loops:
+    for lp in current:
         loop = client.request("GET", f"/loops/{lp.get('loop_id')}") or {}
         for r in (loop.get("resources_created") or []):
             if ":" not in r or r in seen:
