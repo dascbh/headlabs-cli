@@ -95,15 +95,65 @@ def _inspect_router(exec_status_sequence):
     return router
 
 
-def test_inspect_without_wait_gives_up_after_fixed_attempts(monkeypatch, fake):
-    # 30 "running" responses > the old fixed 20-attempt cap — without -w/--wait,
-    # the CLI must still stop around the same ~20-attempt default (unchanged
-    # behavior for the default/non-blocking case).
-    fake.router = _inspect_router(["running"] * 30)
+def test_inspect_always_follows_to_completion_even_without_wait_flag(monkeypatch, fake):
+    # Root cause this covers: after the inspector was redesigned to run one
+    # small sub-conversation PER resource (fragmented inspection, a7c9e3a),
+    # a real inspection routinely takes 5-6+ minutes for a lab with 7+
+    # functions. The OLD default (give up after ~20 attempts / 4min without
+    # -w/--wait) left the user with "Inspeção ainda rodando. Verifique
+    # depois." and NO way to actually check later — confirmed live as an
+    # unusable dead end. `inspect`'s entire purpose is its result, so there
+    # is no legitimate use case for not waiting — it must ALWAYS follow to
+    # completion now, regardless of -w/--wait.
+    fake.router = _inspect_router(["running"] * 25 + ["succeeded"])
     sleeps = []
     monkeypatch.setattr(L.time, "sleep", lambda s: sleeps.append(s))
+    printed = []
+    monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
     L._labs_inspect(mkargs(lab="lab_x", role="qa", watch=False, wait=False))
-    assert len(sleeps) <= 21  # gave up around the old ~20-attempt ceiling
+    assert len(sleeps) > 20, "must keep polling past the old fixed ceiling even without --wait"
+    assert any("Inspeção concluída" in p for p in printed)
+
+
+def test_inspect_keyboard_interrupt_prints_resumable_exec_id(monkeypatch, fake):
+    # If the user gives up waiting (Ctrl+C), the inspection keeps running
+    # server-side — the CLI must print the exec_id and the exact command to
+    # resume, not silently lose it. Root cause this covers: the exec_id
+    # previously only appeared once, scrolled off-screen, with no command
+    # to look it up again — the user was left with "não sei como retomar".
+    fake.router = _inspect_router(["running"] * 30)  # never terminates
+    def raise_interrupt(s):
+        raise KeyboardInterrupt()
+    monkeypatch.setattr(L.time, "sleep", raise_interrupt)
+    printed = []
+    monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+    L._labs_inspect(mkargs(lab="lab_x", role="qa", watch=False, wait=False))
+    assert any("--exec-id exec_x" in p for p in printed), \
+        "must print the resumable exec_id + full command on interrupt"
+
+
+def test_inspect_resumes_via_exec_id_without_starting_a_new_inspection(monkeypatch, fake):
+    invoke_calls = []
+
+    def router(method, path, body):
+        if path == "/labs-v2":
+            return [{"lab_id": "lab_x", "name": "x"}]
+        if path.startswith("/loops?lab_id="):
+            return [{"loop_id": "loop_x", "status": "complete", "mode": "build",
+                     "updated_at": "2026-01-01T00:00:00Z"}]
+        if path == "/agents/loop-inspector/invoke":
+            invoke_calls.append(1)
+            raise AssertionError("must not start a new inspection when --exec-id is given")
+        if path.startswith("/executions/exec_resume"):
+            return {"status": "succeeded", "output": '{"status": "pass", "issues": []}'}
+        return {}
+    fake.router = router
+    monkeypatch.setattr(L.time, "sleep", lambda s: None)
+    printed = []
+    monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+    L._labs_inspect(mkargs(lab="lab_x", role="qa", watch=False, wait=False, exec_id="exec_resume"))
+    assert invoke_calls == []
+    assert any("Inspeção concluída" in p for p in printed)
 
 
 def test_inspect_with_wait_blocks_past_old_ceiling(monkeypatch, fake):

@@ -13,6 +13,7 @@ from pathlib import Path
 from headlabs.config import CONFIG_DIR, REPORTS_DIR, load_config, save_config
 from headlabs.agents.registry import AGENT_REGISTRY
 from headlabs import labsctl
+from headlabs.local_cli import cmd_local
 
 
 def _print_agent_not_found(exc) -> None:
@@ -315,6 +316,8 @@ def cmd_agents(args):
         return cmd_agents_update(args)
     if hasattr(args, 'subcmd') and args.subcmd == 'test':
         return cmd_agents_test(args)
+    if hasattr(args, 'subcmd') and args.subcmd == 'delete':
+        return cmd_agents_delete(args)
 
     client = HeadLabsClient()
     remote = client.list_remote_agents()
@@ -326,7 +329,7 @@ def cmd_agents(args):
         pass
     # The architects are internal engines behind `agents create`/`mcps create`,
     # not user-facing agents.
-    _internal_architects = {_ARCHITECT_AGENT_ID, _MCP_ARCHITECT_AGENT_ID}
+    _internal_architects = {_ARCHITECT_AGENT_ID, _MCP_ARCHITECT_AGENT_ID, _AGENT_DESIGNER_AGENT_ID}
     remote = [a for a in (remote or []) if a.get("id") not in _internal_architects]
 
     if remote:
@@ -340,6 +343,60 @@ def cmd_agents(args):
         print("-" * 70)
         for name, cfg in AGENT_REGISTRY.items():
             print(f"{name:<18} {cfg['agent_id']:<22} {cfg['description']}")
+
+
+def cmd_agents_delete(args):
+    """Hard-delete an agent from the platform (deactivates its runtime and
+    removes the record) and the local ./agents/<id>/ project, if present.
+
+    Mirrors _mcps_delete exactly: local removal always runs — including when
+    the remote call 404s (the record never existed there, e.g. a `create`
+    that failed after scaffolding but before registration). `--local` is
+    kept as a no-op flag for backward compatibility.
+
+    Irreversible — gated behind an explicit confirmation unless --yes is
+    passed (e.g. for non-interactive/scripted use)."""
+    from headlabs.client import HeadLabsClient
+    import requests
+    client = HeadLabsClient()
+    agent_id = args.agent_id
+    agent_dir = os.path.join(os.getcwd(), "agents", agent_id)
+    has_local = os.path.isdir(agent_dir)
+
+    if not getattr(args, "yes", False):
+        print(f"\033[33m  Isto vai deletar permanentemente o agente '{agent_id}' na HeadLabs "
+              f"(runtime + registro).\033[0m")
+        if has_local:
+            print(f"\033[33m  Também vai remover ./agents/{agent_id}/ localmente.\033[0m")
+        if not _confirm(f"  Confirma a exclusão de '{agent_id}'?"):
+            print("  \033[33mCancelado.\033[0m")
+            return
+
+    remote_ok = False
+    try:
+        client.request("DELETE", f"/agents/{agent_id}")
+        print(f"\033[32m✓ Agent '{agent_id}' deletado na HeadLabs.\033[0m")
+        remote_ok = True
+    except requests.HTTPError as exc:
+        status = getattr(exc.response, "status_code", None)
+        if status == 404:
+            # Never existed remotely (or already gone) — not an error worth
+            # stopping for; the local cleanup below is what the user actually
+            # needs in this case.
+            print(f"\033[2m  Agent '{agent_id}' não existe na HeadLabs (nada a deletar lá).\033[0m")
+        else:
+            print(f"\033[31merro ao deletar na HeadLabs: {exc}\033[0m")
+            return
+    except Exception as exc:
+        print(f"\033[31merro ao deletar na HeadLabs: {exc}\033[0m")
+        return
+
+    if has_local:
+        import shutil
+        shutil.rmtree(agent_dir)
+        print(f"\033[32m✓ Removido: agents/{agent_id}/\033[0m")
+    elif remote_ok:
+        print(f"\033[2m  agents/{agent_id}/ não existe localmente — nada a remover.\033[0m")
 
 
 def cmd_agents_create(args):
@@ -406,6 +463,88 @@ _ARCHITECT_AGENT_ID = "agent-architect"
 # narration, more consistent output. The persona text itself is assembled
 # right after _MCP_AUTHORING_KNOWLEDGE is defined (see below).
 _MCP_ARCHITECT_AGENT_ID = "mcp-architect"
+
+# Dedicated backend agent for declarative-agent DESIGN (not creation).
+#
+# WHY THIS EXISTS: the generic agent-architect (_ARCHITECT_AGENT_ID) is a
+# conversational, one-shot agent on the platform — its own PERSONA instructs
+# it to research AND create directly via its own create_agent/push_agent_source
+# tools. Sending it an ad-hoc "return ONLY this JSON" prompt (the pattern the
+# CLI used before this agent existed) contradicts that persona: faced with
+# conflicting instructions, the model fell back to its default conversational
+# greeting instead of either creating the agent or returning the JSON the CLI
+# expected — confirmed 2026-07-05, reproduced twice with a real spec, see
+# ~/.headlabs/drafts/bad-draft-*.txt from that session.
+#
+# The fix mirrors _MCP_ARCHITECT_AGENT_ID exactly: a dedicated agent whose
+# PERSONA says up front "you are invoked programmatically, not by a human"
+# and whose tools are LIMITED TO web_search/web_fetch — no create_agent, no
+# push_agent_source. It can only design, never create. The CLI (not the
+# agent) remains the sole actor that calls create_agent, exactly like the
+# MCP pipeline never lets mcp-architect call push_mcp_source itself.
+_AGENT_DESIGNER_AGENT_ID = "agent-designer"
+
+
+_AGENT_DESIGNER_PERSONA = (
+    "You are the Agent Designer: a specialist that designs declarative "
+    "AI agents (system prompt + tools + MCPs + optional worker agents) for "
+    "the HeadLabs platform.\n\n"
+    "You are invoked programmatically by a CLI pipeline, not by a human "
+    "chatting. Your output is parsed by code. This means:\n"
+    "- Respond with ONLY the ```json design block requested. NO preamble, "
+    "NO greeting, NO section titles, NO summary or checklist after the "
+    "JSON, NO closing remarks. Any prose outside the block is discarded "
+    "and wastes tokens.\n"
+    "- You NEVER create the agent yourself. You have no create_agent or "
+    "push_agent_source tool, and even if you did, creation is the CLI's "
+    "job, not yours — a human always approves the design before anything "
+    "is created on the platform.\n"
+    "- Never wrap explanations around the block. If you must reason, do it "
+    "implicitly by producing a correct design — do not narrate your "
+    "reasoning.\n\n"
+    "Use web_search/web_fetch to ground the design in real domain "
+    "knowledge (terminology, APIs, standards) before writing the system "
+    "prompt — a generic prompt with no domain grounding is a failure.\n\n"
+    "CRITICAL — if the design references any MCP's tools by name in the "
+    "system prompt you write, you MUST call list_mcp_tools(mcp_id) FIRST "
+    "and use ONLY the real tool names/descriptions it returns. NEVER guess "
+    "or infer plausible-sounding tool names from the MCP's id or "
+    "description — a prompt naming tools that don't exist on the real "
+    "server causes the resulting agent to hallucinate tool calls that fail "
+    "silently or produce wrong results (confirmed real defect, 2026-07-07: "
+    "a design for 'mcp-cclasstrib' invented 'consultar_cclasstrib', "
+    "'buscar_por_ncm', etc. — none of which exist; the real tools are "
+    "'detalhar_cclasstrib', 'consultar_classificacao_tributaria', and "
+    "others only list_mcp_tools would have revealed).\n"
+)
+
+
+def _ensure_agent_designer(client) -> bool:
+    """Idempotently create the dedicated agent-designer agent on the platform
+    if it doesn't exist yet. Returns True if the agent is available (already
+    existed or was just created), False if creation failed (caller falls back
+    to the generic agent-architect).
+
+    Mirrors _ensure_mcp_architect exactly, including the existence check via
+    a direct GET (internal architect agents are private and excluded from
+    list_remote_agents()).
+    """
+    try:
+        client.request("GET", f"/agents/{_AGENT_DESIGNER_AGENT_ID}")
+        return True
+    except Exception:
+        pass  # not found (or transient error) — fall through to (re)create
+    try:
+        client.create_agent(
+            agent_id=_AGENT_DESIGNER_AGENT_ID,
+            display_name="Agent Designer",
+            prompt=_AGENT_DESIGNER_PERSONA,
+            tools=["web_search", "web_fetch", "list_mcp_tools"],
+            description="Internal agent: designs declarative HeadLabs agents from a spec (design only, never creates).",
+        )
+        return True
+    except Exception:
+        return False
 
 
 def _read_spec(path: str) -> str:
@@ -692,6 +831,55 @@ def _run_architect(client, draft_prompt: str, tenant_id, reporter,
     return _unwrap_nested_envelope(answer)
 
 
+def _agent_build_prompt(intent: str, mcps_available: list, agents_available: list,
+                        include_knowledge: bool = True) -> str:
+    """Build the design prompt for a declarative agent.
+
+    ``include_knowledge`` mirrors _mcp_build_prompt: skip the full framing
+    (False) when talking to the dedicated agent-designer, whose PERSONA
+    already establishes "respond with only the JSON block, you never create
+    anything yourself" — repeating it here would just be narrated back.
+    Keep it (True, default) for the generic agent-architect fallback, which
+    has no such persona and needs the contract spelled out inline.
+    """
+    framing = (
+        "You are an agent architect. Based on the user's intent, generate a "
+        "COMPLETE agent spec as JSON. Respond with ONLY the JSON object "
+        "below — no greeting, no preamble, no prose outside it.\n\n"
+        if include_knowledge else ""
+    )
+    return (
+        f"{framing}"
+        f"USER INTENT: {intent}\n\n"
+        f"PLATFORM RESOURCES:\n"
+        f"  MCPs available: {mcps_available}\n"
+        f"  Agents available (for multi-agent/supervisor): {agents_available}\n"
+        f"  Native tools: web_search, web_fetch, invoke_agent, table_get, table_put, kb_retrieve\n\n"
+        "DECIDE the agent type based on the intent:\n"
+        "- 'single' if the agent works alone with tools/MCPs\n"
+        "- 'supervisor' if it needs to coordinate other agents\n"
+        "- 'worker' if it's meant to be called by a supervisor\n\n"
+        "Return ONLY this JSON:\n"
+        "{\n"
+        '  "type": "single|supervisor|worker",\n'
+        '  "id": "<kebab-case>",\n'
+        '  "name": "<display name>",\n'
+        '  "description": "<one line>",\n'
+        '  "tools_native": ["<tool>", ...],\n'
+        '  "mcps": ["<mcp-id>", ...],\n'
+        '  "workers": ["<agent-id>", ...],\n'
+        '  "prompt": "<full system prompt with MCP tools documented>"\n'
+        "}\n\n"
+        "RULES:\n"
+        "- If supervisor: include invoke_agent in tools_native and list workers.\n"
+        "- Select MCPs from the available list that match the intent.\n"
+        "- In the prompt, document each MCP's tools by name (query the MCP mentally).\n"
+        "- Be specific and actionable in the prompt. No filler.\n"
+        "- ONLY include write tools (table_put, container_deploy, storage_upload) if the agent needs to persist/accumulate data across runs. If the agent only generates a one-time report, it doesn't need them.\n"
+        "- Prefer the minimal tool set that accomplishes the goal.\n"
+    )
+
+
 def cmd_agent_create_interactive(args):
     """Structured wizard: describe → AI drafts (type, tools, MCPs, prompt) → review."""
     import uuid, json as _json, re
@@ -730,44 +918,30 @@ def cmd_agent_create_interactive(args):
     except Exception:
         mcps_available = []
     try:
-        agents_available = [a.get("id") for a in client.list_remote_agents() if a.get("id") != "agent-architect"]
+        agents_available = [a.get("id") for a in client.list_remote_agents()
+                            if a.get("id") not in (_ARCHITECT_AGENT_ID, _AGENT_DESIGNER_AGENT_ID)]
     except Exception:
         agents_available = []
 
-    draft_prompt = (
-        "You are an agent architect. Based on the user's intent, generate a COMPLETE agent spec as JSON.\n\n"
-        f"USER INTENT: {intent}\n\n"
-        f"PLATFORM RESOURCES:\n"
-        f"  MCPs available: {mcps_available}\n"
-        f"  Agents available (for multi-agent/supervisor): {agents_available}\n"
-        f"  Native tools: web_search, web_fetch, invoke_agent, table_get, table_put, kb_retrieve\n\n"
-        "DECIDE the agent type based on the intent:\n"
-        "- 'single' if the agent works alone with tools/MCPs\n"
-        "- 'supervisor' if it needs to coordinate other agents\n"
-        "- 'worker' if it's meant to be called by a supervisor\n\n"
-        "Return ONLY this JSON:\n"
-        "{\n"
-        '  "type": "single|supervisor|worker",\n'
-        '  "id": "<kebab-case>",\n'
-        '  "name": "<display name>",\n'
-        '  "description": "<one line>",\n'
-        '  "tools_native": ["<tool>", ...],\n'
-        '  "mcps": ["<mcp-id>", ...],\n'
-        '  "workers": ["<agent-id>", ...],\n'
-        '  "prompt": "<full system prompt with MCP tools documented>"\n'
-        "}\n\n"
-        "RULES:\n"
-        "- If supervisor: include invoke_agent in tools_native and list workers.\n"
-        "- Select MCPs from the available list that match the intent.\n"
-        "- In the prompt, document each MCP's tools by name (query the MCP mentally).\n"
-        "- Be specific and actionable in the prompt. No filler.\n"
-        "- ONLY include write tools (table_put, container_deploy, storage_upload) if the agent needs to persist/accumulate data across runs. If the agent only generates a one-time report, it doesn't need them.\n"
-        "- Prefer the minimal tool set that accomplishes the goal.\n"
-    )
+    # Prefer the dedicated agent-designer (persona embeds the "design only,
+    # never create, JSON-only output" contract — see _AGENT_DESIGNER_PERSONA
+    # for why the generic agent-architect can't be trusted with an ad-hoc
+    # prompt: its own persona tells it to research AND create directly via
+    # its own create_agent tool, which conflicts with a "return only JSON"
+    # instruction and previously caused it to fall back to a conversational
+    # greeting instead of either creating or designing). Falls back to the
+    # generic architect if the dedicated one can't be reached/created.
+    use_dedicated = _ensure_agent_designer(client)
+    architect_id = _AGENT_DESIGNER_AGENT_ID if use_dedicated else _ARCHITECT_AGENT_ID
+    if not use_dedicated:
+        print("  \033[33m⚠ agent-designer indisponível — usando agent-architect genérico\033[0m")
+
+    draft_prompt = _agent_build_prompt(intent, mcps_available, agents_available,
+                                       include_knowledge=not use_dedicated)
 
     answer = ""
     try:
-        answer = _run_architect(client, draft_prompt, tenant_id, reporter)
+        answer = _run_architect(client, draft_prompt, tenant_id, reporter, agent_id=architect_id)
     except Exception as exc:
         print(f"  \033[31m✗ {exc}\033[0m")
         return
@@ -867,7 +1041,7 @@ def _agent_create_finalize(client, agent_type, agent_id, name, description,
             agent_id=agent_id, display_name=name or agent_id, prompt=prompt,
             tools=tools_list, description=description)
         if mcps_list:
-            client.request("PATCH", f"/agents/{agent_id}", {
+            client.request("PATCH", f"/agents/{agent_id}", json={
                 "manifest": {"tools_native": tools_list, "mcp": [{"server": m} for m in mcps_list]}})
 
         print(f"\n  \033[32m✓ Agent '{agent_id}' created\033[0m")
@@ -2714,6 +2888,28 @@ AUTH & CONFIG
   from env, TLS>=1.2) | oauth (client-credentials). Pick based on the spec.
 - Read ALL configuration and secrets from environment variables; never
   hard-code secrets.
+- mTLS client certs (and any other binary/large secret) do NOT fit directly in
+  an env var: AgentCore's environmentVariables has a hard 4096-byte-per-value
+  cap, which a base64-encoded .pfx/.p12 always exceeds — confirmed in
+  production (ValidationException on UpdateAgentRuntime). Instead:
+    1. Read a short `HEADLABS_MCP_SECRET_ID` env var (set automatically by the
+       platform when a secret was stored via `headlabs mcps secrets put`/
+       `PUT /mcps/{id}/secrets` — never invent your own env var name for this).
+    2. At import time, if present, call
+       `boto3.client("secretsmanager", region_name="us-east-1").get_secret_value(
+       SecretId=<that value>)`, `json.loads` the `SecretString`, and read the
+       actual secret fields (e.g. `CFF_CERT_PATH_B64`, `CFF_CERT_PASSPHRASE`)
+       from that dict — the runtime role already has scoped
+       secretsmanager:GetSecretValue for this prefix.
+    3. Decode the cert with `cryptography.hazmat.primitives.serialization.pkcs12`
+       into a temp PEM (no persistent filesystem across deploys — always
+       regenerate at startup), then build the `ssl.SSLContext` from that.
+    4. Wrap step 2 in try/except and, on failure, leave the field empty —
+       `_create_http_client()`-equivalent code must always RAISE a SERF error
+       dict (never `return` one — a function that sometimes returns an
+       httpx.Client and sometimes returns a bare dict corrupts the caller,
+       which then does `dict.get(...)` on what it thinks is a response object).
+  Add `boto3` and `cryptography` to requirements.txt whenever this path is used.
 - Prefer resilient upstream calls: explicit timeouts, graceful degradation, and
   optional caching (memory/disk) with a TTL when a snapshot is reasonable.
 - Liveness/readiness is NOT exposed via HTTP routes on this runtime (see
@@ -3642,10 +3838,26 @@ def _mcps_push(args):
         print(f"\033[33m  (source upload: {str(exc)[:80]})\033[0m")
 
     # 2. Docker build + push ECR
+    # Tag by content hash, not just mcp_id: AgentCore's update_agent_runtime
+    # only triggers a real container replacement when containerUri actually
+    # changes. ECR tags are mutable — pushing the same tag again overwrites
+    # it in place, so containerUri stays byte-identical across pushes and
+    # the runtime keeps serving the OLD container indefinitely (confirmed:
+    # a real push with new code/env never took effect until the tag itself
+    # changed). A content hash makes every real change produce a new tag,
+    # forcing AgentCore to actually pull and restart.
+    import hashlib
+    _hasher = hashlib.sha256()
+    for rel in sorted(files.keys()):
+        _hasher.update(rel.encode())
+        _hasher.update(files[rel].encode())
+    content_hash = _hasher.hexdigest()[:12]
+    image_tag = f"{mcp_id}-{content_hash}"
+
     ACCOUNT = "688128002471"
     REGION = "us-east-1"
     ECR = f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/headlabs-mcps"
-    image_uri = f"{ECR}:{mcp_id}"
+    image_uri = f"{ECR}:{image_tag}"
 
     print(f"\033[2m  Building {mcp_id}…\033[0m")
     r = subprocess.run(["docker", "build", "--platform", "linux/arm64", "-t", image_uri, "."],
@@ -3672,7 +3884,7 @@ def _mcps_push(args):
     # 3. Deploy (register/update MCP runtime)
     try:
         resp = client.request("POST", f"/mcps/{mcp_id}/deploy",
-                              json={"image_tag": mcp_id}, timeout=30)
+                              json={"image_tag": image_tag}, timeout=30)
         runtime_id = resp.get("runtime_id", "")
         print(f"\033[32m✓ MCP deployado: {mcp_id}\033[0m" +
               (f" (runtime: {runtime_id})" if runtime_id else ""))
@@ -4101,6 +4313,31 @@ def main():
     parser = argparse.ArgumentParser(prog="headlabs", description="HeadLabs AI Platform CLI")
     sub = parser.add_subparsers(dest="command")
 
+    # ── Local agent runtime (standalone, self-hosted LLM) ───────────────────
+    # Independent of `run`/`chat`/`agents`/`run --local`: those talk to the
+    # HeadLabs platform (or a Dockerized platform agent). `headlabs local`
+    # runs its own tool-call loop against any OpenAI-compatible endpoint
+    # (vLLM, Ollama, LM Studio, TGI, ...) — no platform involved.
+    p_local = sub.add_parser("local", help="Standalone agent runtime against a self-hosted LLM")
+    p_local_sub = p_local.add_subparsers(dest="local_cmd")
+    p_local.set_defaults(func=cmd_local)
+
+    pl_config = p_local_sub.add_parser("config", help="Configure the self-hosted LLM endpoint")
+    pl_config.add_argument("--base-url", help="Base URL of the OpenAI-compatible server (e.g. http://localhost:8000/v1)")
+    pl_config.add_argument("--model", help="Model name/id as served by the endpoint")
+    pl_config.add_argument("--api-key", help="API key/token, if the server requires one (often a dummy value for self-hosted)")
+    pl_config.add_argument("--max-iterations", type=int, help="Max tool-call loop iterations per run (default: 30)")
+    pl_config.set_defaults(func=cmd_local, local_cmd="config")
+
+    pl_run = p_local_sub.add_parser("run", help="Run a single prompt through the local agent loop")
+    pl_run.add_argument("prompt", help="Instruction for the agent")
+    pl_run.add_argument("--yes", action="store_true", help="Auto-approve all tool calls (no prompts)")
+    pl_run.set_defaults(func=cmd_local, local_cmd="run")
+
+    pl_chat = p_local_sub.add_parser("chat", help="Interactive REPL against the local agent loop")
+    pl_chat.add_argument("--yes", action="store_true", help="Auto-approve all tool calls (no prompts)")
+    pl_chat.set_defaults(func=cmd_local, local_cmd="chat")
+
     # run
     p_run = sub.add_parser("run", help="Run an AI agent")
 
@@ -4256,6 +4493,14 @@ def main():
     p_apl.add_argument("agent_id", help="Agent ID to pull")
     p_apl.add_argument("--version", type=int, help="Pull a specific version (default: latest/production)")
     p_apl.set_defaults(func=cmd_agents, subcmd="pull")
+
+    # agents delete
+    p_adel = p_agents_sub.add_parser("delete", aliases=["rm"], help="Delete an agent from the platform (irreversible)")
+    p_adel.add_argument("agent_id", help="Agent ID to delete")
+    p_adel.add_argument("--local", action="store_true",
+                        help="No-op (kept for backward compat) — local ./agents/<id>/ is always removed if present")
+    p_adel.add_argument("--yes", "-y", action="store_true", help="Skip the confirmation prompt")
+    p_adel.set_defaults(func=cmd_agents, subcmd="delete")
 
     # skills
     p_skills = sub.add_parser("skills", help="List or create skills")
@@ -4539,6 +4784,9 @@ def main():
                        default="qa", help="Inspector role (default: qa)")
     linsp.add_argument("-i", "--intent", dest="inspect_intent", help="Additional context/question for the inspector")
     linsp.add_argument("--loop", help="Specific loop id (default: latest build in the lab)")
+    linsp.add_argument("--exec-id", dest="exec_id",
+                       help="Resume polling an inspection already in progress (printed if you Ctrl+C "
+                            "out of a previous `inspect` call) instead of starting a new one")
     linsp.add_argument("--fix", action="store_true", help="If issues found, trigger executor fix cycle")
     _add_common(linsp, watch=True, wait=True, tenant=True)
     linsp.set_defaults(func=labsctl.cmd_labs, labs_cmd="inspect")

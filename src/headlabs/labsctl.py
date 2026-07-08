@@ -766,6 +766,28 @@ def cmd_inspect(args):
     client = HeadLabsClient()
     lab = _resolve_lab(client, args.lab)
     lab_id = lab["lab_id"]
+    role = getattr(args, "role", "qa")
+
+    # Resume an already-running inspection instead of starting a new one —
+    # see the KeyboardInterrupt handler below for why this exists: a
+    # fragmented inspection (commit a7c9e3a) routinely takes 5-6+ minutes,
+    # and interrupting the CLI's poll must not mean losing all access to the
+    # result once it's actually ready server-side.
+    resume_exec_id = getattr(args, "exec_id", None)
+    if resume_exec_id:
+        resume_loop_id = getattr(args, "loop", None)
+        if not resume_loop_id:
+            try:
+                lab_loops = client.request("GET", f"/loops?lab_id={lab_id}") or []
+                builds = [l for l in lab_loops if l.get("mode") != "research"]
+                builds.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+                resume_loop_id = builds[0]["loop_id"] if builds else ""
+            except Exception:
+                resume_loop_id = ""
+        print(f"  {_c('⚙', 'cyan')} Retomando inspeção do lab {_c(lab_id, 'bold')}")
+        print(f"    Execução: {resume_exec_id}")
+        print(_c("    Aguardando inspeção...", "dim"))
+        return _poll_inspection(client, args, lab_id, resume_loop_id, role, resume_exec_id)
 
     # Find the latest build loop in this lab (or use --loop)
     loop_id = getattr(args, "loop", None)
@@ -791,7 +813,6 @@ def cmd_inspect(args):
     loop = client.request("GET", f"/loops/{loop_id}")
     resources = loop.get("resources_created") or []
     architecture = loop.get("architecture") or {}
-    role = getattr(args, "role", "qa")
 
     # Derive endpoints
     api_base = f"https://api.headlabs.ai/api/v1/apps/{lab_id}"
@@ -846,43 +867,73 @@ def cmd_inspect(args):
     exec_id = resp.get("exec_id")
     print(f"    Execução: {exec_id}")
     print(_c("    Aguardando inspeção...", "dim"))
+    return _poll_inspection(client, args, lab_id, loop_id, role, exec_id)
 
+
+def _poll_inspection(client, args, lab_id: str, loop_id: str, role: str, exec_id: str):
+    """Poll an inspection execution to completion, render the result, persist
+    backlog items, and optionally trigger a fix cycle. Shared by cmd_inspect's
+    normal flow and its --exec-id resume path."""
     # Poll for result. -w/--watch and --wait both mean "block until terminal" —
     # previously this loop ALWAYS gave up after a fixed 240s regardless of these
     # flags (they were accepted by the arg parser but never read here), so any
     # inspection slower than 4min (labs with 20+ resources routinely are) silently
     # timed out even when the user explicitly asked to wait.
-    follow = bool(getattr(args, "watch", False) or getattr(args, "wait", False))
+    #
+    # Root cause of a second-order bug this closes: after the inspector was
+    # redesigned to run one small Strands sub-conversation PER resource
+    # (fragmented inspection, commit a7c9e3a — trading wall-clock time for
+    # reliability), a real inspection routinely takes 5-6+ minutes for a
+    # lab with 7+ functions. Without --wait/-w (which the user has no reason
+    # to know they need), the CLI gave up at ~4min and printed "Inspeção
+    # ainda rodando. Verifique depois." — but printed NO way to actually
+    # check later (the exec_id scrolls off-screen, and there was no command
+    # to look it up again). The user is left unable to resume or ever see
+    # the result. `inspect` now ALWAYS follows to completion by default —
+    # unlike `labs create`/`loops create` (long-running builds a CI script
+    # legitimately wants to fire-and-forget), an inspection's entire PURPOSE
+    # is its result, so there is no real use case for not waiting for it.
+    follow = True
     result, attempt = None, 0
-    while True:
-        time.sleep(12)
-        attempt += 1
-        try:
-            ex = client.request("GET", f"/executions/{exec_id}?tenant_id=platform")
-        except Exception:
-            if not follow and attempt >= 20:
+    try:
+        while True:
+            time.sleep(12)
+            attempt += 1
+            try:
+                ex = client.request("GET", f"/executions/{exec_id}?tenant_id=platform")
+            except Exception:
+                if not follow and attempt >= 20:
+                    break
+                continue
+            if ex.get("status") in ("succeeded", "partial", "failed"):
+                out = ex.get("output", "")
+                if isinstance(out, str) and "_s3" in out:
+                    import boto3
+                    ref = json.loads(out)["_s3"][5:]
+                    bkt, _, key = ref.partition("/")
+                    result = json.loads(boto3.client("s3", region_name="us-east-1")
+                                       .get_object(Bucket=bkt, Key=key)["Body"].read())
+                elif isinstance(out, str):
+                    try:
+                        result = json.loads(out)
+                    except Exception:
+                        result = {"summary": out}
+                elif isinstance(out, dict):
+                    result = out
                 break
-            continue
-        if ex.get("status") in ("succeeded", "partial", "failed"):
-            out = ex.get("output", "")
-            if isinstance(out, str) and "_s3" in out:
-                import boto3
-                ref = json.loads(out)["_s3"][5:]
-                bkt, _, key = ref.partition("/")
-                result = json.loads(boto3.client("s3", region_name="us-east-1")
-                                   .get_object(Bucket=bkt, Key=key)["Body"].read())
-            elif isinstance(out, str):
-                try:
-                    result = json.loads(out)
-                except Exception:
-                    result = {"summary": out}
-            elif isinstance(out, dict):
-                result = out
-            break
-        if not follow and attempt >= 20:
-            break  # default (no -w/--wait): give up after ~4min, as before
-        if follow and attempt % 5 == 0:
-            print(_c(f"    ⏳ Ainda inspecionando… ({attempt * 12}s, status={ex.get('status', '?')})", "dim"))
+            if not follow and attempt >= 20:
+                break  # default (no -w/--wait): give up after ~4min, as before
+            if follow and attempt % 5 == 0:
+                print(_c(f"    ⏳ Ainda inspecionando… ({attempt * 12}s, status={ex.get('status', '?')})", "dim"))
+    except KeyboardInterrupt:
+        # The inspector keeps running server-side — only the CLI's polling
+        # stopped. Print the exec_id so the user can actually resume instead
+        # of losing track of it (the root cause of the "não sei como
+        # retomar" complaint: the id scrolled off-screen with no command to
+        # look it up again).
+        print(_c(f"\n(inspeção continua rodando — verifique com: "
+                 f"headlabs labs inspect {lab_id} --role {role} --exec-id {exec_id})", "dim"))
+        return
 
     if not result:
         print(_c("    ⏳ Inspeção ainda rodando. Verifique depois.", "yellow"))
