@@ -67,6 +67,95 @@ def test_gates_auto_approve_zeros_all():
 # never read inside _labs_inspect, so any inspection slower than 4min silently
 # "timed out" even when the user explicitly asked to wait for it.
 
+def test_inspect_passes_plan_from_loop_to_inspector_body(monkeypatch, fake):
+    # Root cause this covers: confirmed live (lab_b869141c494e) that `labs
+    # inspect` built its own invoke body directly from GET /loops/{id} and
+    # never included `plan` — a separate code path from api/routers/
+    # loops.py's own inspector payload builder (used by the orchestrated
+    # loop-remediate flow), which DOES pass plan. Without it, the
+    # inspector's dependency-ordering (agents/loop-inspector/agent.py's
+    # _build_dependency_order) has nothing to chain function units against,
+    # so every function is tested standalone with invented ids that were
+    # never actually written anywhere — producing false "404 not found"
+    # findings even after the planner/inspector side of this fix was
+    # deployed.
+    captured_bodies = []
+
+    def router(method, path, body):
+        if path == "/labs-v2":
+            return [{"lab_id": "lab_x", "name": "x"}]
+        if path.startswith("/loops?lab_id="):
+            return [{"loop_id": "loop_x", "status": "complete", "mode": "build",
+                     "updated_at": "2026-01-01T00:00:00Z"}]
+        if path == "/loops/loop_x":
+            return {"loop_id": "loop_x", "intent": "test", "resources_created": [],
+                    "architecture": {},
+                    "plan": [{"step": 1, "action": "create_function",
+                             "params": {"name": "score-icp-match"},
+                             "contract": {"kind": "processor", "tables_read": ["companies"]}}]}
+        if path == "/agents/loop-inspector/invoke":
+            captured_bodies.append(body)
+            return {"exec_id": "exec_x"}
+        if path.startswith("/executions/exec_x"):
+            return {"status": "succeeded", "output": '{"status": "pass", "issues": []}'}
+        return {}
+    fake.router = router
+    monkeypatch.setattr(L.time, "sleep", lambda s: None)
+    L._labs_inspect(mkargs(lab="lab_x", role="qa", watch=False, wait=False))
+
+    assert len(captured_bodies) == 1
+    sent_plan = captured_bodies[0]["input"]["plan"]
+    assert sent_plan == [{"step": 1, "action": "create_function",
+                          "params": {"name": "score-icp-match"},
+                          "contract": {"kind": "processor", "tables_read": ["companies"]}}]
+
+
+def test_inspect_merges_accumulated_function_contracts_missing_from_current_plan(monkeypatch, fake):
+    # Root cause this covers: confirmed live (lab_b869141c494e,
+    # loop_72464acd81a3) that after a surgical remediation cycle, the
+    # loop's `plan` only had the 1-4 function steps THAT cycle re-emitted
+    # (e.g. score-icp-match) — NOT 'discover-companies', the producer that
+    # originally wrote the 'companies' table in an EARLIER cycle. Without
+    # merging in function_contracts (accumulated additively across all
+    # cycles server-side), the inspector's dependency graph could never
+    # find that producer, so every function reading 'companies' went back
+    # to being tested standalone with an invented company_id.
+    captured_bodies = []
+
+    def router(method, path, body):
+        if path == "/labs-v2":
+            return [{"lab_id": "lab_x", "name": "x"}]
+        if path.startswith("/loops?lab_id="):
+            return [{"loop_id": "loop_x", "status": "complete", "mode": "build",
+                     "updated_at": "2026-01-01T00:00:00Z"}]
+        if path == "/loops/loop_x":
+            return {
+                "loop_id": "loop_x", "intent": "test", "resources_created": [],
+                "architecture": {},
+                "plan": [{"action": "create_function", "params": {"name": "score-icp-match"},
+                         "contract": {"kind": "processor", "tables_read": ["companies"]}}],
+                "function_contracts": {
+                    "discover-companies": {"kind": "producer", "tables_written": ["companies"]},
+                    "score-icp-match": {"kind": "processor", "tables_read": ["stale_should_not_win"]},
+                },
+            }
+        if path == "/agents/loop-inspector/invoke":
+            captured_bodies.append(body)
+            return {"exec_id": "exec_x"}
+        if path.startswith("/executions/exec_x"):
+            return {"status": "succeeded", "output": '{"status": "pass", "issues": []}'}
+        return {}
+    fake.router = router
+    monkeypatch.setattr(L.time, "sleep", lambda s: None)
+    L._labs_inspect(mkargs(lab="lab_x", role="qa", watch=False, wait=False))
+
+    sent_plan = captured_bodies[0]["input"]["plan"]
+    by_name = {(s.get("params") or {}).get("name"): s["contract"] for s in sent_plan}
+    assert by_name["discover-companies"] == {"kind": "producer", "tables_written": ["companies"]}
+    # current plan's contract for score-icp-match must win over the stale accumulated one
+    assert by_name["score-icp-match"] == {"kind": "processor", "tables_read": ["companies"]}
+
+
 def _inspect_router(exec_status_sequence):
     """Router: /labs-v2 → one lab; /loops?lab_id=... → one build; /loops/{id} →
     that build's detail; POST /agents/loop-inspector/invoke → an exec_id; GET

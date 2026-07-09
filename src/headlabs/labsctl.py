@@ -478,6 +478,37 @@ def _labs_fix(args):
         return _follow(client, loop_id, watch=getattr(args, "watch", False), args=args)
 
 
+def _merge_plan_with_contracts(current_plan: list, function_contracts: dict) -> list:
+    """Combine the loop's current `plan` with `function_contracts`
+    accumulated across ALL prior planner cycles (api/routers/loops.py
+    writes this additively — see its "planner" phase branch) so the
+    inspector can build a full cross-function dependency graph, not just
+    one limited to whatever functions happen to be in the LATEST plan.
+
+    Root cause this closes: confirmed live (lab_b869141c494e) that after a
+    surgical remediation cycle, `loop["plan"]` only contains the 1-4
+    function steps that particular cycle re-emitted — e.g. score-icp-match,
+    save-icp-profile — and NOT 'discover-companies', the producer that
+    originally wrote the 'companies' table back in the very first planning
+    cycle. Without that producer's contract, the inspector's dependency
+    ordering has no tables_written to chain against, so every function
+    reading 'companies' goes right back to being tested standalone with an
+    invented company_id.
+
+    For any function present in both, the current plan's step wins (it's
+    the freshest contract) — function_contracts only fills in functions
+    the current plan doesn't mention at all."""
+    synthetic_steps = [{"action": "create_function", "params": {"name": fn_name}, "contract": contract}
+                       for fn_name, contract in (function_contracts or {}).items()]
+    current_fn_names = {
+        (step.get("params") or {}).get("name") for step in (current_plan or [])
+        if isinstance(step, dict) and step.get("action") == "create_function"
+    }
+    merged = list(current_plan or [])
+    merged.extend(s for s in synthetic_steps if s["params"]["name"] not in current_fn_names)
+    return merged
+
+
 def _labs_inspect(args):
     """Run QA/specialist inspection on the lab's product (wrapper for cmd_inspect)."""
     # Map the positional 'lab' to the --lab attribute expected by cmd_inspect
@@ -857,6 +888,44 @@ def cmd_inspect(args):
         "architecture": architecture,
         "site_urls": site_urls,
         "function_endpoints": fn_endpoints,
+        # Planner step contracts (tables_read/tables_written per function) —
+        # lets the inspector chain related functions (e.g. a producer that
+        # writes "companies" before a processor that reads "companies")
+        # instead of testing every function standalone with invented ids
+        # that were never actually written anywhere. Root cause this closes:
+        # confirmed live (lab_b869141c494e) that `labs inspect` built its
+        # own body here directly from GET /loops/{id} and never included
+        # `plan` — api/routers/loops.py's own inspector payload builder
+        # (_build_agent_payload, used by the orchestrated loop-remediate
+        # flow) already passes plan, but this CLI-driven direct-inspect
+        # path is a SEPARATE code path that had no equivalent, so the exact
+        # same "every function tested in isolation with a made-up id"
+        # false-positive kept happening for `labs inspect` even after the
+        # loop-inspector/loop-planner side of this fix was deployed.
+        # Planner step contracts (tables_read/tables_written per function) —
+        # lets the inspector chain related functions (e.g. a producer that
+        # writes "companies" before a processor that reads "companies")
+        # instead of testing every function standalone with invented ids
+        # that were never actually written anywhere. Root cause this closes:
+        # confirmed live (lab_b869141c494e) that `labs inspect` built its
+        # own body here directly from GET /loops/{id} and never included
+        # `plan` — api/routers/loops.py's own inspector payload builder
+        # (_build_agent_payload, used by the orchestrated loop-remediate
+        # flow) already passes plan, but this CLI-driven direct-inspect
+        # path is a SEPARATE code path that had no equivalent, so the exact
+        # same "every function tested in isolation with a made-up id"
+        # false-positive kept happening for `labs inspect` even after the
+        # loop-inspector/loop-planner side of this fix was deployed.
+        #
+        # Uses the MERGED plan (current plan + function_contracts
+        # accumulated across ALL prior planner cycles), not just the
+        # current plan — confirmed live that after a surgical remediation
+        # cycle, `loop["plan"]` only contains the 1-4 function steps THAT
+        # cycle re-emitted, silently losing every other function's contract
+        # from earlier cycles (e.g. the original producer that wrote a
+        # table another function now reads). function_contracts survives
+        # across cycles precisely because it's additive, never overwritten.
+        "plan": _merge_plan_with_contracts(loop.get("plan") or [], loop.get("function_contracts") or {}),
     }}
     # User context/question for the inspector
     user_intent = getattr(args, "inspect_intent", None)
