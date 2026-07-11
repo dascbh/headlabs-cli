@@ -201,3 +201,45 @@ não de código.
 
 Os manifests em `k8s/` (ver `k8s/README.md`) são um rascunho para essa
 transição futura — **não foram aplicados** em nenhum cluster.
+
+## 5. Inspector de projeto local (`headlabs local inspect`)
+
+Diferente do `headlabs labs inspect` (server-side, black-box, sobre recursos
+**já implantados** na plataforma — ver `docs/local-inspector.md` para o
+contraste completo), o `headlabs local inspect` é **client-side e white-box**:
+dirige o mesmo `QueryEngine` do runtime local com um prompt de inspector e um
+subconjunto **read-only** de tools (`read_file`/`glob`/`grep`/`web_fetch` +
+`bash` gated), inspecionando um diretório qualquer em disco. Requer um endpoint
+LLM configurado via `headlabs local config` (igual a `run`/`chat`).
+
+```bash
+headlabs local inspect .                       # inspeção QA do diretório atual
+headlabs local inspect ./app --role backend -i "foco em auth"
+headlabs local inspect ./app --role frontend --url http://localhost:5173
+headlabs local inspect . --skill sec-checklist # injeta uma skill da plataforma
+headlabs local inspect . --fix --yes           # aplica correções + loop de teste
+headlabs local backlog                         # ver .headlabs/local_backlog.json
+headlabs local fix                             # corrigir itens abertos do backlog
+```
+
+- **Roles** (`--role`): mesmos do `labs inspect`
+  (`qa/ux/security/architect/performance/devops/data/frontend/backend`). A
+  especialização é um prompt embarcado no CLI (`src/headlabs/local/inspector.py`),
+  não um agente remoto — por isso funciona 100% self-hosted.
+- **Achados estruturados**: o modelo registra cada issue via a tool
+  `report_finding` (schema pydantic validado pelo engine), persistida em
+  `.headlabs/local_backlog.json` — mesmo formato de item do backlog do
+  `labs inspect`. Há fallback tolerante que extrai findings do texto final se o
+  modelo não usar a tool.
+- **Front-end (`--url`)**: usa `browser_devtools` (navigate localhost →
+  screenshot → console logs → network requests); erros de console e requests
+  4xx/5xx viram findings. Requer Playwright/Chromium e aprovação (ou `--yes`).
+- **`--fix`**: habilita `edit_file` e reusa o loop `autofix` (edit→test→fix);
+  marca itens como `done` só se a suíte ficar verde.
+- **Skills (`--skill ID`)**: busca o conteúdo da skill na plataforma
+  (`GET /resources/skill/{id}`) e injeta no prompt — best-effort, funciona com
+  qualquer backend; falha graciosamente offline.
+- **`--provider platform`**: reservado; hoje indisponível (a plataforma não
+  expõe `/v1/chat/completions` para o loop). Para maior qualidade sem
+  self-hosting próprio, aponte `--provider self-hosted` para qualquer endpoint
+  OpenAI-compatible melhor.

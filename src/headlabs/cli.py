@@ -4338,6 +4338,27 @@ def main():
     pl_chat.add_argument("--yes", action="store_true", help="Auto-approve all tool calls (no prompts)")
     pl_chat.set_defaults(func=cmd_local, local_cmd="chat")
 
+    from headlabs.local.inspector import ROLE_CHOICES as _INSPECT_ROLES
+    pl_inspect = p_local_sub.add_parser("inspect", help="Inspect a local project directory (white-box QA)")
+    pl_inspect.add_argument("directory", nargs="?", default=".", help="Project directory to inspect (default: .)")
+    pl_inspect.add_argument("--role", default="qa", choices=_INSPECT_ROLES, help="Inspection specialist role (default: qa)")
+    pl_inspect.add_argument("-i", "--context", dest="inspect_context", help="Extra context/focus for the inspector")
+    pl_inspect.add_argument("--url", help="URL of the running front-end to inspect (e.g. http://localhost:5173)")
+    pl_inspect.add_argument("--skill", action="append", metavar="ID", help="Platform skill id to inject into the prompt (repeatable)")
+    pl_inspect.add_argument("--fix", action="store_true", help="Apply suggested fixes (enables edit_file + test loop)")
+    pl_inspect.add_argument("--provider", default="self-hosted", choices=["self-hosted", "platform"], help="LLM backend (platform not yet available)")
+    pl_inspect.add_argument("--yes", action="store_true", help="Auto-approve all tool calls (no prompts)")
+    pl_inspect.set_defaults(func=cmd_local, local_cmd="inspect")
+
+    pl_backlog = p_local_sub.add_parser("backlog", help="Show the local inspection backlog")
+    pl_backlog.add_argument("directory", nargs="?", default=".", help="Project directory (default: .)")
+    pl_backlog.set_defaults(func=cmd_local, local_cmd="backlog")
+
+    pl_lfix = p_local_sub.add_parser("fix", help="Apply fixes from the local inspection backlog")
+    pl_lfix.add_argument("directory", nargs="?", default=".", help="Project directory (default: .)")
+    pl_lfix.add_argument("--yes", action="store_true", help="Auto-approve all tool calls (no prompts)")
+    pl_lfix.set_defaults(func=cmd_local, local_cmd="fix")
+
     # run
     p_run = sub.add_parser("run", help="Run an AI agent")
 

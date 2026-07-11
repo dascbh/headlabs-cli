@@ -58,6 +58,12 @@ def cmd_local(args) -> None:
         _cmd_local_run(args)
     elif subcmd == "chat":
         _cmd_local_chat(args)
+    elif subcmd == "inspect":
+        _cmd_local_inspect(args)
+    elif subcmd == "backlog":
+        _cmd_local_backlog(args)
+    elif subcmd == "fix":
+        _cmd_local_fix(args)
     else:
         _cmd_local_status()
 
@@ -89,7 +95,7 @@ def _cmd_local_config(args) -> None:
     print(f"  model:    {cfg.model}")
 
 
-def _build_engine(args) -> QueryEngine:
+def _build_engine(args, *, tools=None, system_prompt=None, cwd=None) -> QueryEngine:
     cfg = load_local_config()
     if not cfg.is_configured():
         print("headlabs local is not configured. Run:")
@@ -97,15 +103,19 @@ def _build_engine(args) -> QueryEngine:
         sys.exit(2)
 
     provider = OpenAICompatibleProvider(cfg)
-    cwd = os.getcwd()
+    cwd = cwd or os.getcwd()
     mode = "auto" if getattr(args, "yes", False) else "default"
     permission_manager = PermissionManager(cwd, mode=mode)
+    kwargs = {}
+    if system_prompt is not None:
+        kwargs["system_prompt"] = system_prompt
     return QueryEngine(
         provider,
-        ALL_TOOLS,
+        tools if tools is not None else ALL_TOOLS,
         permission_manager,
         cwd=cwd,
         max_iterations=cfg.max_iterations,
+        **kwargs,
     )
 
 
@@ -120,6 +130,185 @@ def _cmd_local_run(args) -> None:
         sys.exit(1)
     finally:
         engine.provider.close()
+
+
+# ─── Inspect a local project ────────────────────────────────────────────────
+
+_SEV_COLOR = {"critical": "\033[31m", "high": "\033[31m",
+              "medium": "\033[33m", "low": "\033[2m"}
+
+
+def _inspect_tools(with_browser: bool):
+    """Read-only tool subset for the inspection pass (never edit_file)."""
+    from headlabs.local.tools import (
+        ReadFileTool, GlobTool, GrepTool, WebFetchTool, BashTool, ReportFindingTool,
+    )
+    tools = [ReadFileTool, GlobTool, GrepTool, WebFetchTool, BashTool, ReportFindingTool]
+    if with_browser:
+        from headlabs.local.tools import BrowserDevtoolsTool
+        tools.append(BrowserDevtoolsTool)
+    return tools
+
+
+def _fix_tools():
+    from headlabs.local.tools import (
+        ReadFileTool, GlobTool, GrepTool, EditFileTool, BashTool,
+    )
+    return [ReadFileTool, GlobTool, GrepTool, EditFileTool, BashTool]
+
+
+def _render_findings(items: list[dict], role: str) -> None:
+    print(f"\n\033[1mInspeção concluída\033[0m — role \033[1m{role}\033[0m")
+    if not items:
+        print("  Nenhum problema encontrado.\n")
+        return
+    print(f"  {len(items)} issue(s) registrada(s)\n")
+    print(f"  \033[1mIssues\033[0m ({len(items)})")
+    for it in items:
+        sev = it.get("severity", "medium")
+        color = _SEV_COLOR.get(sev, "\033[2m")
+        print(f"    {color}[{sev}]\033[0m {it.get('resource', '')} — {it.get('title', '')}")
+        if it.get("description"):
+            print(f"          {it['description']}")
+        if it.get("fix"):
+            print(f"          \033[2mfix: {it['fix']}\033[0m")
+    print()
+
+
+def _cmd_local_inspect(args) -> None:
+    from headlabs.local import backlog as backlog_mod
+    from headlabs.local.inspector import (
+        build_inspector_prompt, inspect_task_message, fetch_skills, parse_findings_fallback,
+    )
+
+    if getattr(args, "provider", "self-hosted") == "platform":
+        print("--provider platform ainda não está disponível: a plataforma HeadLabs")
+        print("não expõe um endpoint OpenAI-compatible (/v1/chat/completions) para o loop.")
+        print("Use --provider self-hosted (default) apontando `headlabs local config`")
+        print("para qualquer endpoint OpenAI-compatible.")
+        sys.exit(2)
+
+    directory = os.path.abspath(getattr(args, "directory", None) or ".")
+    if not os.path.isdir(directory):
+        print(f"Not a directory: {directory}")
+        sys.exit(2)
+
+    role = getattr(args, "role", "qa") or "qa"
+    context = getattr(args, "inspect_context", None)
+    url = getattr(args, "url", None)
+    skills = fetch_skills(getattr(args, "skill", None) or [])
+    prompt = build_inspector_prompt(role, context=context, url=url, skills=skills)
+
+    engine = _build_engine(args, tools=_inspect_tools(bool(url)),
+                           system_prompt=prompt, cwd=directory)
+
+    before_ids = {i.get("id") for i in backlog_mod.load_backlog(directory)}
+    final_text = ""
+    try:
+        final_text = engine.run(inspect_task_message(role, url), on_event=_render_event)
+    except ProviderError:
+        sys.exit(1)
+    finally:
+        engine.provider.close()
+
+    after = backlog_mod.load_backlog(directory)
+    new_items = [i for i in after if i.get("id") not in before_ids]
+    # Fallback: model described issues in prose/JSON instead of calling the tool.
+    if not new_items and final_text:
+        for f in parse_findings_fallback(final_text):
+            new_items.append(backlog_mod.add_finding(directory, role=role, **f))
+
+    _render_findings(new_items, role)
+    if new_items:
+        print(f"  \033[36m📋\033[0m {len(new_items)} item(ns) em {backlog_mod.BACKLOG_SUBPATH}")
+        print(f"     Ver: headlabs local backlog")
+
+    if getattr(args, "fix", False) and new_items:
+        _apply_local_fix(args, directory, [i for i in new_items if i.get("status") != "done"])
+
+
+def _cmd_local_backlog(args) -> None:
+    from headlabs.local import backlog as backlog_mod
+    directory = os.path.abspath(getattr(args, "directory", None) or ".")
+    items = backlog_mod.load_backlog(directory)
+    if not items:
+        print("Backlog vazio — rode: headlabs local inspect")
+        return
+    open_items = [b for b in items if b.get("status") != "done"]
+    done_items = [b for b in items if b.get("status") == "done"]
+    print(f"\033[1mBacklog local\033[0m ({len(open_items)} aberto(s), {len(done_items)} concluído(s))\n")
+    for it in open_items:
+        sev = it.get("severity", "medium")
+        color = _SEV_COLOR.get(sev, "\033[2m")
+        print(f"  {color}[{sev}]\033[0m {it.get('resource', '')} — {it.get('title', '')}")
+        if it.get("fix"):
+            print(f"        \033[2mfix: {it['fix']}\033[0m")
+    if done_items:
+        print(f"\n  \033[2m{len(done_items)} item(ns) concluído(s)\033[0m")
+
+
+def _cmd_local_fix(args) -> None:
+    from headlabs.local import backlog as backlog_mod
+    directory = os.path.abspath(getattr(args, "directory", None) or ".")
+    items = [b for b in backlog_mod.load_backlog(directory) if b.get("status") != "done"]
+    if not items:
+        print("Backlog vazio — nada para corrigir. Rode: headlabs local inspect")
+        return
+    _apply_local_fix(args, directory, items)
+
+
+def _apply_local_fix(args, directory: str, items: list[dict]) -> None:
+    """Apply fixes for the given backlog items, then run the test loop and mark
+    items done if the suite goes green. Reuses autofix.py's edit→test→fix cycle."""
+    from headlabs.local import backlog as backlog_mod
+    from headlabs.local.inspector import build_fix_prompt_from_findings, FIX_SYSTEM_PROMPT
+
+    if not items:
+        return
+    print(f"\n  \033[36m⚙\033[0m Corrigindo {len(items)} item(ns)...")
+    engine = _build_engine(args, tools=_fix_tools(),
+                           system_prompt=FIX_SYSTEM_PROMPT, cwd=directory)
+    try:
+        engine.run(build_fix_prompt_from_findings(items), on_event=_render_event)
+    except ProviderError:
+        sys.exit(1)
+    finally:
+        engine.provider.close()
+
+    passed = _run_autofix_loop(args, directory)
+    if passed:
+        for it in items:
+            backlog_mod.set_status(directory, it["id"], "done")
+        print(f"  \033[32m✓\033[0m {len(items)} item(ns) marcado(s) como done (testes verdes).")
+    elif passed is None:
+        print("  \033[2m(sem comando de teste detectado — itens deixados abertos para revisão)\033[0m")
+    else:
+        print("  \033[33mTestes ainda falhando — itens deixados abertos para revisão.\033[0m")
+
+
+def _run_autofix_loop(args, directory: str):
+    """Run the detected test command; on failure, feed the output back and retry
+    (up to MAX_AUTOFIX_RETRIES). Returns True (green), False (still red), or None
+    (no test command detected)."""
+    cmd = detect_test_command(directory)
+    if not cmd:
+        return None
+    for attempt in range(MAX_AUTOFIX_RETRIES):
+        result = run_test_command(cmd, directory)
+        if result.success:
+            print(f"  \033[32m✓\033[0m Testes passaram ({cmd.command})")
+            return True
+        print(f"  \033[33m✗\033[0m Testes falharam — tentando corrigir ({attempt + 1}/{MAX_AUTOFIX_RETRIES})")
+        from headlabs.local.inspector import FIX_SYSTEM_PROMPT
+        engine = _build_engine(args, tools=_fix_tools(),
+                               system_prompt=FIX_SYSTEM_PROMPT, cwd=directory)
+        try:
+            engine.run(build_fix_prompt(result, []), on_event=_render_event)
+        except ProviderError:
+            break
+        finally:
+            engine.provider.close()
+    return run_test_command(cmd, directory).success
 
 
 # ─── Interactive chat ───────────────────────────────────────────────────────

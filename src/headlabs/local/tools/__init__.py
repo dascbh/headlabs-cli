@@ -12,7 +12,10 @@ from headlabs.local.tools.todo_write import TodoWriteTool
 from headlabs.local.tools.ask_user_question import AskUserQuestionTool
 from headlabs.local.tools.config_tool import ConfigTool
 from headlabs.local.tools.browser_devtools import BrowserDevtoolsTool
+from headlabs.local.tools.report_finding import ReportFindingTool
 
+# ReportFindingTool is deliberately NOT in ALL_TOOLS: it only makes sense during
+# `headlabs local inspect`, which assembles its own read-only tool subset.
 ALL_TOOLS: list[type[BaseTool]] = [
     ReadFileTool,
     EditFileTool,
@@ -43,5 +46,6 @@ __all__ = [
     "AskUserQuestionTool",
     "ConfigTool",
     "BrowserDevtoolsTool",
+    "ReportFindingTool",
     "ALL_TOOLS",
 ]
