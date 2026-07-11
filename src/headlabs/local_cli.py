@@ -218,6 +218,13 @@ def _cmd_local_inspect(args) -> None:
         for f in parse_findings_fallback(final_text):
             new_items.append(backlog_mod.add_finding(directory, role=role, **f))
 
+    # The model doesn't reliably echo the role into report_finding; the CLI owns
+    # the authoritative role (`--role`), so stamp it onto this run's items.
+    new_ids = [i["id"] for i in new_items]
+    backlog_mod.restamp_role(directory, new_ids, role)
+    id_set = set(new_ids)
+    new_items = [i for i in backlog_mod.load_backlog(directory) if i["id"] in id_set]
+
     _render_findings(new_items, role)
     if new_items:
         print(f"  \033[36m📋\033[0m {len(new_items)} item(ns) em {backlog_mod.BACKLOG_SUBPATH}")

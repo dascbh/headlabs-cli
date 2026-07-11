@@ -86,6 +86,24 @@ def add_finding(
     return by_id[item["id"]]
 
 
+def restamp_role(cwd: str, item_ids, role: str) -> None:
+    """Rewrite the ``source`` of the given items to the authoritative inspection
+    role. The ``report_finding`` tool records whatever ``role`` the model passed
+    (often the default), but the real role is the one the CLI was invoked with —
+    so the CLI stamps it after the run instead of trusting the model."""
+    ids = set(item_ids)
+    if not ids:
+        return
+    items = load_backlog(cwd)
+    changed = False
+    for it in items:
+        if it.get("id") in ids:
+            it["source"] = f"inspector/{role} (local)"
+            changed = True
+    if changed:
+        save_backlog(cwd, items)
+
+
 def set_status(cwd: str, item_id: str, status: str) -> bool:
     """Update one item's status (e.g. 'open' -> 'done'). Returns True if found."""
     items = load_backlog(cwd)

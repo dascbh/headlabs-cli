@@ -54,6 +54,14 @@ def test_set_status_marks_done(tmp_path):
     assert backlog.set_status(d, "nonexistent", "done") is False
 
 
+def test_restamp_role_overrides_source(tmp_path):
+    d = str(tmp_path)
+    # Simulate the tool having recorded the model's default role.
+    item = backlog.add_finding(d, role="qa", severity="high", title="Secret", detail="", file="a.py", line=1)
+    backlog.restamp_role(d, [item["id"]], "security")
+    assert backlog.load_backlog(d)[0]["source"] == "inspector/security (local)"
+
+
 def test_load_tolerates_corrupt_file(tmp_path):
     path = tmp_path / ".headlabs" / "local_backlog.json"
     path.parent.mkdir(parents=True)
