@@ -28,8 +28,8 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("browser-devtools", host="0.0.0.0", stateless_http=True)
 
-DEFAULT_WAIT_MS = int(os.environ.get("BROWSER_DEFAULT_WAIT_MS", "2000"))
-NAV_TIMEOUT_MS = int(os.environ.get("BROWSER_NAV_TIMEOUT_MS", "20000"))
+DEFAULT_WAIT_MS = int(os.environ.get("BROWSER_DEFAULT_WAIT_MS", "1500"))
+NAV_TIMEOUT_MS = int(os.environ.get("BROWSER_NAV_TIMEOUT_MS", "15000"))
 MAX_ITEMS = 100
 MAX_TEXT = 4000
 _LAUNCH_ARGS = ["--no-sandbox", "--disable-dev-shm-usage", "--single-process", "--no-zygote"]
@@ -100,12 +100,20 @@ async def _with_page(url: str, wait_ms: int, fn):
             page.on("request", on_request)
             page.on("requestfailed", on_requestfailed)
             page.on("response", on_response)
+            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
             status = "unknown"
-            resp = await page.goto(url, timeout=NAV_TIMEOUT_MS, wait_until="load")
-            if resp is not None:
-                status = resp.status
+            # `domcontentloaded` (not `load`) returns as soon as the DOM is
+            # parsed — a slow/hanging subresource on a heavy page must not block
+            # the whole inspection (and trip an upstream request timeout). We
+            # still capture late console/network activity during wait_ms below.
+            try:
+                resp = await page.goto(url, timeout=NAV_TIMEOUT_MS, wait_until="domcontentloaded")
+                if resp is not None:
+                    status = resp.status
+            except PlaywrightTimeoutError:
+                status = "load_timeout"  # proceed with whatever loaded so far
             if wait_ms > 0:
-                await page.wait_for_timeout(min(wait_ms, 10_000))
+                await page.wait_for_timeout(min(wait_ms, 8_000))
             return await fn(page, {"console": console, "requests": requests,
                                    "failed": failed, "status": status,
                                    "page_errors": page_errors})
