@@ -1,0 +1,7 @@
+mcp:
+  id: browser-devtools
+  name: "Browser DevTools"
+  description: "Headless Chromium inspection for running front-ends: load a URL and report console errors, failed network requests, rendered text, screenshots, and evaluate JS (a11y/DOM probes). Gives Claude-backed agents real browser capability beyond plain HTTP GET."
+  version: "1.0.0"
+  transport: streamable-http
+  port: 8000
