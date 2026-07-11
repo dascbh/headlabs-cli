@@ -34,6 +34,22 @@ MAX_ITEMS = 100
 MAX_TEXT = 4000
 _LAUNCH_ARGS = ["--no-sandbox", "--disable-dev-shm-usage", "--single-process", "--no-zygote"]
 
+# Accessibility/DOM summary computed in the SAME page load as inspect_page — one
+# browser launch per call. Doing this here (rather than a second evaluate_js
+# call) avoids a back-to-back browser relaunch that can trip the gateway's
+# request timeout.
+_A11Y_JS = """() => ({
+  imgs_without_alt: document.querySelectorAll('img:not([alt])').length,
+  inputs_without_label: Array.from(document.querySelectorAll('input,select,textarea'))
+      .filter(e => e.type !== 'hidden' && (!e.labels || !e.labels.length) && !e.getAttribute('aria-label')).length,
+  links_without_text: Array.from(document.querySelectorAll('a'))
+      .filter(a => !a.textContent.trim() && !a.getAttribute('aria-label')).length,
+  buttons_without_text: Array.from(document.querySelectorAll('button'))
+      .filter(b => !b.textContent.trim() && !b.getAttribute('aria-label')).length,
+  has_lang: !!document.documentElement.lang,
+  has_viewport: !!document.querySelector('meta[name=viewport]')
+})"""
+
 
 def _err(code: str, message: str) -> dict:
     return {"error": {"code": code, "message": message}}
@@ -102,8 +118,10 @@ async def inspect_page(url: str, wait_ms: int = DEFAULT_WAIT_MS, screenshot: boo
     """Load a URL in a real headless Chromium and report runtime issues that a
     plain HTTP GET cannot see: HTTP status, console errors/warnings, uncaught JS
     exceptions (page_errors), failed (4xx/5xx or network-failed) requests, page
-    title, and a rendered-text excerpt. Optionally returns a base64 PNG
-    screenshot. Read-only; one fresh browser per call.
+    title, an accessibility/DOM summary (imgs without alt, inputs without label,
+    has lang/viewport, ...), and a rendered-text excerpt. Optionally returns a
+    base64 PNG screenshot. Read-only; one fresh browser per call — this single
+    call covers runtime errors, network health, and a11y together.
 
     Args:
         url: absolute http(s) URL of the running front-end to inspect.
@@ -119,6 +137,10 @@ async def inspect_page(url: str, wait_ms: int = DEFAULT_WAIT_MS, screenshot: boo
             text = await page.inner_text("body")
         except Exception:
             text = ""
+        try:
+            a11y = await page.evaluate(_A11Y_JS)
+        except Exception:
+            a11y = {}
         console = sinks["console"]
         out = {
             "url": url,
@@ -129,6 +151,7 @@ async def inspect_page(url: str, wait_ms: int = DEFAULT_WAIT_MS, screenshot: boo
             "page_errors": sinks["page_errors"],
             "failed_requests": sinks["failed"],
             "request_count": len(sinks["requests"]),
+            "accessibility": a11y,
             "rendered_text_excerpt": text[:MAX_TEXT],
         }
         if screenshot:
