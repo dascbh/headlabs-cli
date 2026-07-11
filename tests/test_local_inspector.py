@@ -136,7 +136,7 @@ def test_ensure_platform_agent_creates_when_missing():
     assert created["agent_id"] == inspector.PLATFORM_AGENT_ID
 
 
-def test_ensure_usability_agent_creates_and_attaches_mcp():
+def test_ensure_usability_agent_creates_and_syncs_prompt():
     created = {}
     patched = {}
 
@@ -157,9 +157,37 @@ def test_ensure_usability_agent_creates_and_attaches_mcp():
     agent_id = inspector.ensure_usability_agent(FakeClient())
     assert agent_id == inspector.USABILITY_AGENT_ID
     assert created["agent_id"] == inspector.USABILITY_AGENT_ID
-    # the browser MCP must be attached to the manifest
+    # It is a pure synthesizer: prompt kept in sync, NO MCP attached (the CLI
+    # drives the browser directly).
     assert patched["method"] == "PATCH"
-    assert patched["json"]["manifest"]["mcp"] == [{"server": inspector.BROWSER_MCP_ID}]
+    assert patched["json"]["prompt"] == inspector._USABILITY_AGENT_PROMPT
+    assert patched["json"]["manifest"]["mcp"] == []
+
+
+def test_deterministic_usability_findings_from_axe_and_mobile():
+    axe = {"violations": [
+        {"id": "color-contrast", "impact": "serious", "help": "Contrast too low",
+         "description": "Elements must have sufficient contrast", "helpUrl": "http://x",
+         "node_count": 3, "sample_targets": [".a", ".b"]},
+    ]}
+    mobile = {"accessibility": {"horizontal_overflow": True, "small_tap_targets": 4},
+              "page_errors": ["TypeError: x is not a function"],
+              "failed_requests": [], "performance": {"fcp_ms": 4000}}
+    out = inspector.deterministic_usability_findings(axe, mobile)
+    titles = [f["title"] for f in out]
+    files = [f["file"] for f in out]
+    assert "WCAG: color-contrast" in titles
+    assert "wcag:color-contrast" in files  # stable dedup key
+    assert any("Overflow" in t for t in titles)
+    assert any("toque" in t for t in titles)
+    assert any("JavaScript" in t for t in titles)
+    assert any("Contentful" in t for t in titles)
+    # axe 'serious' maps to 'high'
+    assert out[0]["severity"] == "high"
+
+
+def test_deterministic_usability_findings_tolerates_errors():
+    assert inspector.deterministic_usability_findings({"error": "boom"}, {"error": "boom"}) == []
 
 
 def test_usability_is_a_role_choice():

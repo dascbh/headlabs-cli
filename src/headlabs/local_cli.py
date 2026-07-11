@@ -238,8 +238,7 @@ def _cmd_local_inspect_platform(args) -> None:
     from headlabs.client import HeadLabsClient
     from headlabs.local import backlog as backlog_mod
     from headlabs.local.inspector import (
-        build_code_bundle, ensure_platform_agent, ensure_usability_agent,
-        platform_findings_from_result,
+        build_code_bundle, ensure_platform_agent, platform_findings_from_result,
     )
 
     directory = os.path.abspath(getattr(args, "directory", None) or ".")
@@ -252,37 +251,30 @@ def _cmd_local_inspect_platform(args) -> None:
 
     client = HeadLabsClient()
 
-    # `usability` routes to a DEDICATED agent that carries the browser MCP and
-    # inspects a LIVE url — isolated from the code inspector (own prompt + tools +
-    # runtime), so the code/general inspectors never pay the browser MCP cost.
+    # `usability` runs a two-layer inspection: the CLI drives the browser MCP
+    # directly for the DETERMINISTIC objective findings (axe WCAG + responsive +
+    # perf + runtime — 100% reproducible, no LLM), then a grounded synthesizer
+    # agent adds the HEURISTIC layer on top. This removes the LLM from the
+    # objective-findings path entirely, so those never vary between runs.
     if role == "usability":
         if not url:
             print("  \033[31m--role usability requer --url <URL do front-end rodando>\033[0m")
             sys.exit(2)
-        print(f"  \033[36m⚙\033[0m Inspeção de usabilidade via plataforma (Claude + browser) — {url}")
-        try:
-            agent_id = ensure_usability_agent(client)
-        except Exception as e:
-            print(f"  \033[31mNão foi possível provisionar o agente de usabilidade: {e}\033[0m")
-            sys.exit(1)
-        instruction = (f"Inspect the usability and accessibility of {url}. Use your browser "
-                       f"tools (a11y_audit, inspect_page) on the LIVE url and return JSON findings.")
-        if context:
-            instruction += f" User focus: {context}."
-        input_data = {"question": instruction, "url": url}
-    else:
-        print(f"  \033[36m⚙\033[0m Inspeção via plataforma (Claude) — role \033[1m{role}\033[0m")
-        bundle = build_code_bundle(directory)
-        print(f"    Empacotados {len(bundle)} bytes de código de {os.path.basename(directory)}")
-        try:
-            agent_id = ensure_platform_agent(client)
-        except Exception as e:
-            print(f"  \033[31mNão foi possível provisionar o agente da plataforma: {e}\033[0m")
-            sys.exit(1)
-        instruction = f"Inspect this project as a {role} specialist and return JSON findings."
-        if context:
-            instruction += f" User focus: {context}."
-        input_data = {"question": f"{instruction}\n\n{bundle}", "role": role}
+        _run_usability_platform(client, directory, url, context, args)
+        return
+
+    print(f"  \033[36m⚙\033[0m Inspeção via plataforma (Claude) — role \033[1m{role}\033[0m")
+    bundle = build_code_bundle(directory)
+    print(f"    Empacotados {len(bundle)} bytes de código de {os.path.basename(directory)}")
+    try:
+        agent_id = ensure_platform_agent(client)
+    except Exception as e:
+        print(f"  \033[31mNão foi possível provisionar o agente da plataforma: {e}\033[0m")
+        sys.exit(1)
+    instruction = f"Inspect this project as a {role} specialist and return JSON findings."
+    if context:
+        instruction += f" User focus: {context}."
+    input_data = {"question": f"{instruction}\n\n{bundle}", "role": role}
 
     try:
         exec_id, tenant_id, stream_id = client.invoke(agent_id, input_data)
@@ -313,6 +305,77 @@ def _cmd_local_inspect_platform(args) -> None:
         print(f"     Ver: headlabs local backlog")
     elif getattr(result, "summary", ""):
         print(f"  \033[2m{result.summary}\033[0m")
+
+    if getattr(args, "fix", False) and new_items:
+        _apply_local_fix(args, directory, [i for i in new_items if i.get("status") != "done"])
+
+
+def _run_usability_platform(client, directory, url, context, args) -> None:
+    """Two-layer usability inspection of a LIVE url.
+
+    Layer 1 (deterministic): the CLI calls the browser-devtools MCP directly
+    (axe WCAG audit + mobile inspect_page) and turns the raw signals into
+    grounded, reproducible findings — no LLM, so they never vary.
+    Layer 2 (heuristic): a grounded synthesizer agent receives those same tool
+    results and adds only what a rules engine can't catch (content clarity,
+    form burden, missing states). The two layers are merged and deduped.
+    """
+    import json
+    from headlabs.local import backlog as backlog_mod
+    from headlabs.local.inspector import (
+        call_browser_mcp, deterministic_usability_findings,
+        ensure_usability_agent, platform_findings_from_result,
+    )
+    role = "usability"
+
+    print(f"  \033[36m⚙\033[0m Inspeção de usabilidade — {url}")
+    print("    \033[2mCamada determinística: axe-core (WCAG) + inspeção mobile...\033[0m")
+    # The first call absorbs a possible AgentCore cold start (more retries); the
+    # second runs against an already-warm container.
+    axe = call_browser_mcp("a11y_audit", {"url": url}, tries=7)
+    mobile = call_browser_mcp("inspect_page", {"url": url, "viewport": "mobile", "wait_ms": 1200}, tries=4)
+    for probe, res in (("a11y_audit", axe), ("inspect_page", mobile)):
+        if isinstance(res, dict) and res.get("error"):
+            print(f"  \033[33m⚠ browser MCP {probe}: {res['error']}\033[0m")
+
+    det = deterministic_usability_findings(axe, mobile)
+    print(f"    \033[2m{len(det)} finding(s) objetivo(s) (determinístico)\033[0m")
+
+    # Heuristic layer — grounded on the SAME tool results (agent is a synthesizer,
+    # not a tool-caller), so it can't hallucinate or duplicate the objective set.
+    heur = []
+    tool_ctx = json.dumps({"a11y_audit": axe, "inspect_mobile": mobile},
+                          ensure_ascii=False)[:14000]
+    try:
+        agent_id = ensure_usability_agent(client)
+        instruction = (f"Live URL: {url}\nBrowser check results already computed:\n{tool_ctx}\n\n"
+                       "Return ONLY additional HEURISTIC usability findings as a JSON array. "
+                       "Do NOT repeat WCAG/axe, responsive, runtime or performance issues "
+                       "already present in the data above.")
+        if context:
+            instruction += f"\nUser focus: {context}."
+        exec_id, tenant_id, stream_id = client.invoke(agent_id, {"question": instruction, "url": url})
+        print(f"    \033[2mCamada heurística (síntese Claude) — execução {exec_id}...\033[0m")
+        result = client.poll(exec_id, tenant_id=tenant_id, stream_id=stream_id, timeout=600)
+        heur = platform_findings_from_result(result)
+        print(f"    \033[2m{len(heur)} finding(s) heurístico(s)\033[0m")
+    except Exception as e:
+        print(f"  \033[33m⚠ Camada heurística indisponível ({e}); usando só a determinística\033[0m")
+
+    before_ids = {i.get("id") for i in backlog_mod.load_backlog(directory)}
+    for f in det + heur:
+        backlog_mod.add_finding(directory, role=role, **f)
+    new_items = [i for i in backlog_mod.load_backlog(directory) if i.get("id") not in before_ids]
+    new_ids = [i["id"] for i in new_items]
+    backlog_mod.restamp_role(directory, new_ids, role, origin="platform")
+    new_items = [i for i in backlog_mod.load_backlog(directory) if i["id"] in set(new_ids)]
+
+    _render_findings(new_items, role)
+    if new_items:
+        print(f"  \033[36m📋\033[0m {len(new_items)} item(ns) em {backlog_mod.BACKLOG_SUBPATH}")
+        print("     Ver: headlabs local backlog")
+    else:
+        print("  \033[2mNenhum problema de usabilidade encontrado.\033[0m")
 
     if getattr(args, "fix", False) and new_items:
         _apply_local_fix(args, directory, [i for i in new_items if i.get("status") != "done"])

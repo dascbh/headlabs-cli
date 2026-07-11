@@ -218,32 +218,33 @@ def build_code_bundle(directory: str) -> str:
 # loop-inspector — never pay the browser MCP's per-invocation session cost.
 USABILITY_AGENT_ID = "usability-inspector"
 BROWSER_MCP_ID = "browser-devtools"
+BROWSER_MCP_ENDPOINT = "https://mcps.headlabs.ai/browser-devtools/mcp"
 
+# The agent is a GROUNDED SYNTHESIZER, not a tool-caller: the CLI runs the
+# deterministic browser checks (axe + inspect_page) and hands the results in.
+# This removes the LLM from the objective-findings path entirely (those come
+# straight from axe/browser → 100% reproducible), so the only variance left is
+# the heuristic layer, which is additive. The agent needs no MCP of its own.
 _USABILITY_AGENT_PROMPT = """\
-You are a usability & accessibility inspector for live web front-ends. You are
-given a URL of a RUNNING site and MUST use your browser tools to inspect the live
-page (not source code):
+You are a usability inspector. You receive a URL and the RESULTS of automated
+browser checks already run on the live page (an axe-core WCAG audit plus a mobile
+inspect_page with accessibility, responsive, performance and runtime signals).
 
-- a11y_audit(url): objective WCAG 2.0/2.1 A&AA violations (impact, rule, help).
-- inspect_page(url, viewport='mobile'): responsive issues (horizontal_overflow,
-  small_tap_targets), performance (fcp_ms, load_ms), runtime console_errors /
-  page_errors, an accessibility summary, and a rendered-text excerpt.
-- Optionally inspect_page(url, viewport='desktop') to compare layouts.
+Do NOT repeat issues the automated checks already captured (WCAG violations,
+horizontal overflow, small tap targets, runtime/console errors, failed requests,
+slow first-contentful-paint). Instead add HEURISTIC usability findings a rules
+engine cannot catch, grounded in the provided rendered text and DOM summary:
+content clarity and microcopy, form/interaction burden, missing loading/empty/
+error states, navigation and flow, and information hierarchy.
 
-Evaluate usability across: accessibility (WCAG), responsive/mobile layout,
-perceived performance, runtime errors that break the experience, and — from the
-rendered text and DOM summary — content clarity and form/interaction burden.
-
-Return ONLY a JSON array of findings, each:
-{"severity":"critical|high|medium|low","title":"...","detail":"... cite the tool
-evidence (rule id, metric, count) ...","fix":"..."}
-Ground every finding in the tool results — do not invent. If the page is solid,
-return []."""
+Return ONLY a JSON array: [{"severity":"critical|high|medium|low","title":"...",
+"detail":"...","fix":"..."}]. If you have no additional heuristic findings, return []."""
 
 
 def ensure_usability_agent(client) -> str:
-    """Provision the dedicated usability agent (idempotent) and ensure the
-    browser-devtools MCP is attached to its manifest. Returns its id."""
+    """Provision the dedicated usability synthesizer agent (idempotent) and keep
+    its prompt in sync. It carries NO MCP — the CLI runs the browser checks and
+    passes results in, so the agent only synthesizes heuristic findings."""
     try:
         existing = {a.get("id") for a in client.list_remote_agents()}
     except Exception:
@@ -253,16 +254,111 @@ def ensure_usability_agent(client) -> str:
             agent_id=USABILITY_AGENT_ID,
             display_name="Usability Inspector",
             prompt=_USABILITY_AGENT_PROMPT,
-            description="Live front-end usability & accessibility inspection via a headless browser (browser-devtools MCP).",
+            description="Grounded synthesizer of heuristic usability findings from browser-check results.",
         )
-    # Attach the browser MCP (idempotent — safe to PATCH every run).
+    # Keep prompt in sync and ensure no MCP is attached (pure synthesizer).
     try:
         client.request("PATCH", f"/agents/{USABILITY_AGENT_ID}",
-                       json={"manifest": {"skills": [], "tools_native": [],
-                                          "mcp": [{"server": BROWSER_MCP_ID}]}})
+                       json={"prompt": _USABILITY_AGENT_PROMPT,
+                             "manifest": {"skills": [], "tools_native": [], "mcp": []}})
     except Exception:
         pass
     return USABILITY_AGENT_ID
+
+
+def call_browser_mcp(tool: str, args: dict, tries: int = 4) -> dict:
+    """Call a browser-devtools MCP tool directly (the deterministic path).
+    Returns the tool's JSON dict, or ``{'error': ...}``. Retries transient
+    gateway timeouts (a cold browser launch can trip the CloudFront window)."""
+    import asyncio
+    import base64
+    import json as _json
+
+    try:
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"mcp client unavailable: {exc}"}
+
+    from headlabs.client import HeadLabsClient
+    c = HeadLabsClient()
+    headers = {}
+    if c.api_key:
+        headers["Authorization"] = "Basic " + base64.b64encode(c.api_key.encode()).decode()
+
+    async def _run():
+        last = None
+        for i in range(tries):
+            try:
+                async with streamablehttp_client(BROWSER_MCP_ENDPOINT, headers=headers,
+                                                  timeout=90, terminate_on_close=False) as (r, w, _):
+                    async with ClientSession(r, w) as s:
+                        await s.initialize()
+                        res = await s.call_tool(tool, args)
+                        txt = "".join(getattr(b, "text", "") for b in res.content)
+                        return _json.loads(txt)
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                if i < tries - 1:
+                    # Adaptive backoff: warm calls take ~8s, but a cold AgentCore
+                    # runtime can take up to ~60s to spin up — keep retrying long
+                    # enough to outlast a cold start rather than failing fast.
+                    await asyncio.sleep(min(6 + i * 6, 24))
+        return {"error": str(last)[:160]}
+
+    return asyncio.run(_run())
+
+
+_AXE_IMPACT_SEV = {"critical": "critical", "serious": "high", "moderate": "medium", "minor": "low"}
+
+
+def deterministic_usability_findings(axe: dict, mobile: dict) -> list[dict]:
+    """Build grounded, reproducible findings straight from the browser-check
+    results (no LLM). Stable ``file`` keys (rule id / signal name) give stable
+    dedup across runs — same site, same findings, every time."""
+    out = []
+    if isinstance(axe, dict) and "error" not in axe:
+        for v in (axe.get("violations") or []):
+            sev = _AXE_IMPACT_SEV.get(v.get("impact"), "medium")
+            targets = ", ".join((v.get("sample_targets") or [])[:3])
+            out.append({
+                "severity": sev,
+                "title": f"WCAG: {v.get('id')}",
+                "detail": (f"{v.get('help', '')}. {v.get('node_count', 0)} elemento(s)."
+                           + (f" Alvos: {targets}." if targets else "")
+                           + (f" Ref: {v.get('helpUrl', '')}" if v.get("helpUrl") else "")),
+                "fix": f"Corrigir a violação axe '{v.get('id')}': {v.get('description', '')}.",
+                "file": f"wcag:{v.get('id')}",
+            })
+    if isinstance(mobile, dict) and "error" not in mobile:
+        a = mobile.get("accessibility") or {}
+        if a.get("horizontal_overflow"):
+            out.append({"severity": "high", "title": "Overflow horizontal no mobile",
+                        "detail": "A página ultrapassa a largura do viewport mobile (scroll horizontal).",
+                        "fix": "Layout responsivo (max-width:100%, flex/grid, evitar larguras fixas).",
+                        "file": "responsive:overflow"})
+        if a.get("small_tap_targets"):
+            out.append({"severity": "medium",
+                        "title": f"{a['small_tap_targets']} alvo(s) de toque pequeno(s) (<40px)",
+                        "detail": "Elementos clicáveis menores que ~40px dificultam o toque no mobile (WCAG 2.5.5).",
+                        "fix": "Aumentar a área de toque para >=44x44px.",
+                        "file": "responsive:tap-targets"})
+        for pe in (mobile.get("page_errors") or [])[:10]:
+            out.append({"severity": "high", "title": "Erro de JavaScript em runtime",
+                        "detail": f"Exceção não tratada quebra a experiência: {pe}",
+                        "fix": "Corrigir a exceção JavaScript.", "file": "runtime:pageerror"})
+        for fr in (mobile.get("failed_requests") or [])[:8]:
+            out.append({"severity": "medium", "title": "Requisição falha (recurso quebrado)",
+                        "detail": f"{fr}", "fix": "Corrigir o recurso/endpoint ausente.",
+                        "file": "runtime:failed-request"})
+        perf = mobile.get("performance") or {}
+        fcp = perf.get("fcp_ms")
+        if isinstance(fcp, (int, float)) and fcp > 2500:
+            out.append({"severity": "medium", "title": "First Contentful Paint lento",
+                        "detail": f"FCP={int(fcp)}ms (>2.5s) prejudica a usabilidade percebida.",
+                        "fix": "Otimizar carregamento (reduzir JS/CSS bloqueante, lazy-load, CDN).",
+                        "file": "perf:fcp"})
+    return out
 
 
 def ensure_platform_agent(client) -> str:

@@ -226,12 +226,23 @@ headlabs local fix                             # corrigir itens abertos do backl
   (`qa/ux/security/architect/performance/devops/data/frontend/backend`) + `usability`.
   A especialização é um prompt embarcado no CLI (`src/headlabs/local/inspector.py`),
   não um agente remoto — por isso funciona 100% self-hosted.
-- **`--role usability` + `--provider platform`**: roteia para um **agente
-  dedicado** `usability-inspector` (Claude) que carrega o MCP `browser-devtools`
-  e inspeciona a URL **viva** (`--url`) — a11y WCAG (axe-core), responsivo/mobile
-  (overflow, tap targets), performance (FCP) e erros de runtime. É um agente à
-  parte (isola prompt + tools + runtime), então o inspector de código e o
-  `loop-inspector` de produção não pagam o custo do browser MCP. Requer `--url`.
+- **`--role usability` + `--provider platform`**: inspeção de **duas camadas**
+  da URL **viva** (`--url`), desenhada para consistência:
+  1. **Determinística** — o CLI chama o MCP `browser-devtools` diretamente
+     (`a11y_audit` via axe-core + `inspect_page` mobile) e converte os sinais
+     brutos em findings ancorados: WCAG (regra axe), responsivo (overflow, tap
+     targets), performance (FCP) e erros de runtime. Sem LLM → **100%
+     reproduzível** (mesma URL ⇒ mesmos findings objetivos, sempre; a chave de
+     dedup é o id da regra/sinal, ex. `wcag:select-name`).
+  2. **Heurística** — um **agente sintetizador** dedicado `usability-inspector`
+     (Claude, sem MCP) recebe os *resultados* dessas mesmas checagens e adiciona
+     só o que uma engine de regras não pega (clareza de conteúdo, carga do
+     formulário, estados faltando), ancorado nos dados — sem repetir a camada
+     objetiva nem alucinar.
+
+  Assim o LLM sai do caminho dos findings objetivos (a fonte de variância) e fica
+  só na camada de julgamento, que é aditiva. As chamadas ao browser reutilizam
+  backoff adaptativo para absorver cold start do runtime. Requer `--url`.
   Ex.: `headlabs local inspect . --role usability --url https://meuapp.com --provider platform`.
 - **Achados estruturados**: o modelo registra cada issue via a tool
   `report_finding` (schema pydantic validado pelo engine), persistida em
