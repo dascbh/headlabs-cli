@@ -223,9 +223,16 @@ headlabs local fix                             # corrigir itens abertos do backl
 ```
 
 - **Roles** (`--role`): mesmos do `labs inspect`
-  (`qa/ux/security/architect/performance/devops/data/frontend/backend`). A
-  especialização é um prompt embarcado no CLI (`src/headlabs/local/inspector.py`),
+  (`qa/ux/security/architect/performance/devops/data/frontend/backend`) + `usability`.
+  A especialização é um prompt embarcado no CLI (`src/headlabs/local/inspector.py`),
   não um agente remoto — por isso funciona 100% self-hosted.
+- **`--role usability` + `--provider platform`**: roteia para um **agente
+  dedicado** `usability-inspector` (Claude) que carrega o MCP `browser-devtools`
+  e inspeciona a URL **viva** (`--url`) — a11y WCAG (axe-core), responsivo/mobile
+  (overflow, tap targets), performance (FCP) e erros de runtime. É um agente à
+  parte (isola prompt + tools + runtime), então o inspector de código e o
+  `loop-inspector` de produção não pagam o custo do browser MCP. Requer `--url`.
+  Ex.: `headlabs local inspect . --role usability --url https://meuapp.com --provider platform`.
 - **Achados estruturados**: o modelo registra cada issue via a tool
   `report_finding` (schema pydantic validado pelo engine), persistida em
   `.headlabs/local_backlog.json` — mesmo formato de item do backlog do

@@ -136,6 +136,36 @@ def test_ensure_platform_agent_creates_when_missing():
     assert created["agent_id"] == inspector.PLATFORM_AGENT_ID
 
 
+def test_ensure_usability_agent_creates_and_attaches_mcp():
+    created = {}
+    patched = {}
+
+    class FakeClient:
+        def list_remote_agents(self):
+            return []
+
+        def create_agent(self, **kwargs):
+            created.update(kwargs)
+            return {"id": kwargs["agent_id"]}
+
+        def request(self, method, path, **kwargs):
+            patched["method"] = method
+            patched["path"] = path
+            patched["json"] = kwargs.get("json")
+            return {}
+
+    agent_id = inspector.ensure_usability_agent(FakeClient())
+    assert agent_id == inspector.USABILITY_AGENT_ID
+    assert created["agent_id"] == inspector.USABILITY_AGENT_ID
+    # the browser MCP must be attached to the manifest
+    assert patched["method"] == "PATCH"
+    assert patched["json"]["manifest"]["mcp"] == [{"server": inspector.BROWSER_MCP_ID}]
+
+
+def test_usability_is_a_role_choice():
+    assert "usability" in inspector.ROLE_CHOICES
+
+
 def test_ensure_platform_agent_idempotent_when_present():
     class FakeClient:
         def list_remote_agents(self):

@@ -238,7 +238,8 @@ def _cmd_local_inspect_platform(args) -> None:
     from headlabs.client import HeadLabsClient
     from headlabs.local import backlog as backlog_mod
     from headlabs.local.inspector import (
-        build_code_bundle, ensure_platform_agent, platform_findings_from_result,
+        build_code_bundle, ensure_platform_agent, ensure_usability_agent,
+        platform_findings_from_result,
     )
 
     directory = os.path.abspath(getattr(args, "directory", None) or ".")
@@ -247,21 +248,42 @@ def _cmd_local_inspect_platform(args) -> None:
         sys.exit(2)
     role = getattr(args, "role", "qa") or "qa"
     context = getattr(args, "inspect_context", None)
+    url = getattr(args, "url", None)
 
     client = HeadLabsClient()
-    print(f"  \033[36m⚙\033[0m Inspeção via plataforma (Claude) — role \033[1m{role}\033[0m")
-    bundle = build_code_bundle(directory)
-    print(f"    Empacotados {len(bundle)} bytes de código de {os.path.basename(directory)}")
-    try:
-        agent_id = ensure_platform_agent(client)
-    except Exception as e:
-        print(f"  \033[31mNão foi possível provisionar o agente da plataforma: {e}\033[0m")
-        sys.exit(1)
 
-    instruction = f"Inspect this project as a {role} specialist and return JSON findings."
-    if context:
-        instruction += f" User focus: {context}."
-    input_data = {"question": f"{instruction}\n\n{bundle}", "role": role}
+    # `usability` routes to a DEDICATED agent that carries the browser MCP and
+    # inspects a LIVE url — isolated from the code inspector (own prompt + tools +
+    # runtime), so the code/general inspectors never pay the browser MCP cost.
+    if role == "usability":
+        if not url:
+            print("  \033[31m--role usability requer --url <URL do front-end rodando>\033[0m")
+            sys.exit(2)
+        print(f"  \033[36m⚙\033[0m Inspeção de usabilidade via plataforma (Claude + browser) — {url}")
+        try:
+            agent_id = ensure_usability_agent(client)
+        except Exception as e:
+            print(f"  \033[31mNão foi possível provisionar o agente de usabilidade: {e}\033[0m")
+            sys.exit(1)
+        instruction = (f"Inspect the usability and accessibility of {url}. Use your browser "
+                       f"tools (a11y_audit, inspect_page) on the LIVE url and return JSON findings.")
+        if context:
+            instruction += f" User focus: {context}."
+        input_data = {"question": instruction, "url": url}
+    else:
+        print(f"  \033[36m⚙\033[0m Inspeção via plataforma (Claude) — role \033[1m{role}\033[0m")
+        bundle = build_code_bundle(directory)
+        print(f"    Empacotados {len(bundle)} bytes de código de {os.path.basename(directory)}")
+        try:
+            agent_id = ensure_platform_agent(client)
+        except Exception as e:
+            print(f"  \033[31mNão foi possível provisionar o agente da plataforma: {e}\033[0m")
+            sys.exit(1)
+        instruction = f"Inspect this project as a {role} specialist and return JSON findings."
+        if context:
+            instruction += f" User focus: {context}."
+        input_data = {"question": f"{instruction}\n\n{bundle}", "role": role}
+
     try:
         exec_id, tenant_id, stream_id = client.invoke(agent_id, input_data)
     except Exception as e:

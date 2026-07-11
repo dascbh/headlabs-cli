@@ -14,7 +14,7 @@ import json
 # local and platform inspectors share the same vocabulary.
 ROLE_CHOICES = [
     "qa", "ux", "security", "architect", "performance",
-    "devops", "data", "frontend", "backend",
+    "devops", "data", "frontend", "backend", "usability",
 ]
 
 _ROLE_FOCUS = {
@@ -64,6 +64,14 @@ _ROLE_FOCUS = {
         "- Error handling and input validation on endpoints.\n"
         "- Hardcoded secrets, missing authz checks.\n"
         "- API contract issues and inconsistent status codes."
+    ),
+    "usability": (
+        "- Accessibility (WCAG): labels, contrast, alt text, ARIA, keyboard nav.\n"
+        "- Responsive/mobile: horizontal overflow, tiny tap targets, broken layout.\n"
+        "- Perceived performance and runtime console/JS errors that hurt the UX.\n"
+        "- Content clarity, form/interaction burden, missing loading/error states.\n"
+        "When a running URL is given (--url), drive the browser to inspect the live\n"
+        "page (navigate, console/network, evaluate) rather than only the source."
     ),
 }
 
@@ -202,6 +210,59 @@ def build_code_bundle(directory: str) -> str:
             parts.append(block)
             total += len(block)
     return "\n".join(parts) if parts else "(no source files found)"
+
+
+# The usability inspector is a SEPARATE dedicated agent (not a role on the shared
+# code inspector): it isolates prompt + tools + runtime. It carries the heavy,
+# browser-devtools MCP so the code inspector — and, in production, the general
+# loop-inspector — never pay the browser MCP's per-invocation session cost.
+USABILITY_AGENT_ID = "usability-inspector"
+BROWSER_MCP_ID = "browser-devtools"
+
+_USABILITY_AGENT_PROMPT = """\
+You are a usability & accessibility inspector for live web front-ends. You are
+given a URL of a RUNNING site and MUST use your browser tools to inspect the live
+page (not source code):
+
+- a11y_audit(url): objective WCAG 2.0/2.1 A&AA violations (impact, rule, help).
+- inspect_page(url, viewport='mobile'): responsive issues (horizontal_overflow,
+  small_tap_targets), performance (fcp_ms, load_ms), runtime console_errors /
+  page_errors, an accessibility summary, and a rendered-text excerpt.
+- Optionally inspect_page(url, viewport='desktop') to compare layouts.
+
+Evaluate usability across: accessibility (WCAG), responsive/mobile layout,
+perceived performance, runtime errors that break the experience, and — from the
+rendered text and DOM summary — content clarity and form/interaction burden.
+
+Return ONLY a JSON array of findings, each:
+{"severity":"critical|high|medium|low","title":"...","detail":"... cite the tool
+evidence (rule id, metric, count) ...","fix":"..."}
+Ground every finding in the tool results — do not invent. If the page is solid,
+return []."""
+
+
+def ensure_usability_agent(client) -> str:
+    """Provision the dedicated usability agent (idempotent) and ensure the
+    browser-devtools MCP is attached to its manifest. Returns its id."""
+    try:
+        existing = {a.get("id") for a in client.list_remote_agents()}
+    except Exception:
+        existing = set()
+    if USABILITY_AGENT_ID not in existing:
+        client.create_agent(
+            agent_id=USABILITY_AGENT_ID,
+            display_name="Usability Inspector",
+            prompt=_USABILITY_AGENT_PROMPT,
+            description="Live front-end usability & accessibility inspection via a headless browser (browser-devtools MCP).",
+        )
+    # Attach the browser MCP (idempotent — safe to PATCH every run).
+    try:
+        client.request("PATCH", f"/agents/{USABILITY_AGENT_ID}",
+                       json={"manifest": {"skills": [], "tools_native": [],
+                                          "mcp": [{"server": BROWSER_MCP_ID}]}})
+    except Exception:
+        pass
+    return USABILITY_AGENT_ID
 
 
 def ensure_platform_agent(client) -> str:
