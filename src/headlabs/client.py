@@ -13,6 +13,31 @@ from headlabs.result import Result
 from headlabs.agents.registry import AGENT_REGISTRY
 
 
+def _loads_tolerant(raw: Any) -> dict:
+    """Parse an execution ``output`` field without dying on a malformed
+    envelope. Agents sometimes emit answers containing invalid JSON escapes
+    (``\\d`` from a regex, a lone ``\\`` before a path, …); a strict
+    ``json.loads`` then raises and the whole run fails *after* the agent already
+    succeeded. We repair invalid backslash escapes and retry, and finally fall
+    back to wrapping the raw text as ``{"answer": raw}`` so the caller always
+    gets something usable rather than an exception.
+    """
+    if not isinstance(raw, str):
+        return raw or {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    import re
+    repaired = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', raw)
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        # Last resort: hand the raw text back as the answer so callers can still
+        # extract fenced blocks / apply their own resilient parsing downstream.
+        return {"answer": raw}
+
+
 def _ephemeral_credentials(session) -> dict | None:
     """Short-lived AWS credentials for the agent to read the CLIENT's account.
 
@@ -171,7 +196,7 @@ class HeadLabsClient:
     def _result_from_execution(data: dict) -> Result:
         status = data.get("status")
         raw = data.get("output", "{}")
-        output = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        output = _loads_tolerant(raw)
         norm = "succeeded" if status == "succeeded" else "failed"
         default_summary = "" if status == "succeeded" else f"Execution {status}"
         if status == "dlq":
@@ -248,6 +273,12 @@ class HeadLabsClient:
         data = self._get_execution(exec_id, tenant_id)
         result = self._result_from_execution(data)
         if reporter is not None:
+            # Attach the structured result to the trace (when the reporter
+            # records one) *before* finalizing, so machine output (json /
+            # stream-json) and the persisted trace include it.
+            if hasattr(reporter, "set_result"):
+                from dataclasses import asdict
+                reporter.set_result(asdict(result))
             reporter.finish(final_status, result.summary)
         else:
             print()
@@ -347,9 +378,12 @@ class HeadLabsClient:
 
     # ── Remote API methods (platform resources) ───────────────────────────────
 
-    def list_remote_agents(self) -> list[dict]:
-        """List agents deployed on the platform."""
-        resp = requests.get(f"{self.api_url}/agents", headers=self._headers(), timeout=15)
+    def list_remote_agents(self, timeout: int = 15) -> list[dict]:
+        """List agents deployed on the platform.
+
+        ``timeout`` is configurable so latency-sensitive callers (e.g. shell
+        tab-completion) can use a short budget and fall back gracefully."""
+        resp = requests.get(f"{self.api_url}/agents", headers=self._headers(), timeout=timeout)
         if resp.status_code == 200:
             return resp.json()
         return []
@@ -375,6 +409,64 @@ class HeadLabsClient:
             "listed": False,
         }
         resp = requests.post(f"{self.api_url}/agents", json=body, headers=self._headers(), timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+
+    def create_mcp(self, mcp_id: str, display_name: str, description: str = "",
+                   framework: str = "container") -> dict:
+        """Register a new MCP server on the platform (POST /mcps).
+
+        This is the call that makes the MCP a first-class platform asset
+        (``kind: "mcp"`` in the labs table) — the one ``GET /mcps`` filters on.
+        Uploading source (``/mcps/{id}/source``) and deploying a runtime
+        (``/mcps/{id}/deploy``) do NOT create this record on their own; they
+        only version code / provision a runtime for an MCP id that must
+        already exist. Skipping this call is why a pushed+deployed MCP can
+        silently never show up in ``headlabs mcps list``.
+
+        ``framework="container"`` marks this as a Docker/AgentCore-runtime MCP
+        (the model `mcps create`/`mcps push` builds), as opposed to the
+        platform's dynamic ``openapi-gateway`` default (spec-driven, no
+        container).
+
+        IMPORTANT — NOT idempotent server-side: the API has no conflict check
+        and always ``put_item``s, so calling this on an id that already has a
+        registered ``runtime_id``/``status`` would overwrite those fields back
+        to the defaults. Callers MUST check existence first (e.g. via
+        ``request("GET", f"/mcps/{id}")``, 404 = absent) and only call this
+        when the MCP does not yet exist.
+        """
+        body = {
+            "id": mcp_id,
+            "display_name": display_name,
+            "description": description or f"MCP: {display_name}",
+            "framework": framework,
+        }
+        resp = requests.post(f"{self.api_url}/mcps", json=body, headers=self._headers(), timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+
+    def publish_mcp(self, mcp_id: str) -> dict:
+        """Publish an MCP (POST /mcps/{id}/publish): sets visibility="public".
+
+        The platform's own gate requires an active ``runtime_id`` before an
+        MCP is discoverable/callable — publishing one without a live runtime
+        would flip the flag but leave nothing actually reachable. Callers
+        should only invoke this after confirming the deploy step returned a
+        ``runtime_id`` (mirrors the same default-private-until-explicit-
+        publish governance already enforced for agents)."""
+        resp = requests.post(f"{self.api_url}/mcps/{mcp_id}/publish",
+                             headers=self._headers(), timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+
+    def unpublish_mcp(self, mcp_id: str) -> dict:
+        """Unpublish an MCP (POST /mcps/{id}/unpublish): sets visibility="private".
+
+        Instant kill-switch — removes the MCP from discovery/consumption
+        without deleting the runtime or registration."""
+        resp = requests.post(f"{self.api_url}/mcps/{mcp_id}/unpublish",
+                             headers=self._headers(), timeout=30)
         resp.raise_for_status()
         return resp.json()
 
@@ -502,7 +594,7 @@ class HeadLabsClient:
             if status in terminal:
                 data = self._get_execution(exec_id, poll_tenant)
                 raw = data.get("output", "{}")
-                output = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                output = _loads_tolerant(raw)
                 if status in ("succeeded", "partial"):
                     msg = (output.get("answer") or output.get("response")
                            or output.get("message") or str(output))

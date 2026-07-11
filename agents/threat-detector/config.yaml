@@ -1,0 +1,39 @@
+agent:
+  id:          threat-detector
+  version:     "2.0.0"
+  framework:   strands
+  category:    security
+  description: >
+    AWS security posture reasoning agent. Thinks like a senior cloud security
+    specialist: hunts misconfigurations, exposure and risk across IAM, network,
+    data, logging and encryption (read-only).
+
+llm:
+  model:      us.anthropic.claude-sonnet-4-5-20250929-v1:0
+  max_tokens: 8000
+
+memory:
+  short:  null
+  medium: null
+  long:   null
+
+skills: []
+
+tools:
+  native: []
+  mcp:    []
+
+guardrail: null
+
+tenant:
+  partition_enabled: true
+  isolation:         shared
+
+sla:
+  p99_ms:     120000
+  max_tokens: 8000
+
+observability:
+  otel:            true
+  langfuse_traces: false
+  xray:            true

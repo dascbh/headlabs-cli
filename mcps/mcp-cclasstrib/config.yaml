@@ -1,0 +1,7 @@
+mcp:
+  id: mcp-cclasstrib
+  name: "MCP cClassTrib"
+  description: "Consulta às tabelas CST e cClassTrib (IBS/CBS) da API Conformidade Fácil / Receita Federal com cache local e validação de pares."
+  version: "1.0.0"
+  transport: streamable-http
+  port: 8080

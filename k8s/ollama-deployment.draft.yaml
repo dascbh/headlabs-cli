@@ -1,0 +1,89 @@
+# DRAFT — not applied to any cluster. See docs/local-runtime.md for context.
+#
+# Simpler alternative to vllm-deployment.draft.yaml: Ollama as a Deployment on
+# the existing HeadLabs EKS cluster. Lower throughput than vLLM, but far less
+# operational surface — same official image used in docker-compose.local.yml
+# for local validation, so behavior should transfer directly (only run this
+# on GPU nodes; Ollama also runs on CPU nodes if no GPU is available, at
+# CPU-equivalent latency to the local Compose test).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: headlabs-local-ollama
+  namespace: headlabs-local-llm   # placeholder — align with existing cluster conventions
+  labels:
+    app: headlabs-local-ollama
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: headlabs-local-ollama
+  template:
+    metadata:
+      labels:
+        app: headlabs-local-ollama
+    spec:
+      nodeSelector:
+        node.kubernetes.io/instance-type: g5.xlarge   # placeholder; omit entirely for CPU-only nodes
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: ollama
+          image: ollama/ollama:latest   # same image validated locally
+          env:
+            - name: OLLAMA_KEEP_ALIVE
+              value: "30m"
+          ports:
+            - containerPort: 11434
+          resources:
+            requests:
+              memory: "8Gi"
+              cpu: "2"
+            limits:
+              memory: "16Gi"
+              cpu: "4"
+              # nvidia.com/gpu: 1   # uncomment when scheduling on GPU nodes
+          volumeMounts:
+            - name: ollama-models
+              mountPath: /root/.ollama
+          readinessProbe:
+            exec:
+              command: ["ollama", "list"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+      volumes:
+        - name: ollama-models
+          persistentVolumeClaim:
+            claimName: headlabs-local-ollama-models
+      # Model pull is not baked into the image — either bake a custom image
+      # with `ollama pull` done at build time, or run a Job once after
+      # deploy to pull the model into the PVC (mirrors `make -f
+      # Makefile.local pull` from the local validation flow).
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: headlabs-local-ollama
+  namespace: headlabs-local-llm
+spec:
+  selector:
+    app: headlabs-local-ollama
+  ports:
+    - port: 11434
+      targetPort: 11434
+  type: ClusterIP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: headlabs-local-ollama-models
+  namespace: headlabs-local-llm
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 30Gi
+  # storageClassName: <confirm against existing cluster's default StorageClass>

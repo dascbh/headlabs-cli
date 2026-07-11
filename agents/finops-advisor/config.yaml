@@ -1,0 +1,45 @@
+agent:
+  id:          finops-advisor
+  version:     "1.0.0"
+  framework:   strands
+  category:    finops
+  description: >
+    LLM-powered FinOps intelligence agent. Reasons like a senior AWS FinOps
+    specialist over Cost Explorer + service describe APIs (read-only).
+
+llm:
+  model:      us.anthropic.claude-sonnet-4-5-20250929-v1:0
+  max_tokens: 8000
+
+memory:
+  short:  null
+  medium: null
+  long:   null
+
+skills: []
+
+tools:
+  native: []
+  mcp:    []
+
+guardrail: null
+
+tenant:
+  partition_enabled: true
+  isolation:         shared
+
+sla:
+  p99_ms:     120000
+  max_tokens: 8000
+
+observability:
+  otel:            true
+  langfuse_traces: false
+  xray:            true
+
+# Cross-account: when target_role_arn is present in the event, tools assume that
+# role before calling AWS. Empty → single-account mode (agent's own role).
+crossAccount:
+  roleNameConvention:     HeadLabsFinOpsReadOnly
+  sessionName:            headlabs-finops-advisor
+  sessionDurationSeconds: 3600

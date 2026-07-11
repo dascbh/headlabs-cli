@@ -1,0 +1,41 @@
+# Bootstrap for the `headlabs local` validation stack (Ollama via Docker Compose).
+# See docs/local-runtime.md for the full explanation and the EKS migration path.
+#
+# Usage:
+#   make -f Makefile.local up        # start Ollama, pull the model, configure headlabs local
+#   make -f Makefile.local down      # stop the stack
+#   make -f Makefile.local logs      # tail Ollama logs
+#   make -f Makefile.local test      # run a real (non-mocked) headlabs local prompt
+
+COMPOSE_FILE := docker-compose.local.yml
+MODEL        := llama3.1:8b
+BASE_URL     := http://localhost:11434/v1
+
+.PHONY: up down logs pull configure test clean
+
+up: pull configure
+	@echo ""
+	@echo "headlabs local is configured against Ollama ($(MODEL))."
+	@echo "Try:  headlabs local run \"list the files in this directory\""
+
+pull:
+	docker compose -f $(COMPOSE_FILE) up -d
+	@echo "Waiting for Ollama to become healthy..."
+	@until docker compose -f $(COMPOSE_FILE) ps ollama | grep -q healthy; do sleep 1; done
+	@echo "Pulling $(MODEL) (first run only; cached afterwards)..."
+	docker compose -f $(COMPOSE_FILE) exec ollama ollama pull $(MODEL)
+
+configure:
+	headlabs local config --base-url $(BASE_URL) --model $(MODEL) --api-key ollama
+
+down:
+	docker compose -f $(COMPOSE_FILE) down
+
+logs:
+	docker compose -f $(COMPOSE_FILE) logs -f ollama
+
+test:
+	headlabs local run "List the files in the current directory using the bash tool, then summarize what this project is based on README.md" --yes
+
+clean: down
+	docker volume rm headlabs_local_ollama_models 2>/dev/null || true

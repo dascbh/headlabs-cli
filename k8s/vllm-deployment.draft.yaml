@@ -1,0 +1,110 @@
+# DRAFT — not applied to any cluster. See docs/local-runtime.md for context.
+#
+# vLLM serving a self-hosted model on the existing HeadLabs EKS cluster,
+# exposing the same /v1/chat/completions contract that `headlabs local`
+# already speaks — no code changes needed in headlabs-cli when switching to
+# this, only `headlabs local config --base-url <this-service>`.
+#
+# Before applying for real:
+#   - Pick the actual model + confirm the matching --tool-call-parser value
+#     (validate empirically via curl against the real deployment, per the
+#     "Escolha do modelo" section in docs/local-runtime.md — do not assume).
+#   - Confirm namespace, GPU node group / Karpenter NodePool label selectors,
+#     and persistent volume for model weights (avoid re-downloading on every
+#     pod restart / cold start).
+#   - Confirm resource requests/limits against actual instance type (g5/g6).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: headlabs-local-vllm
+  namespace: headlabs-local-llm   # placeholder — align with existing cluster conventions
+  labels:
+    app: headlabs-local-vllm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: headlabs-local-vllm
+  template:
+    metadata:
+      labels:
+        app: headlabs-local-vllm
+    spec:
+      # Placeholder node selector — replace with the actual Karpenter NodePool
+      # / GPU node group labels used by the HeadLabs EKS cluster.
+      nodeSelector:
+        node.kubernetes.io/instance-type: g5.xlarge
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: vllm
+          # AWS publishes optimized, free vLLM Deep Learning Containers for
+          # EC2/ECS/EKS — prefer that over a hand-rolled image.
+          # Placeholder tag — pin an actual verified DLC tag before applying.
+          image: public.ecr.aws/deep-learning-containers/vllm:latest-gpu
+          args:
+            - "--model"
+            - "meta-llama/Llama-3.1-8B-Instruct"   # placeholder — confirm final model choice
+            - "--enable-auto-tool-choice"
+            - "--tool-call-parser"
+            - "llama3_json"                         # placeholder — must match the chosen model family
+            - "--port"
+            - "8000"
+          ports:
+            - containerPort: 8000
+          resources:
+            requests:
+              nvidia.com/gpu: 1
+              memory: "16Gi"
+              cpu: "4"
+            limits:
+              nvidia.com/gpu: 1
+              memory: "24Gi"
+              cpu: "8"
+          volumeMounts:
+            - name: model-cache
+              mountPath: /root/.cache/huggingface
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 120
+            periodSeconds: 30
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: headlabs-local-vllm-model-cache
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: headlabs-local-vllm
+  namespace: headlabs-local-llm
+spec:
+  selector:
+    app: headlabs-local-vllm
+  ports:
+    - port: 8000
+      targetPort: 8000
+  type: ClusterIP   # internal by default; expose via Ingress only if external access is needed
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: headlabs-local-vllm-model-cache
+  namespace: headlabs-local-llm
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+  # storageClassName: <confirm against existing cluster's default/GPU-node-compatible StorageClass>

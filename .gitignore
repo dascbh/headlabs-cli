@@ -23,3 +23,9 @@ htmlcov/
 *.swp
 *.swo
 reports/
+
+# macOS
+.DS_Store
+
+# Scratch HTML written by `headlabs local` runs in the repo root
+/*.html

@@ -1,0 +1,71 @@
+# Local validation stack for `headlabs local` — Ollama serving an
+# OpenAI-compatible /v1 endpoint, run entirely on the host machine (CPU on
+# Apple Silicon; no GPU passthrough to containers on macOS).
+#
+# This is a *validation* stack, not a production one: the goal is to prove
+# the headlabs-cli local agent loop (provider, tool-calling, streaming) works
+# end-to-end against a real server before doing anything on the HeadLabs EKS
+# cluster. See docs/local-runtime.md for the full flow and the EKS migration
+# path.
+#
+# Usage: make -f Makefile.local up
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: headlabs-local-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    environment:
+      # Keep the model resident between requests — avoids reload latency
+      # while iterating during manual testing.
+      - OLLAMA_KEEP_ALIVE=30m
+      # Ollama defaults to a small context window (commonly 4096 tokens)
+      # regardless of what the model actually supports, and silently drops
+      # the OLDEST tokens (system prompt + early conversation turns) once
+      # exceeded -- no error, just quietly incoherent answers. Confirmed via
+      # our own logs (n_ctx_slot=4096 on every request before this fix) and
+      # documented upstream (ollama/ollama#2714, #6026, #9890). Set
+      # explicitly instead of trusting the default.
+      - OLLAMA_CONTEXT_LENGTH=16384
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # Web UI for chatting with / inspecting models served by the ollama
+  # service above — purely for manual inspection and testing convenience,
+  # not used by headlabs-cli itself (headlabs local talks directly to
+  # ollama's /v1 API).
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: headlabs-local-webui
+    depends_on:
+      - ollama
+    ports:
+      - "3000:8080"
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - WEBUI_AUTH=false
+      # Disable background tasks that silently use the main chat model and
+      # inflate every request's prompt (confirmed root cause of slow/stuck
+      # responses on resource-constrained self-hosted setups — see
+      # https://docs.openwebui.com/troubleshooting/performance/).
+      - ENABLE_TITLE_GENERATION=false
+      - ENABLE_TAGS_GENERATION=false
+      - ENABLE_AUTOCOMPLETE_GENERATION=false
+      - ENABLE_FOLLOW_UP_GENERATION=false
+      - ENABLE_RETRIEVAL_QUERY_GENERATION=false
+    volumes:
+      - open_webui_data:/app/backend/data
+    restart: unless-stopped
+
+volumes:
+  ollama_models:
+    name: headlabs_local_ollama_models
+  open_webui_data:
+    name: headlabs_local_open_webui_data
