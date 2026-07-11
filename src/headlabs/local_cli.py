@@ -182,11 +182,7 @@ def _cmd_local_inspect(args) -> None:
     )
 
     if getattr(args, "provider", "self-hosted") == "platform":
-        print("--provider platform ainda não está disponível: a plataforma HeadLabs")
-        print("não expõe um endpoint OpenAI-compatible (/v1/chat/completions) para o loop.")
-        print("Use --provider self-hosted (default) apontando `headlabs local config`")
-        print("para qualquer endpoint OpenAI-compatible.")
-        sys.exit(2)
+        return _cmd_local_inspect_platform(args)
 
     directory = os.path.abspath(getattr(args, "directory", None) or ".")
     if not os.path.isdir(directory):
@@ -229,6 +225,72 @@ def _cmd_local_inspect(args) -> None:
     if new_items:
         print(f"  \033[36m📋\033[0m {len(new_items)} item(ns) em {backlog_mod.BACKLOG_SUBPATH}")
         print(f"     Ver: headlabs local backlog")
+
+    if getattr(args, "fix", False) and new_items:
+        _apply_local_fix(args, directory, [i for i in new_items if i.get("status") != "done"])
+
+
+def _cmd_local_inspect_platform(args) -> None:
+    """Inspect a local project via the HeadLabs platform (Claude-backed agent).
+    The cloud runtime can't read the local disk, so the CLI bundles the source
+    client-side and ships it to a declarative inspector agent using the same
+    invoke+poll pattern as `agents`/`labs`."""
+    from headlabs.client import HeadLabsClient
+    from headlabs.local import backlog as backlog_mod
+    from headlabs.local.inspector import (
+        build_code_bundle, ensure_platform_agent, platform_findings_from_result,
+    )
+
+    directory = os.path.abspath(getattr(args, "directory", None) or ".")
+    if not os.path.isdir(directory):
+        print(f"Not a directory: {directory}")
+        sys.exit(2)
+    role = getattr(args, "role", "qa") or "qa"
+    context = getattr(args, "inspect_context", None)
+
+    client = HeadLabsClient()
+    print(f"  \033[36m⚙\033[0m Inspeção via plataforma (Claude) — role \033[1m{role}\033[0m")
+    bundle = build_code_bundle(directory)
+    print(f"    Empacotados {len(bundle)} bytes de código de {os.path.basename(directory)}")
+    try:
+        agent_id = ensure_platform_agent(client)
+    except Exception as e:
+        print(f"  \033[31mNão foi possível provisionar o agente da plataforma: {e}\033[0m")
+        sys.exit(1)
+
+    instruction = f"Inspect this project as a {role} specialist and return JSON findings."
+    if context:
+        instruction += f" User focus: {context}."
+    input_data = {"question": f"{instruction}\n\n{bundle}", "role": role}
+    try:
+        exec_id, tenant_id, stream_id = client.invoke(agent_id, input_data)
+    except Exception as e:
+        print(f"  \033[31mFalha ao invocar o agente da plataforma: {e}\033[0m")
+        sys.exit(1)
+    print(f"    Execução: {exec_id}")
+    print("    \033[2mAguardando inspeção da plataforma...\033[0m")
+    try:
+        result = client.poll(exec_id, tenant_id=tenant_id, stream_id=stream_id, timeout=600)
+    except Exception as e:
+        print(f"  \033[31mErro no poll da execução: {e}\033[0m")
+        sys.exit(1)
+
+    before_ids = {i.get("id") for i in backlog_mod.load_backlog(directory)}
+    new_items = []
+    for f in platform_findings_from_result(result):
+        new_items.append(backlog_mod.add_finding(directory, role=role, **f))
+    new_items = [i for i in new_items if i.get("id") not in before_ids]
+    new_ids = [i["id"] for i in new_items]
+    backlog_mod.restamp_role(directory, new_ids, role, origin="platform")
+    id_set = set(new_ids)
+    new_items = [i for i in backlog_mod.load_backlog(directory) if i["id"] in id_set]
+
+    _render_findings(new_items, role)
+    if new_items:
+        print(f"  \033[36m📋\033[0m {len(new_items)} item(ns) em {backlog_mod.BACKLOG_SUBPATH}")
+        print(f"     Ver: headlabs local backlog")
+    elif getattr(result, "summary", ""):
+        print(f"  \033[2m{result.summary}\033[0m")
 
     if getattr(args, "fix", False) and new_items:
         _apply_local_fix(args, directory, [i for i in new_items if i.get("status") != "done"])

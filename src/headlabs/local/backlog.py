@@ -86,11 +86,13 @@ def add_finding(
     return by_id[item["id"]]
 
 
-def restamp_role(cwd: str, item_ids, role: str) -> None:
+def restamp_role(cwd: str, item_ids, role: str, origin: str = "local") -> None:
     """Rewrite the ``source`` of the given items to the authoritative inspection
-    role. The ``report_finding`` tool records whatever ``role`` the model passed
-    (often the default), but the real role is the one the CLI was invoked with —
-    so the CLI stamps it after the run instead of trusting the model."""
+    role and origin. The ``report_finding`` tool records whatever ``role`` the
+    model passed (often the default), but the real role is the one the CLI was
+    invoked with — so the CLI stamps it after the run instead of trusting the
+    model. ``origin`` distinguishes the self-hosted loop ('local') from the
+    platform (Claude) provider ('platform')."""
     ids = set(item_ids)
     if not ids:
         return
@@ -98,7 +100,7 @@ def restamp_role(cwd: str, item_ids, role: str) -> None:
     changed = False
     for it in items:
         if it.get("id") in ids:
-            it["source"] = f"inspector/{role} (local)"
+            it["source"] = f"inspector/{role} ({origin})"
             changed = True
     if changed:
         save_backlog(cwd, items)

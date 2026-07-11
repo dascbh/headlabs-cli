@@ -81,6 +81,72 @@ def test_parse_findings_fallback_no_json():
     assert inspector.parse_findings_fallback("no findings here") == []
 
 
+# ── platform provider helpers ────────────────────────────────────────────────
+
+import types
+
+
+def test_build_code_bundle_includes_source_excludes_vendored(tmp_path):
+    (tmp_path / "app.py").write_text("print('hi')\n")
+    (tmp_path / "notes.txt").write_text("ignore me")  # not a source ext
+    vendored = tmp_path / "node_modules" / "pkg"
+    vendored.mkdir(parents=True)
+    (vendored / "index.js").write_text("var x = 1")
+    bundle = inspector.build_code_bundle(str(tmp_path))
+    assert "FILE: app.py" in bundle
+    assert "notes.txt" not in bundle
+    assert "node_modules" not in bundle
+
+
+def test_platform_findings_from_dict_wrapper():
+    res = types.SimpleNamespace(raw_output={"answer": "", "findings": [
+        {"severity": "critical", "title": "SQLi", "detail": "concat", "fix": "params", "file": "a.py", "line": 12},
+    ]}, summary="")
+    out = inspector.platform_findings_from_result(res)
+    assert len(out) == 1 and out[0]["severity"] == "critical" and out[0]["line"] == 12
+
+
+def test_platform_findings_handles_brackets_in_strings():
+    # Regression: bracket chars inside a detail must not break structured extraction.
+    res = types.SimpleNamespace(raw_output={"findings": [
+        {"severity": "high", "title": "Arr", "detail": "uses list[0] and dict[key]", "fix": "x"},
+    ]}, summary="")
+    out = inspector.platform_findings_from_result(res)
+    assert len(out) == 1 and "list[0]" in out[0]["detail"]
+
+
+def test_platform_findings_empty_when_no_data():
+    res = types.SimpleNamespace(raw_output={"answer": ""}, summary="")
+    assert inspector.platform_findings_from_result(res) == []
+
+
+def test_ensure_platform_agent_creates_when_missing():
+    created = {}
+
+    class FakeClient:
+        def list_remote_agents(self):
+            return [{"id": "other"}]
+
+        def create_agent(self, **kwargs):
+            created.update(kwargs)
+            return {"id": kwargs["agent_id"]}
+
+    agent_id = inspector.ensure_platform_agent(FakeClient())
+    assert agent_id == inspector.PLATFORM_AGENT_ID
+    assert created["agent_id"] == inspector.PLATFORM_AGENT_ID
+
+
+def test_ensure_platform_agent_idempotent_when_present():
+    class FakeClient:
+        def list_remote_agents(self):
+            return [{"id": inspector.PLATFORM_AGENT_ID}]
+
+        def create_agent(self, **kwargs):
+            raise AssertionError("must not create when agent already exists")
+
+    assert inspector.ensure_platform_agent(FakeClient()) == inspector.PLATFORM_AGENT_ID
+
+
 # ── end-to-end: engine drives report_finding ─────────────────────────────────
 
 class _FakeProvider:

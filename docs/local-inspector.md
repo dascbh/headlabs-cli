@@ -1,14 +1,19 @@
 # Proposta: `headlabs local inspect` — inspector white-box para projetos locais
 
-> **Status: implementado (MVP completo).** Escopo entregue: inspeção estática +
+> **Status: implementado (completo).** Escopo entregue: inspeção estática +
 > `--fix` + front-end (`--url`), superfície **`headlabs local inspect`**, backend
-> self-hosted + ponte de skills (`--skill`). `--provider platform` fica como
-> dependência de fase 2 (a plataforma não expõe `/v1/chat/completions`). Uso
+> **híbrido**: self-hosted (default) e **`--provider platform`** (agente Claude
+> declarativo, via invoke+poll — ver §8) + ponte de skills (`--skill`). Uso
 > resumido em `docs/local-runtime.md` §5; este doc mantém o racional de design.
 >
 > Código: `src/headlabs/local/inspector.py`, `local/backlog.py`,
 > `local/tools/report_finding.py`, handlers em `local_cli.py`, subparsers em
 > `cli.py`. Testes: `tests/test_local_{inspector,backlog,report_finding}.py`.
+>
+> **Comparação real medida** (repo `Vulnerable-Flask-App`, `--role security`):
+> self-hosted `granite4.1:8b` achou 1–2 issues; `--provider platform`
+> (Claude Sonnet 4.5) achou 23–27 (SQLi, SSTI, YAML RCE, JWT bypass, XXE, MD5,
+> secrets hardcoded, Python 2.7 EOL) com números de linha exatos.
 
 ## 1. Contexto / problema
 
@@ -172,12 +177,15 @@ mapa role→skill default (ex.: `security` puxa `security-checklist` se existir)
   OpenAI-compatible de `headlabs local config`. Para maior qualidade sem rodar um
   servidor próprio, o usuário pode apontar o `base_url` para qualquer endpoint
   OpenAI-compatible (vLLM hospedado, comercial, etc.).
-- **`--provider platform` (dependência de fase 2, NÃO nesta entrega):** a
-  plataforma **não expõe** `/v1/chat/completions` hoje — só invoke de agentes +
-  executions (`client.py`). Usar a HeadLabs como cérebro do loop exige um gateway
-  chat-completions do lado do servidor. Vou deixar o ponto de extensão pronto
-  (seleção de provider isolada em `_build_inspect_engine`), mas a flag fica
-  documentada como indisponível até essa infra existir.
+- **`--provider platform` (implementado):** em vez de um gateway
+  chat-completions (que a plataforma não expõe), o modo platform usa o padrão
+  que o CLI já emprega em `agents`/`labs`: o CLI empacota o código localmente
+  (`build_code_bundle`) e o envia a um agente declarativo Claude-backed via
+  `client.invoke()` + `client.poll()`, depois faz parse das findings
+  (`platform_findings_from_result`) para o mesmo backlog. Na 1ª execução
+  provisiona o agente `local-code-inspector` (`ensure_platform_agent`,
+  idempotente). Não usa `headlabs local config` nem `--profile` AWS. O código é
+  enviado para a nuvem (considerar antes de usar em código sensível).
 
 ## 9. Mudanças de código (resumo)
 

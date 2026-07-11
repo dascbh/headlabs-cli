@@ -145,6 +145,99 @@ def build_fix_prompt_from_findings(items: list[dict]) -> str:
             "each, reading the file first to see exact content:\n\n" + body)
 
 
+# ── platform provider (invoke a Claude-backed declarative agent) ─────────────
+
+PLATFORM_AGENT_ID = "local-code-inspector"
+
+_PLATFORM_AGENT_PROMPT = """\
+You are a senior software inspector. You receive a bundle of source files from a
+local project plus a target role (qa, ux, security, architect, performance,
+devops, data, frontend, backend). Review the code as that specialist and find
+real issues, citing evidence.
+
+Return ONLY a JSON array (no prose, no markdown fences) of findings, each:
+{"severity": "critical|high|medium|low", "title": "...", "detail": "... with
+evidence ...", "fix": "concrete fix", "file": "path", "line": <int or null>}
+
+Base every finding on the code you were given. Do not invent issues. If the code
+is clean, return [].
+"""
+
+# Same excludes as GlobTool so the bundle mirrors what the local inspector sees.
+_BUNDLE_EXCLUDE_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv",
+                        "dist", "build", ".headlabs", ".mypy_cache", ".pytest_cache"}
+_BUNDLE_EXTS = {".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rb", ".php", ".java",
+                ".rs", ".html", ".css", ".yaml", ".yml", ".toml", ".cfg", ".ini",
+                ".json", ".sh", ".env", ".sql", "Dockerfile", ".md"}
+_BUNDLE_MAX_TOTAL = 120_000   # cap the whole bundle so the invoke payload stays sane
+_BUNDLE_MAX_FILE = 20_000     # per-file cap
+
+
+def build_code_bundle(directory: str) -> str:
+    """Walk the project and concatenate its source files (bounded) into one
+    text bundle to ship to the platform agent — the cloud runtime can't read
+    the user's disk, so the CLI gathers the code client-side (the same read-only
+    view the local inspector has) and sends it in the invoke payload."""
+    import os
+
+    parts, total = [], 0
+    for root, dirs, files in os.walk(directory):
+        dirs[:] = [d for d in dirs if d not in _BUNDLE_EXCLUDE_DIRS]
+        for name in sorted(files):
+            ext_ok = name in _BUNDLE_EXTS or os.path.splitext(name)[1] in _BUNDLE_EXTS
+            if not ext_ok:
+                continue
+            path = os.path.join(root, name)
+            rel = os.path.relpath(path, directory)
+            try:
+                text = open(path, encoding="utf-8", errors="replace").read()
+            except OSError:
+                continue
+            if len(text) > _BUNDLE_MAX_FILE:
+                text = text[:_BUNDLE_MAX_FILE] + "\n... (truncated)"
+            block = f"===== FILE: {rel} =====\n{text}\n"
+            if total + len(block) > _BUNDLE_MAX_TOTAL:
+                parts.append(f"... (bundle truncated at {_BUNDLE_MAX_TOTAL} bytes)")
+                return "\n".join(parts)
+            parts.append(block)
+            total += len(block)
+    return "\n".join(parts) if parts else "(no source files found)"
+
+
+def ensure_platform_agent(client) -> str:
+    """Create the declarative inspector agent if it doesn't exist yet
+    (idempotent). Returns its id."""
+    try:
+        existing = {a.get("id") for a in client.list_remote_agents()}
+    except Exception:
+        existing = set()
+    if PLATFORM_AGENT_ID not in existing:
+        client.create_agent(
+            agent_id=PLATFORM_AGENT_ID,
+            display_name="Local Code Inspector",
+            prompt=_PLATFORM_AGENT_PROMPT,
+            description="Reviews a bundle of local source files and returns JSON findings.",
+        )
+    return PLATFORM_AGENT_ID
+
+
+def platform_findings_from_result(result) -> list[dict]:
+    """Extract findings (add_finding kwargs) from a platform execution Result,
+    whichever shape the agent returned them in."""
+    raw = getattr(result, "raw_output", None)
+    # Already-structured output: map the list directly (never round-trip through
+    # the text parser, whose bracket matching isn't string-aware).
+    if isinstance(raw, list):
+        return _normalize_findings(raw)
+    if isinstance(raw, dict):
+        for key in ("findings", "issues"):
+            if isinstance(raw.get(key), list):
+                return _normalize_findings(raw[key])
+        if raw.get("answer"):
+            return parse_findings_fallback(raw["answer"])
+    return parse_findings_fallback(getattr(result, "summary", "") or "")
+
+
 def fetch_skills(skill_ids: list[str] | None) -> str:
     """Fetch skill content from the platform and concatenate it for prompt
     injection. Best-effort: a missing/unreachable skill (or no platform
@@ -179,18 +272,19 @@ def parse_findings_fallback(text: str) -> list[dict]:
     if not text:
         return []
     raw = _extract_json_array(text)
-    if raw is None:
-        return []
+    return _normalize_findings(raw) if raw is not None else []
+
+
+def _normalize_findings(items: list) -> list[dict]:
+    """Coerce a list of finding-like dicts into add_finding kwargs. Shared by
+    the text-fallback path and the platform (already-structured) path."""
     out = []
-    for obj in raw:
-        if not isinstance(obj, dict):
-            continue
-        if not (obj.keys() & _FINDING_KEYS):
+    for obj in items:
+        if not isinstance(obj, dict) or not (obj.keys() & _FINDING_KEYS):
             continue
         title = str(obj.get("title") or obj.get("description") or "").strip()
         if not title:
             continue
-        detail = str(obj.get("detail") or obj.get("description") or "").strip()
         line = obj.get("line")
         try:
             line = int(line) if line is not None else None
@@ -199,7 +293,7 @@ def parse_findings_fallback(text: str) -> list[dict]:
         out.append({
             "severity": str(obj.get("severity", "medium")).lower(),
             "title": title,
-            "detail": detail,
+            "detail": str(obj.get("detail") or obj.get("description") or "").strip(),
             "fix": str(obj.get("fix", "")).strip(),
             "file": str(obj.get("file", "")).strip(),
             "line": line,

@@ -239,7 +239,12 @@ headlabs local fix                             # corrigir itens abertos do backl
 - **Skills (`--skill ID`)**: busca o conteúdo da skill na plataforma
   (`GET /resources/skill/{id}`) e injeta no prompt — best-effort, funciona com
   qualquer backend; falha graciosamente offline.
-- **`--provider platform`**: reservado; hoje indisponível (a plataforma não
-  expõe `/v1/chat/completions` para o loop). Para maior qualidade sem
-  self-hosting próprio, aponte `--provider self-hosted` para qualquer endpoint
-  OpenAI-compatible melhor.
+- **`--provider platform`**: roda a inspeção na HeadLabs com um agente
+  declarativo Claude-backed. Como o runtime da nuvem não lê seu disco, o CLI
+  **empacota o código localmente** (`build_code_bundle`) e o envia via
+  `invoke`+`poll` — o mesmo padrão de `agents`/`labs`, sem exigir `--profile`
+  AWS. Na primeira execução provisiona (idempotente) o agente
+  `local-code-inspector`. Não precisa de `headlabs local config`. Trade-off:
+  qualidade muito maior (Claude Sonnet) ao custo de tokens da plataforma e de
+  enviar o código para a nuvem — use `--provider self-hosted` (default) para
+  ficar 100% local/offline.
