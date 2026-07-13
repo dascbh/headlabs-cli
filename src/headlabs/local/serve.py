@@ -137,12 +137,13 @@ def detect_run_commands(cwd: str, *, serve_cmd: str | None = None,
                         build: bool = True) -> RunPlan:
     """Read a project directory and decide how to install, build and serve it.
 
-    ``serve_cmd`` / ``port`` are explicit overrides (from CLI flags) that skip
-    detection for that field. Raises ``ValueError`` when the project can't be
-    served automatically and no ``serve_cmd`` override was given.
+    Detection order: an explicit ``serve_cmd`` override wins; then a Node project
+    (``package.json``); then non-Node stacks (Django, Streamlit, FastAPI, Flask,
+    Go, or a static ``index.html``). ``serve_cmd`` / ``port`` are explicit
+    overrides that skip detection for that field. Raises ``ValueError`` when the
+    project can't be served automatically and no ``serve_cmd`` was given.
     """
     root = Path(cwd)
-    manager = _detect_manager(root)
     pkg_path = root / "package.json"
 
     # Explicit override: trust the user's command; still detect a port default.
@@ -154,13 +155,23 @@ def detect_run_commands(cwd: str, *, serve_cmd: str | None = None,
             except (json.JSONDecodeError, OSError):
                 pass
         return RunPlan(serve_cmd=serve_cmd, port=port or default_port, cwd=str(root),
-                       framework=framework, manager=manager)
+                       framework=framework, manager=_detect_manager(root))
 
-    if not pkg_path.exists():
-        raise ValueError(
-            f"No package.json in {root} — cannot auto-serve. "
-            f"Pass --serve-cmd '<command>' and --port <n> to serve a non-Node project."
-        )
+    if pkg_path.exists():
+        return _detect_node(root, pkg_path, port, build)
+
+    plan = _detect_non_node(root, port, build)
+    if plan is not None:
+        return plan
+    raise ValueError(
+        f"Could not detect how to serve {root} (no package.json, manage.py, "
+        f"go.mod, index.html, or Python web deps). Pass --serve-cmd '<command>' "
+        f"and --port <n> to serve it explicitly."
+    )
+
+
+def _detect_node(root: Path, pkg_path: Path, port: int | None, build: bool) -> RunPlan:
+    manager = _detect_manager(root)
     try:
         pkg = json.loads(pkg_path.read_text())
     except (json.JSONDecodeError, OSError) as exc:
@@ -176,7 +187,6 @@ def detect_run_commands(cwd: str, *, serve_cmd: str | None = None,
 
     framework, default_port = _detect_framework_port(pkg)
     build_cmd = _run_script_cmd(manager, "build") if (build and scripts.get("build")) else None
-
     return RunPlan(
         serve_cmd=_run_script_cmd(manager, serve_script),
         port=port or default_port,
@@ -186,6 +196,78 @@ def detect_run_commands(cwd: str, *, serve_cmd: str | None = None,
         framework=framework,
         manager=manager,
     )
+
+
+def _first_existing(root: Path, names) -> str | None:
+    return next((n for n in names if (root / n).exists()), None)
+
+
+def _read_py_manifest(root: Path) -> str | None:
+    parts = []
+    for f in ("requirements.txt", "pyproject.toml", "Pipfile", "setup.py", "setup.cfg"):
+        p = root / f
+        if p.exists():
+            try:
+                parts.append(p.read_text())
+            except OSError:
+                pass
+    return "\n".join(parts) if parts else None
+
+
+def _py_install(root: Path) -> str | None:
+    if (root / "requirements.txt").exists():
+        return "pip install -r requirements.txt"
+    if (root / "pyproject.toml").exists() or (root / "setup.py").exists():
+        return "pip install ."
+    return None
+
+
+def _detect_non_node(root: Path, port: int | None, build: bool) -> RunPlan | None:
+    """Detect how to serve non-Node stacks. Best-effort and conservative — an
+    unrecognized layout returns None so the caller raises a helpful error."""
+    # Django — the highest-confidence Python signal.
+    if (root / "manage.py").exists():
+        p = port or 8000
+        return RunPlan(serve_cmd=f"python manage.py runserver 0.0.0.0:{p}", port=p,
+                       cwd=str(root), install_cmd=_py_install(root),
+                       framework="django", manager="python")
+
+    manifest = _read_py_manifest(root)
+    if manifest:
+        low = manifest.lower()
+        if "streamlit" in low:
+            p = port or 8501
+            entry = _first_existing(root, ["streamlit_app.py", "app.py", "main.py"]) or "app.py"
+            return RunPlan(
+                serve_cmd=(f"streamlit run {entry} --server.port {p} "
+                           f"--server.address 0.0.0.0 --server.headless true"),
+                port=p, cwd=str(root), install_cmd=_py_install(root),
+                framework="streamlit", manager="python")
+        entry = _first_existing(root, ["app.py", "main.py", "server.py", "asgi.py", "wsgi.py"])
+        if ("fastapi" in low or "uvicorn" in low) and entry:
+            p = port or 8000
+            return RunPlan(serve_cmd=f"uvicorn {entry[:-3]}:app --host 0.0.0.0 --port {p}",
+                           port=p, cwd=str(root), install_cmd=_py_install(root),
+                           framework="fastapi", manager="python")
+        if "flask" in low and entry:
+            p = port or 5000
+            return RunPlan(serve_cmd=f"flask --app {entry[:-3]} run --host 0.0.0.0 --port {p}",
+                           port=p, cwd=str(root), install_cmd=_py_install(root),
+                           framework="flask", manager="python")
+
+    # Go web app.
+    if (root / "go.mod").exists():
+        p = port or 8080
+        return RunPlan(serve_cmd="go run .", port=p, cwd=str(root),
+                       build_cmd=("go build ./..." if build else None),
+                       framework="go", manager="go")
+
+    # Plain static site — serve the directory over HTTP.
+    if (root / "index.html").exists():
+        p = port or 8000
+        return RunPlan(serve_cmd=f"python3 -m http.server {p} --bind 0.0.0.0", port=p,
+                       cwd=str(root), framework="static", manager="python")
+    return None
 
 
 def _scan_url(line: str) -> str | None:

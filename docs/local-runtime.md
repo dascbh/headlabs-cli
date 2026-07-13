@@ -216,6 +216,8 @@ LLM configurado via `headlabs local config` (igual a `run`/`chat`).
 headlabs local inspect .                       # inspeção QA do diretório atual
 headlabs local inspect ./app --role backend -i "foco em auth"
 headlabs local inspect ./app --role frontend --url http://localhost:5173
+headlabs local inspect ./app --role usability --serve --provider platform  # build+run+testa+derruba
+headlabs local inspect ./app --role usability --url https://app.com --auth-storage state.json  # atrás de login
 headlabs local inspect . --skill sec-checklist # injeta uma skill da plataforma
 headlabs local inspect . --fix --yes           # aplica correções + loop de teste
 headlabs local backlog                         # ver .headlabs/local_backlog.json
@@ -266,3 +268,56 @@ headlabs local fix                             # corrigir itens abertos do backl
   qualidade muito maior (Claude Sonnet) ao custo de tokens da plataforma e de
   enviar o código para a nuvem — use `--provider self-hosted` (default) para
   ficar 100% local/offline.
+
+### 5.1. Rodar o app local antes de inspecionar (`--serve`)
+
+Fecha o ciclo **build → run → acessar → testar**: em vez de você subir o dev
+server à mão e passar `--url`, o `--serve` detecta como o projeto sobe, builda,
+inicia o servidor **em background**, espera ele responder (health-check HTTP),
+inspeciona, e **derruba tudo no fim** (SIGTERM→SIGKILL na árvore de processos —
+`src/headlabs/local/serve.py`).
+
+```bash
+headlabs local inspect ./app --role usability --serve                # auto-detecta build/run/porta
+headlabs local inspect ./app --role usability --serve --install      # roda o install antes do build
+headlabs local inspect ./app --role usability --serve --no-build     # pula o build, sobe direto o dev server
+headlabs local inspect ./api --serve --serve-cmd "uvicorn main:app --port 8000" --port 8000
+```
+
+- **Detecção automática** (`detect_run_commands`): lê `package.json`+lockfile
+  (Vite→5173, Next/CRA→3000, Angular→4200, etc; manager npm/pnpm/yarn/bun) e,
+  para stacks não-Node, reconhece Django (`manage.py`), Streamlit, FastAPI,
+  Flask, Go (`go.mod`) e sites estáticos (`index.html`). Overrides: `--serve-cmd`
+  (comando de start) e `--port`.
+- **Browser local**: um alvo `localhost`/servido é **inalcançável pelo MCP
+  remoto**, então a camada determinística (axe-core + inspect mobile) roda num
+  **Playwright local** (`browser_probe.py`) que enxerga o localhost — com os
+  **mesmos findings reproduzíveis** do caminho remoto (axe embarcado no pacote).
+- **Teardown garantido**: o dev server sobe no seu próprio process group; ao sair
+  (sucesso ou erro) o grupo inteiro é morto. Se o servidor sair antes de
+  responder, o erro traz a saída dele.
+
+### 5.2. Páginas atrás de autenticação (`--auth-*`)
+
+Permite inspecionar páginas login-gated (ou um app servido atrás de auth). A
+credencial é aplicada ao **contexto do browser** (`browser.new_context(...)`),
+valendo tanto para a camada determinística local quanto para a tool
+`browser_devtools` dirigida por LLM (`browser_auth.py`).
+
+```bash
+# storage_state (RECOMENDADO): login manual 1x, reusa a sessão — sem senha na CLI
+npx playwright open --save-storage=state.json https://app.com/login   # capture uma vez
+headlabs local inspect . --role usability --url https://app.com --auth-storage state.json
+
+headlabs local inspect . --role usability --url https://app.com --auth-basic user:senha
+headlabs local inspect . --role usability --url https://app.com --auth-header "Authorization: Bearer $TOKEN"
+```
+
+- `--auth-storage FILE` — JSON de `storageState` do Playwright (cookies +
+  localStorage de uma sessão logada). É o caminho recomendado: nenhuma senha
+  passa pela CLI e cobre sessões SPA/JWT.
+- `--auth-basic USER:PASS` — HTTP Basic auth.
+- `--auth-header 'K: V'` — header estático (repetível), ex. bearer token.
+- **Escopo**: auth vale nos caminhos de **browser local** (localhost/`--serve` ou
+  qualquer `--url` com auth). O MCP remoto não expõe parâmetros de auth, então um
+  alvo autenticado é inerentemente um cenário de browser local.
