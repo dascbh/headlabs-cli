@@ -297,16 +297,41 @@ headlabs local inspect ./api --serve --serve-cmd "uvicorn main:app --port 8000" 
   (sucesso ou erro) o grupo inteiro é morto. Se o servidor sair antes de
   responder, o erro traz a saída dele.
 
-### 5.2. Páginas atrás de autenticação (`--auth-*`)
+### 5.2. Páginas atrás de autenticação
 
-Permite inspecionar páginas login-gated (ou um app servido atrás de auth). A
-credencial é aplicada ao **contexto do browser** (`browser.new_context(...)`),
-valendo tanto para a camada determinística local quanto para a tool
-`browser_devtools` dirigida por LLM (`browser_auth.py`).
+Há dois jeitos: **auto-login** (a ferramenta loga sozinha a partir de
+usuário+senha — um comando só) e **credencial pronta** (`--auth-*`). Em ambos, a
+auth é aplicada ao **contexto do browser** (`browser.new_context(...)`), valendo
+tanto para a camada determinística local quanto para a tool `browser_devtools`.
+
+#### Auto-login (`--login-url`) — um comando testa qualquer site
 
 ```bash
-# storage_state (RECOMENDADO): login manual 1x, reusa a sessão — sem senha na CLI
-npx playwright open --save-storage=state.json https://app.com/login   # capture uma vez
+headlabs local inspect . --role usability \
+  --login-url https://app.com/login \
+  --login-user admin@app.com --login-pass 'senha' \
+  --url https://app.com/dashboard \
+  --provider platform --yes
+```
+
+A ferramenta abre o browser, **preenche o formulário de login, submete, captura
+a sessão** (cookies + localStorage, ex. JWT/Cognito) e então inspeciona a área
+autenticada (`login.py`). Detalhes:
+
+- `--login-user` / `--login-pass` (ou a env `HEADLABS_LOGIN_PASS` para não expor
+  a senha no histórico do shell).
+- Seletores dos campos são tolerantes por padrão (email/usuário + senha +
+  submit); para formulários fora do padrão, passe `--login-user-field`,
+  `--login-pass-field`, `--login-submit` com seletores CSS.
+- Se `--url` for omitido, inspeciona a **página onde o login caiu** (landing).
+- Falha ruidosa: credencial errada / campos não encontrados → erro claro, sem
+  inspecionar deslogado por engano.
+
+#### Credencial pronta (`--auth-*`)
+
+```bash
+# storage_state: reusa uma sessão já capturada (sem digitar senha na CLI)
+npx playwright open --save-storage=state.json https://app.com/login   # captura 1x
 headlabs local inspect . --role usability --url https://app.com --auth-storage state.json
 
 headlabs local inspect . --role usability --url https://app.com --auth-basic user:senha
@@ -314,10 +339,10 @@ headlabs local inspect . --role usability --url https://app.com --auth-header "A
 ```
 
 - `--auth-storage FILE` — JSON de `storageState` do Playwright (cookies +
-  localStorage de uma sessão logada). É o caminho recomendado: nenhuma senha
-  passa pela CLI e cobre sessões SPA/JWT.
+  localStorage). Bom para reusar a mesma sessão em várias execuções.
 - `--auth-basic USER:PASS` — HTTP Basic auth.
 - `--auth-header 'K: V'` — header estático (repetível), ex. bearer token.
-- **Escopo**: auth vale nos caminhos de **browser local** (localhost/`--serve` ou
-  qualquer `--url` com auth). O MCP remoto não expõe parâmetros de auth, então um
-  alvo autenticado é inerentemente um cenário de browser local.
+
+> **Roteamento**: qualquer auth (auto-login ou `--auth-*`) **força o browser
+> local**, o único que autentica — o MCP remoto não expõe parâmetros de auth.
+> Não commite os arquivos `*_state.json` (contêm tokens); já estão no `.gitignore`.

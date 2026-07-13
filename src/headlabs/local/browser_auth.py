@@ -27,9 +27,13 @@ from pathlib import Path
 
 @dataclass
 class BrowserAuth:
-    """Authentication material for an inspected page. Empty by default."""
+    """Authentication material for an inspected page. Empty by default.
 
-    storage_state: str | None = None
+    ``storage_state`` may be a path to a Playwright storageState JSON, or an
+    already-loaded state ``dict`` (e.g. produced in-memory by ``login.capture_login``).
+    """
+
+    storage_state: str | dict | None = None
     http_credentials: tuple[str, str] | None = None
     extra_http_headers: dict[str, str] = field(default_factory=dict)
 
@@ -39,15 +43,19 @@ class BrowserAuth:
     def context_kwargs(self) -> dict:
         """Map to ``browser.new_context(...)`` kwargs.
 
-        Raises ``ValueError`` if a ``storage_state`` path was given but does not
+        Raises ``ValueError`` if a ``storage_state`` *path* was given but does not
         exist — failing loudly here beats a silent unauthenticated inspection.
+        An in-memory state ``dict`` is passed straight through.
         """
         kw: dict = {}
         if self.storage_state:
-            p = Path(self.storage_state).expanduser()
-            if not p.is_file():
-                raise ValueError(f"storage_state file not found: {p}")
-            kw["storage_state"] = str(p)
+            if isinstance(self.storage_state, dict):
+                kw["storage_state"] = self.storage_state
+            else:
+                p = Path(self.storage_state).expanduser()
+                if not p.is_file():
+                    raise ValueError(f"storage_state file not found: {p}")
+                kw["storage_state"] = str(p)
         if self.http_credentials:
             user, pwd = self.http_credentials
             kw["http_credentials"] = {"username": user, "password": pwd}

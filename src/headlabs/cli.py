@@ -4365,6 +4365,19 @@ def main():
                             help="HTTP Basic auth credentials for the inspected page")
     pl_inspect.add_argument("--auth-header", dest="auth_header", action="append", metavar="'K: V'",
                             help="Extra request header, e.g. 'Authorization: Bearer <token>' (repeatable)")
+    # ── Auto form-login: log in and inspect any site in one command ──
+    pl_inspect.add_argument("--login-url", dest="login_url", metavar="URL",
+                            help="Login page URL — the tool fills the form, logs in, and inspects the authenticated app")
+    pl_inspect.add_argument("--login-user", dest="login_user", metavar="USER",
+                            help="Username/email for --login-url")
+    pl_inspect.add_argument("--login-pass", dest="login_pass", metavar="PASS",
+                            help="Password for --login-url (or set env HEADLABS_LOGIN_PASS)")
+    pl_inspect.add_argument("--login-user-field", dest="login_user_field", metavar="CSS",
+                            help="CSS selector for the username field (for non-standard login forms)")
+    pl_inspect.add_argument("--login-pass-field", dest="login_pass_field", metavar="CSS",
+                            help="CSS selector for the password field")
+    pl_inspect.add_argument("--login-submit", dest="login_submit", metavar="CSS",
+                            help="CSS selector for the submit button")
     pl_inspect.set_defaults(func=cmd_local, local_cmd="inspect")
 
     pl_backlog = p_local_sub.add_parser("backlog", help="Show the local inspection backlog")

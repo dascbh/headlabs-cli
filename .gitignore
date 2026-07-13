@@ -29,3 +29,7 @@ reports/
 
 # Scratch HTML written by `headlabs local` runs in the repo root
 /*.html
+
+# arquivos de sessão do inspector (tokens) — nunca commitar
+*_state.json
+agrometa_state.json

@@ -186,9 +186,14 @@ def _should_use_local_browser(args, url, auth) -> bool:
 
 
 def _build_browser_auth(args):
-    """Assemble a BrowserAuth from the --auth-* flags, or None if none were
-    given. Exits(2) with a clear message on malformed input."""
+    """Assemble a BrowserAuth from --login-* (auto form login) and/or the
+    --auth-* flags, or None if none were given. Exits with a clear message on
+    malformed input or a failed login. On successful login, stashes the
+    post-login landing URL on ``args._login_landing`` so inspection can default
+    ``--url`` to it."""
     from headlabs.local.browser_auth import BrowserAuth
+
+    login_url = getattr(args, "login_url", None)
     try:
         auth = BrowserAuth.from_cli(
             storage=getattr(args, "auth_storage", None),
@@ -198,6 +203,30 @@ def _build_browser_auth(args):
     except ValueError as e:
         print(f"  \033[31m{e}\033[0m")
         sys.exit(2)
+
+    if login_url:
+        user = getattr(args, "login_user", None)
+        password = getattr(args, "login_pass", None) or os.environ.get("HEADLABS_LOGIN_PASS")
+        if not user or not password:
+            print("  \033[31m--login-url requer --login-user e --login-pass "
+                  "(ou a env HEADLABS_LOGIN_PASS)\033[0m")
+            sys.exit(2)
+        from headlabs.local.login import capture_login, LoginError
+        print(f"  \033[36m⚙\033[0m Login automático em {login_url} …")
+        try:
+            state, landing = capture_login(
+                login_url, user, password,
+                user_selector=getattr(args, "login_user_field", None),
+                password_selector=getattr(args, "login_pass_field", None),
+                submit_selector=getattr(args, "login_submit", None),
+            )
+        except LoginError as e:
+            print(f"  \033[31mFalha no login: {e}\033[0m")
+            sys.exit(1)
+        print(f"  \033[32m✓\033[0m Logado (sessão capturada) — landing: {landing}")
+        auth.storage_state = state          # in-memory state overrides any file
+        args._login_landing = landing
+
     return None if auth.is_empty() else auth
 
 
@@ -206,7 +235,8 @@ def _serve_and_inspect(args, directory, run):
     health-checked URL, then tear the server down. Otherwise call ``run`` with
     the explicit --url (or None). ``run`` takes a single ``url`` argument."""
     if not getattr(args, "serve", False):
-        return run(getattr(args, "url", None))
+        # Default the target to wherever the auto-login landed, if --url was omitted.
+        return run(getattr(args, "url", None) or getattr(args, "_login_landing", None))
     from headlabs.local.serve import detect_run_commands, ServedApp, ServeError
     no_build = getattr(args, "no_build", False)
     try:
@@ -323,9 +353,10 @@ def _cmd_local_inspect_platform(args) -> None:
     # agent adds the HEURISTIC layer on top. This removes the LLM from the
     # objective-findings path entirely, so those never vary between runs.
     if role == "usability":
-        auth = _build_browser_auth(args)
+        auth = _build_browser_auth(args)   # may perform auto-login and set _login_landing
+        url = url or getattr(args, "_login_landing", None)
         if not url and not getattr(args, "serve", False):
-            print("  \033[31m--role usability requer --url <URL do front-end rodando> ou --serve\033[0m")
+            print("  \033[31m--role usability requer --url, --serve ou --login-url\033[0m")
             sys.exit(2)
         _serve_and_inspect(args, directory, lambda u: _run_usability_platform(
             client, directory, u, context, args,
