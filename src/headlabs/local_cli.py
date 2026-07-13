@@ -272,6 +272,21 @@ def _cmd_local_inspect(args) -> None:
     role = getattr(args, "role", "qa") or "qa"
     context = getattr(args, "inspect_context", None)
     auth = _build_browser_auth(args)
+
+    # Usability without --provider platform runs the DETERMINISTIC layer only
+    # (axe + responsive + runtime): no LLM at all — no local server, no platform.
+    # The heuristic/checklist layers need --provider platform.
+    if role == "usability":
+        if getattr(args, "checklist", None):
+            print("  \033[33m⚠ --checklist requer --provider platform; rodando só a camada determinística\033[0m")
+        url_eff = getattr(args, "url", None) or getattr(args, "_login_landing", None)
+        if not url_eff and not getattr(args, "serve", False):
+            print("  \033[31m--role usability requer --url, --serve ou --login-url\033[0m")
+            sys.exit(2)
+        _serve_and_inspect(args, directory,
+                           lambda u: _run_usability_deterministic(directory, u, auth, args))
+        return
+
     _serve_and_inspect(args, directory,
                        lambda url: _do_self_hosted_inspect(args, directory, role, context, url, auth))
 
@@ -441,6 +456,44 @@ def _print_checklist_report(report):
         print(f"      {mark[r['verdict']]} {r['text']}")
         if r["verdict"] == "fail" and r["evidence"]:
             print(f"          \033[2m{r['evidence']}\033[0m")
+
+
+def _run_usability_deterministic(directory, url, auth, args) -> None:
+    """Deterministic-only usability inspection — axe WCAG + responsive + runtime,
+    straight from the local/remote browser probe, with NO LLM (works offline; no
+    local model server and no platform). This is the self-hosted usability path;
+    the heuristic/checklist layers require --provider platform."""
+    from headlabs.local import backlog as backlog_mod
+    from headlabs.local.inspector import deterministic_usability_findings
+
+    use_local = _should_use_local_browser(args, url, auth)
+    where = "browser local" if use_local else "MCP remoto"
+    print(f"  \033[36m⚙\033[0m Inspeção de usabilidade (determinística, sem LLM) — {url}")
+    print(f"    \033[2mCamada determinística ({where}): axe-core (WCAG) + inspeção mobile...\033[0m")
+    axe, mobile = _obtain_browser_signals(url, auth, use_local)
+    for probe, res in (("a11y_audit", axe), ("inspect_page", mobile)):
+        if isinstance(res, dict) and res.get("error"):
+            print(f"  \033[33m⚠ browser {probe}: {res['error']}\033[0m")
+
+    det = deterministic_usability_findings(axe, mobile)
+    before_ids = {i.get("id") for i in backlog_mod.load_backlog(directory)}
+    for f in det:
+        backlog_mod.add_finding(directory, role="usability", **f)
+    new_items = [i for i in backlog_mod.load_backlog(directory) if i.get("id") not in before_ids]
+    new_ids = [i["id"] for i in new_items]
+    backlog_mod.restamp_role(directory, new_ids, "usability")
+    new_items = [i for i in backlog_mod.load_backlog(directory) if i["id"] in set(new_ids)]
+
+    _render_findings(new_items, "usability")
+    if new_items:
+        print(f"  \033[36m📋\033[0m {len(new_items)} item(ns) em {backlog_mod.BACKLOG_SUBPATH}")
+        print("     Ver: headlabs local backlog")
+    else:
+        print("  \033[2mNenhum problema determinístico encontrado "
+              "(rode com --provider platform para a camada heurística/checklist).\033[0m")
+
+    if getattr(args, "fix", False) and new_items:
+        _apply_local_fix(args, directory, [i for i in new_items if i.get("status") != "done"])
 
 
 def _obtain_browser_signals(url, auth, use_local):

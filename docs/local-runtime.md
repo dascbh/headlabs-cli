@@ -228,6 +228,11 @@ headlabs local fix                             # corrigir itens abertos do backl
   (`qa/ux/security/architect/performance/devops/data/frontend/backend`) + `usability`.
   A especialização é um prompt embarcado no CLI (`src/headlabs/local/inspector.py`),
   não um agente remoto — por isso funciona 100% self-hosted.
+- **`--role usability` SEM `--provider platform`**: roda **só a camada
+  determinística** (axe/responsivo/runtime) — **sem LLM nenhum** (não precisa do
+  servidor local `headlabs local config` nem da plataforma; funciona offline
+  contra `--url`/`--serve`). As camadas heurística e `--checklist` exigem
+  `--provider platform`.
 - **`--role usability` + `--provider platform`**: inspeção de **duas camadas**
   da URL **viva** (`--url`), desenhada para consistência:
   1. **Determinística** — o CLI chama o MCP `browser-devtools` diretamente

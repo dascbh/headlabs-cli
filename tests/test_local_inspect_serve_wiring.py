@@ -14,7 +14,7 @@ import pytest
 from headlabs.local import backlog as backlog_mod
 from headlabs.local_cli import (
     _build_browser_auth, _obtain_browser_signals, _run_usability_platform, _serve_and_inspect,
-    _should_use_local_browser,
+    _run_usability_deterministic, _should_use_local_browser,
 )
 from headlabs.local.browser_auth import BrowserAuth
 from headlabs.local.serve import is_local_url
@@ -138,6 +138,21 @@ def test_obtain_browser_signals_local_uses_real_probe(tmp_path):
 
 
 # ── full usability path (deterministic layer) writes to the backlog ─────────
+
+@pytest.mark.skipif(not _browser_available(), reason="headless Chromium not available")
+def test_run_usability_deterministic_needs_no_client(tmp_path):
+    # Self-hosted usability: deterministic layer only, NO LLM/client at all.
+    (tmp_path / "index.html").write_text(_BAD_HTML)
+    port = _free_port()
+    from headlabs.local.serve import ServedApp, detect_run_commands
+    plan = detect_run_commands(str(tmp_path),
+                               serve_cmd=f"python3 -m http.server {port} --bind 127.0.0.1", port=port)
+    with ServedApp(plan, do_build=False, startup_timeout=20) as app:
+        _run_usability_deterministic(str(tmp_path), app.url, None, _args())  # no client passed
+    items = backlog_mod.load_backlog(str(tmp_path))
+    assert items, "expected deterministic findings without any LLM"
+    assert any("WCAG" in (i.get("title", "")) for i in items)
+
 
 @pytest.mark.skipif(not _browser_available(), reason="headless Chromium not available")
 def test_run_usability_platform_local_writes_findings(tmp_path):
