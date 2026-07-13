@@ -175,6 +175,16 @@ def _render_findings(items: list[dict], role: str) -> None:
     print()
 
 
+def _should_use_local_browser(args, url, auth) -> bool:
+    """Whether the deterministic layer must use the LOCAL Playwright probe rather
+    than the remote browser-devtools MCP. Required when the target is unreachable
+    by the remote MCP (localhost or a --serve'd app) OR when auth is set — the
+    remote MCP exposes no auth parameters, so only the local browser can carry a
+    storage_state / basic / header credential."""
+    from headlabs.local.serve import is_local_url
+    return bool(getattr(args, "serve", False) or is_local_url(url) or auth is not None)
+
+
 def _build_browser_auth(args):
     """Assemble a BrowserAuth from the --auth-* flags, or None if none were
     given. Exits(2) with a clear message on malformed input."""
@@ -313,14 +323,13 @@ def _cmd_local_inspect_platform(args) -> None:
     # agent adds the HEURISTIC layer on top. This removes the LLM from the
     # objective-findings path entirely, so those never vary between runs.
     if role == "usability":
-        from headlabs.local.serve import is_local_url
         auth = _build_browser_auth(args)
         if not url and not getattr(args, "serve", False):
             print("  \033[31m--role usability requer --url <URL do front-end rodando> ou --serve\033[0m")
             sys.exit(2)
         _serve_and_inspect(args, directory, lambda u: _run_usability_platform(
             client, directory, u, context, args,
-            auth=auth, use_local=(getattr(args, "serve", False) or is_local_url(u))))
+            auth=auth, use_local=_should_use_local_browser(args, u, auth)))
         return
 
     print(f"  \033[36m⚙\033[0m Inspeção via plataforma (Claude) — role \033[1m{role}\033[0m")

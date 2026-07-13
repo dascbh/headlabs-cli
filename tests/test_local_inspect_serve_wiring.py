@@ -14,7 +14,9 @@ import pytest
 from headlabs.local import backlog as backlog_mod
 from headlabs.local_cli import (
     _build_browser_auth, _obtain_browser_signals, _run_usability_platform, _serve_and_inspect,
+    _should_use_local_browser,
 )
+from headlabs.local.browser_auth import BrowserAuth
 from headlabs.local.serve import is_local_url
 
 
@@ -65,6 +67,27 @@ def test_build_browser_auth_bad_flag_exits(capsys):
     with pytest.raises(SystemExit) as ei:
         _build_browser_auth(_args(auth_basic="nopass"))
     assert ei.value.code == 2
+
+
+# ── local-vs-remote routing decision ────────────────────────────────────────
+
+def test_routing_public_url_no_auth_uses_remote():
+    assert _should_use_local_browser(_args(), "https://example.com", None) is False
+
+
+def test_routing_localhost_uses_local():
+    assert _should_use_local_browser(_args(), "http://localhost:5173", None) is True
+
+
+def test_routing_serve_uses_local():
+    assert _should_use_local_browser(_args(serve=True), "https://example.com", None) is True
+
+
+def test_routing_auth_forces_local_even_for_public_url():
+    # A storage_state/basic/header credential can only be applied by the local
+    # browser, so auth must force the local probe even for a public URL.
+    auth = BrowserAuth.from_cli(basic="u:p")
+    assert _should_use_local_browser(_args(), "https://app.example.com", auth) is True
 
 
 # ── _serve_and_inspect wraps the lifecycle and passes the healthy url ────────
