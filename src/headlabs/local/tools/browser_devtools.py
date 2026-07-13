@@ -73,9 +73,17 @@ class _BrowserWorker:
         self._jobs: queue.Queue = queue.Queue()
         self._playwright = None
         self._browser = None
+        self._context = None
         self._page = None
+        self._auth = None  # BrowserAuth | None — applied to the browser context
         self.console_logs: list[str] = []
         self.network_requests: list[str] = []
+
+    def set_auth(self, auth) -> None:
+        """Set authentication for the browser context. Must be called BEFORE the
+        first navigate (the context is created once, lazily); a later change has
+        no effect until the session is closed and reopened."""
+        self._auth = auth
 
     def _ensure_thread(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -116,7 +124,15 @@ class _BrowserWorker:
 
         self._playwright = sync_playwright().start()
         self._browser = self._playwright.chromium.launch(headless=True)
-        self._page = self._browser.new_page()
+        # A context (not a bare page) so authentication — storage_state, HTTP
+        # basic credentials, extra headers — can be applied for login-gated or
+        # served-behind-auth targets. With no auth this is an empty context,
+        # equivalent to the previous new_page().
+        ctx_kwargs = {"ignore_https_errors": True}
+        if self._auth is not None and not self._auth.is_empty():
+            ctx_kwargs.update(self._auth.context_kwargs())
+        self._context = self._browser.new_context(**ctx_kwargs)
+        self._page = self._context.new_page()
         self._page.on("console", lambda msg: self._record_console(msg))
         self._page.on("request", lambda req: self._record_request(req))
 
@@ -148,12 +164,15 @@ class _BrowserWorker:
         return self._page.inner_text(selector, timeout=timeout_ms)
 
     def _do_close(self) -> None:
+        if self._context is not None:
+            self._context.close()
         if self._browser is not None:
             self._browser.close()
         if self._playwright is not None:
             self._playwright.stop()
         self._playwright = None
         self._browser = None
+        self._context = None
         self._page = None
         self.console_logs = []
         self.network_requests = []

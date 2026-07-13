@@ -4348,6 +4348,23 @@ def main():
     pl_inspect.add_argument("--fix", action="store_true", help="Apply suggested fixes (enables edit_file + test loop)")
     pl_inspect.add_argument("--provider", default="self-hosted", choices=["self-hosted", "platform"], help="LLM backend (platform not yet available)")
     pl_inspect.add_argument("--yes", action="store_true", help="Auto-approve all tool calls (no prompts)")
+    # ── Scenario 3: build/run the app locally, then inspect it ──
+    pl_inspect.add_argument("--serve", action="store_true",
+                            help="Build & start the project's dev server, inspect it, then tear it down (auto-detects the URL)")
+    pl_inspect.add_argument("--serve-cmd", dest="serve_cmd",
+                            help="Explicit command to start the dev server (overrides package.json detection)")
+    pl_inspect.add_argument("--port", type=int, help="Port the dev server listens on (overrides framework default)")
+    pl_inspect.add_argument("--install", action="store_true",
+                            help="Run the package manager install step before building (with --serve)")
+    pl_inspect.add_argument("--no-build", dest="no_build", action="store_true",
+                            help="Skip the build step, start the dev server directly (with --serve)")
+    # ── Authentication for login-gated / served-behind-auth pages ──
+    pl_inspect.add_argument("--auth-storage", dest="auth_storage", metavar="FILE",
+                            help="Path to a Playwright storageState JSON (a saved logged-in session)")
+    pl_inspect.add_argument("--auth-basic", dest="auth_basic", metavar="USER:PASS",
+                            help="HTTP Basic auth credentials for the inspected page")
+    pl_inspect.add_argument("--auth-header", dest="auth_header", action="append", metavar="'K: V'",
+                            help="Extra request header, e.g. 'Authorization: Bearer <token>' (repeatable)")
     pl_inspect.set_defaults(func=cmd_local, local_cmd="inspect")
 
     pl_backlog = p_local_sub.add_parser("backlog", help="Show the local inspection backlog")
@@ -4851,10 +4868,10 @@ def main():
     _add_common(ow, tenant=True)
     ow.set_defaults(func=labsctl.cmd_loops, loops_cmd="watch")
 
-    og = loops_sub.add_parser("logs", help="Show the build's agent trace")
+    og = loops_sub.add_parser("logs", help="Show the build's agent trace (waterfall); -w to follow live")
     og.add_argument("job_id")
     og.add_argument("--phase", help="Filter by phase/agent")
-    _add_common(og)
+    _add_common(og, watch=True)
     og.set_defaults(func=labsctl.cmd_loops, loops_cmd="logs")
 
     oa = loops_sub.add_parser("approve", help="Approve the pending gate")

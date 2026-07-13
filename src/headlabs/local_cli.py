@@ -175,12 +175,52 @@ def _render_findings(items: list[dict], role: str) -> None:
     print()
 
 
-def _cmd_local_inspect(args) -> None:
-    from headlabs.local import backlog as backlog_mod
-    from headlabs.local.inspector import (
-        build_inspector_prompt, inspect_task_message, fetch_skills, parse_findings_fallback,
-    )
+def _build_browser_auth(args):
+    """Assemble a BrowserAuth from the --auth-* flags, or None if none were
+    given. Exits(2) with a clear message on malformed input."""
+    from headlabs.local.browser_auth import BrowserAuth
+    try:
+        auth = BrowserAuth.from_cli(
+            storage=getattr(args, "auth_storage", None),
+            basic=getattr(args, "auth_basic", None),
+            headers=getattr(args, "auth_header", None),
+        )
+    except ValueError as e:
+        print(f"  \033[31m{e}\033[0m")
+        sys.exit(2)
+    return None if auth.is_empty() else auth
 
+
+def _serve_and_inspect(args, directory, run):
+    """If --serve is set, build+start the dev server, call ``run(url)`` with the
+    health-checked URL, then tear the server down. Otherwise call ``run`` with
+    the explicit --url (or None). ``run`` takes a single ``url`` argument."""
+    if not getattr(args, "serve", False):
+        return run(getattr(args, "url", None))
+    from headlabs.local.serve import detect_run_commands, ServedApp, ServeError
+    no_build = getattr(args, "no_build", False)
+    try:
+        plan = detect_run_commands(
+            directory,
+            serve_cmd=getattr(args, "serve_cmd", None),
+            port=getattr(args, "port", None),
+            build=not no_build,
+        )
+    except ValueError as e:
+        print(f"  \033[31m{e}\033[0m")
+        sys.exit(2)
+    print(f"  \033[36m⚙\033[0m Servindo app local ({plan.framework}, {plan.manager})")
+    try:
+        with ServedApp(plan, do_install=getattr(args, "install", False),
+                       do_build=not no_build,
+                       log_cb=lambda m: print(f"    \033[2m{m}\033[0m")) as app:
+            return run(app.url)
+    except ServeError as e:
+        print(f"  \033[31mFalha ao servir o app: {e}\033[0m")
+        sys.exit(1)
+
+
+def _cmd_local_inspect(args) -> None:
     if getattr(args, "provider", "self-hosted") == "platform":
         return _cmd_local_inspect_platform(args)
 
@@ -191,9 +231,25 @@ def _cmd_local_inspect(args) -> None:
 
     role = getattr(args, "role", "qa") or "qa"
     context = getattr(args, "inspect_context", None)
-    url = getattr(args, "url", None)
+    auth = _build_browser_auth(args)
+    _serve_and_inspect(args, directory,
+                       lambda url: _do_self_hosted_inspect(args, directory, role, context, url, auth))
+
+
+def _do_self_hosted_inspect(args, directory, role, context, url, auth) -> None:
+    from headlabs.local import backlog as backlog_mod
+    from headlabs.local.inspector import (
+        build_inspector_prompt, inspect_task_message, fetch_skills, parse_findings_fallback,
+    )
+
     skills = fetch_skills(getattr(args, "skill", None) or [])
     prompt = build_inspector_prompt(role, context=context, url=url, skills=skills)
+
+    # The browser_devtools tool is a module-level singleton; set auth on it
+    # before the inspection so any navigation it drives is authenticated.
+    if auth is not None and url:
+        from headlabs.local.tools import browser_devtools as _bd
+        _bd._worker.set_auth(auth)
 
     engine = _build_engine(args, tools=_inspect_tools(bool(url)),
                            system_prompt=prompt, cwd=directory)
@@ -257,10 +313,14 @@ def _cmd_local_inspect_platform(args) -> None:
     # agent adds the HEURISTIC layer on top. This removes the LLM from the
     # objective-findings path entirely, so those never vary between runs.
     if role == "usability":
-        if not url:
-            print("  \033[31m--role usability requer --url <URL do front-end rodando>\033[0m")
+        from headlabs.local.serve import is_local_url
+        auth = _build_browser_auth(args)
+        if not url and not getattr(args, "serve", False):
+            print("  \033[31m--role usability requer --url <URL do front-end rodando> ou --serve\033[0m")
             sys.exit(2)
-        _run_usability_platform(client, directory, url, context, args)
+        _serve_and_inspect(args, directory, lambda u: _run_usability_platform(
+            client, directory, u, context, args,
+            auth=auth, use_local=(getattr(args, "serve", False) or is_local_url(u))))
         return
 
     print(f"  \033[36m⚙\033[0m Inspeção via plataforma (Claude) — role \033[1m{role}\033[0m")
@@ -310,11 +370,31 @@ def _cmd_local_inspect_platform(args) -> None:
         _apply_local_fix(args, directory, [i for i in new_items if i.get("status") != "done"])
 
 
-def _run_usability_platform(client, directory, url, context, args) -> None:
+def _obtain_browser_signals(url, auth, use_local):
+    """Return ``(axe, mobile)`` deterministic browser-check dicts for ``url``.
+
+    - ``use_local`` (localhost or --serve): drive a LOCAL Playwright — the remote
+      MCP can't reach the user's machine — and this path also carries auth.
+    - otherwise: call the remote browser-devtools MCP (public URL, no auth).
+
+    Both return the identical dict shape ``deterministic_usability_findings``
+    consumes, so the objective-findings logic stays single-sourced.
+    """
+    from headlabs.local.inspector import call_browser_mcp
+    if use_local:
+        from headlabs.local.browser_probe import run_local_usability_probe
+        return run_local_usability_probe(url, auth)
+    axe = call_browser_mcp("a11y_audit", {"url": url}, tries=7)
+    mobile = call_browser_mcp("inspect_page", {"url": url, "viewport": "mobile", "wait_ms": 1200}, tries=4)
+    return axe, mobile
+
+
+def _run_usability_platform(client, directory, url, context, args, *, auth=None, use_local=False) -> None:
     """Two-layer usability inspection of a LIVE url.
 
-    Layer 1 (deterministic): the CLI calls the browser-devtools MCP directly
-    (axe WCAG audit + mobile inspect_page) and turns the raw signals into
+    Layer 1 (deterministic): axe WCAG audit + mobile inspect_page, run either via
+    a LOCAL Playwright (localhost/--serve, and the only path that can carry auth)
+    or the remote browser-devtools MCP (public URL). The raw signals become
     grounded, reproducible findings — no LLM, so they never vary.
     Layer 2 (heuristic): a grounded synthesizer agent receives those same tool
     results and adds only what a rules engine can't catch (content clarity,
@@ -323,20 +403,18 @@ def _run_usability_platform(client, directory, url, context, args) -> None:
     import json
     from headlabs.local import backlog as backlog_mod
     from headlabs.local.inspector import (
-        call_browser_mcp, deterministic_usability_findings,
+        deterministic_usability_findings,
         ensure_usability_agent, platform_findings_from_result,
     )
     role = "usability"
 
+    where = "browser local" if use_local else "MCP remoto"
     print(f"  \033[36m⚙\033[0m Inspeção de usabilidade — {url}")
-    print("    \033[2mCamada determinística: axe-core (WCAG) + inspeção mobile...\033[0m")
-    # The first call absorbs a possible AgentCore cold start (more retries); the
-    # second runs against an already-warm container.
-    axe = call_browser_mcp("a11y_audit", {"url": url}, tries=7)
-    mobile = call_browser_mcp("inspect_page", {"url": url, "viewport": "mobile", "wait_ms": 1200}, tries=4)
+    print(f"    \033[2mCamada determinística ({where}): axe-core (WCAG) + inspeção mobile...\033[0m")
+    axe, mobile = _obtain_browser_signals(url, auth, use_local)
     for probe, res in (("a11y_audit", axe), ("inspect_page", mobile)):
         if isinstance(res, dict) and res.get("error"):
-            print(f"  \033[33m⚠ browser MCP {probe}: {res['error']}\033[0m")
+            print(f"  \033[33m⚠ browser {probe}: {res['error']}\033[0m")
 
     det = deterministic_usability_findings(axe, mobile)
     print(f"    \033[2m{len(det)} finding(s) objetivo(s) (determinístico)\033[0m")
