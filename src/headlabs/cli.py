@@ -4343,6 +4343,8 @@ def main():
     pl_inspect.add_argument("directory", nargs="?", default=".", help="Project directory to inspect (default: .)")
     pl_inspect.add_argument("--role", default="qa", choices=_INSPECT_ROLES, help="Inspection specialist role (default: qa)")
     pl_inspect.add_argument("-i", "--context", dest="inspect_context", help="Extra context/focus for the inspector")
+    pl_inspect.add_argument("--checklist", metavar="FILE",
+                            help="Calibrate --role usability: a checklist file (md/txt) the agent evaluates item-by-item (PASS/FAIL/N-A), each FAIL becoming a finding")
     pl_inspect.add_argument("--url", help="URL of the running front-end to inspect (e.g. http://localhost:5173)")
     pl_inspect.add_argument("--skill", action="append", metavar="ID", help="Platform skill id to inject into the prompt (repeatable)")
     pl_inspect.add_argument("--fix", action="store_true", help="Apply suggested fixes (enables edit_file + test loop)")

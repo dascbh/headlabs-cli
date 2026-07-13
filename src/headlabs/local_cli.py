@@ -354,13 +354,15 @@ def _cmd_local_inspect_platform(args) -> None:
     # objective-findings path entirely, so those never vary between runs.
     if role == "usability":
         auth = _build_browser_auth(args)   # may perform auto-login and set _login_landing
+        checklist_items = _load_checklist(args)
         url = url or getattr(args, "_login_landing", None)
         if not url and not getattr(args, "serve", False):
             print("  \033[31m--role usability requer --url, --serve ou --login-url\033[0m")
             sys.exit(2)
         _serve_and_inspect(args, directory, lambda u: _run_usability_platform(
             client, directory, u, context, args,
-            auth=auth, use_local=_should_use_local_browser(args, u, auth)))
+            auth=auth, use_local=_should_use_local_browser(args, u, auth),
+            checklist_items=checklist_items))
         return
 
     print(f"  \033[36m⚙\033[0m Inspeção via plataforma (Claude) — role \033[1m{role}\033[0m")
@@ -410,6 +412,37 @@ def _cmd_local_inspect_platform(args) -> None:
         _apply_local_fix(args, directory, [i for i in new_items if i.get("status") != "done"])
 
 
+def _load_checklist(args):
+    """Load & parse --checklist FILE into ChecklistItems, or None. Exits(2) on a
+    missing/empty file."""
+    path = getattr(args, "checklist", None)
+    if not path:
+        return None
+    from headlabs.local.checklist import parse_checklist
+    if not os.path.isfile(path):
+        print(f"  \033[31mchecklist não encontrado: {path}\033[0m")
+        sys.exit(2)
+    items = parse_checklist(open(path, encoding="utf-8", errors="replace").read())
+    if not items:
+        print(f"  \033[31mchecklist vazio (nenhum item reconhecido em {path})\033[0m")
+        sys.exit(2)
+    return items
+
+
+def _print_checklist_report(report):
+    """Print the per-item checklist verdicts (✓ pass / ✗ fail / – n-a)."""
+    npass = sum(1 for r in report if r["verdict"] == "pass")
+    nfail = sum(1 for r in report if r["verdict"] == "fail")
+    nna = sum(1 for r in report if r["verdict"] == "na")
+    print(f"    \033[2mChecklist: {len(report)} itens — "
+          f"\033[32m{npass} PASS\033[0m\033[2m · \033[31m{nfail} FAIL\033[0m\033[2m · {nna} N/A\033[0m")
+    mark = {"pass": "\033[32m✓\033[0m", "fail": "\033[31m✗\033[0m", "na": "\033[2m–\033[0m"}
+    for r in report:
+        print(f"      {mark[r['verdict']]} {r['text']}")
+        if r["verdict"] == "fail" and r["evidence"]:
+            print(f"          \033[2m{r['evidence']}\033[0m")
+
+
 def _obtain_browser_signals(url, auth, use_local):
     """Return ``(axe, mobile)`` deterministic browser-check dicts for ``url``.
 
@@ -429,22 +462,24 @@ def _obtain_browser_signals(url, auth, use_local):
     return axe, mobile
 
 
-def _run_usability_platform(client, directory, url, context, args, *, auth=None, use_local=False) -> None:
+def _run_usability_platform(client, directory, url, context, args, *, auth=None,
+                            use_local=False, checklist_items=None) -> None:
     """Two-layer usability inspection of a LIVE url.
 
     Layer 1 (deterministic): axe WCAG audit + mobile inspect_page, run either via
     a LOCAL Playwright (localhost/--serve, and the only path that can carry auth)
     or the remote browser-devtools MCP (public URL). The raw signals become
     grounded, reproducible findings — no LLM, so they never vary.
-    Layer 2 (heuristic): a grounded synthesizer agent receives those same tool
-    results and adds only what a rules engine can't catch (content clarity,
-    form burden, missing states). The two layers are merged and deduped.
+    Layer 2 (subjective): when ``checklist_items`` is given, the agent returns a
+    per-item verdict against the user's own criteria (calibrated/auditable) and
+    each FAIL becomes a finding; otherwise it does the default free-form heuristic
+    synthesis. The two layers are merged and deduped.
     """
     import json
     from headlabs.local import backlog as backlog_mod
     from headlabs.local.inspector import (
         deterministic_usability_findings,
-        ensure_usability_agent, platform_findings_from_result,
+        ensure_usability_agent, ensure_checklist_agent, platform_findings_from_result,
     )
     role = "usability"
 
@@ -459,26 +494,37 @@ def _run_usability_platform(client, directory, url, context, args, *, auth=None,
     det = deterministic_usability_findings(axe, mobile)
     print(f"    \033[2m{len(det)} finding(s) objetivo(s) (determinístico)\033[0m")
 
-    # Heuristic layer — grounded on the SAME tool results (agent is a synthesizer,
+    # Subjective layer — grounded on the SAME tool results (agent is a synthesizer,
     # not a tool-caller), so it can't hallucinate or duplicate the objective set.
     heur = []
     tool_ctx = json.dumps({"a11y_audit": axe, "inspect_mobile": mobile},
                           ensure_ascii=False)[:14000]
     try:
-        agent_id = ensure_usability_agent(client)
-        instruction = (f"Live URL: {url}\nBrowser check results already computed:\n{tool_ctx}\n\n"
-                       "Return ONLY additional HEURISTIC usability findings as a JSON array. "
-                       "Do NOT repeat WCAG/axe, responsive, runtime or performance issues "
-                       "already present in the data above.")
-        if context:
-            instruction += f"\nUser focus: {context}."
-        exec_id, tenant_id, stream_id = client.invoke(agent_id, {"question": instruction, "url": url})
-        print(f"    \033[2mCamada heurística (síntese Claude) — execução {exec_id}...\033[0m")
-        result = client.poll(exec_id, tenant_id=tenant_id, stream_id=stream_id, timeout=600)
-        heur = platform_findings_from_result(result)
-        print(f"    \033[2m{len(heur)} finding(s) heurístico(s)\033[0m")
+        if checklist_items:
+            from headlabs.local.checklist import build_checklist_instruction, evaluate_results
+            agent_id = ensure_checklist_agent(client)
+            instruction = build_checklist_instruction(checklist_items, url, tool_ctx, context)
+            exec_id, tenant_id, stream_id = client.invoke(agent_id, {"question": instruction, "url": url})
+            print(f"    \033[2mCamada checklist ({len(checklist_items)} itens, síntese Claude) — execução {exec_id}...\033[0m")
+            result = client.poll(exec_id, tenant_id=tenant_id, stream_id=stream_id, timeout=600)
+            report, heur = evaluate_results(result, checklist_items)
+            _print_checklist_report(report)
+        else:
+            agent_id = ensure_usability_agent(client)
+            instruction = (f"Live URL: {url}\nBrowser check results already computed:\n{tool_ctx}\n\n"
+                           "Return ONLY additional HEURISTIC usability findings as a JSON array. "
+                           "Do NOT repeat WCAG/axe, responsive, runtime or performance issues "
+                           "already present in the data above.")
+            if context:
+                instruction += f"\nUser focus: {context}."
+            exec_id, tenant_id, stream_id = client.invoke(agent_id, {"question": instruction, "url": url})
+            print(f"    \033[2mCamada heurística (síntese Claude) — execução {exec_id}...\033[0m")
+            result = client.poll(exec_id, tenant_id=tenant_id, stream_id=stream_id, timeout=600)
+            heur = platform_findings_from_result(result)
+            print(f"    \033[2m{len(heur)} finding(s) heurístico(s)\033[0m")
     except Exception as e:
-        print(f"  \033[33m⚠ Camada heurística indisponível ({e}); usando só a determinística\033[0m")
+        layer = "checklist" if checklist_items else "heurística"
+        print(f"  \033[33m⚠ Camada {layer} indisponível ({e}); usando só a determinística\033[0m")
 
     before_ids = {i.get("id") for i in backlog_mod.load_backlog(directory)}
     for f in det + heur:

@@ -297,6 +297,33 @@ headlabs local inspect ./api --serve --serve-cmd "uvicorn main:app --port 8000" 
   (sucesso ou erro) o grupo inteiro é morto. Se o servidor sair antes de
   responder, o erro traz a saída dele.
 
+### 5.1b. Calibrar o que testar — `--checklist` (menos dependente do agente)
+
+Para não deixar o resultado à mercê do que o LLM resolve olhar, passe uma
+**checklist** dos critérios que *você* quer verificar. A camada objetiva
+(axe/responsivo/runtime) continua rodando igual; a camada subjetiva deixa de ser
+"findings livres" e vira uma **avaliação item-a-item** (PASS / FAIL / N-A + a
+evidência observada). Cada item reprovado vira um finding no backlog.
+
+```bash
+headlabs local inspect . --role usability --url http://localhost:5173 --checklist ux.md
+```
+```markdown
+# ux.md — um critério por linha (headers e linhas vazias são ignorados)
+- [ ] (high) Botão primário destacado para a ação principal
+- [ ] Todo campo de formulário tem label visível
+- [ ] Estados de loading / vazio / erro presentes
+- [ ] Contraste AA no texto principal
+```
+
+- Marcadores tolerantes: `- [ ]`, `-`, `*`, `1.` etc. Prefixo opcional
+  `(critical|high|medium|low)` define a severidade daquele item quando reprova
+  (senão a severidade que o agente atribuir, senão `medium`). Máx. 50 itens.
+- Saída: relatório `✓/✗/–` por item + os FAIL no backlog (chave estável
+  `checklist:<n>`). Combina com `-i/--context` para foco extra em texto livre.
+- Requer `--provider platform` (a avaliação por item roda no agente dedicado
+  `usability-checklist`). A camada determinística não depende disso.
+
 ### 5.2. Páginas atrás de autenticação
 
 Há dois jeitos: **auto-login** (a ferramenta loga sozinha a partir de

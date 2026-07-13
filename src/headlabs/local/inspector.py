@@ -266,6 +266,51 @@ def ensure_usability_agent(client) -> str:
     return USABILITY_AGENT_ID
 
 
+CHECKLIST_AGENT_ID = "usability-checklist"
+
+_CHECKLIST_AGENT_PROMPT = """\
+You are a usability auditor. You receive a live URL, the RESULTS of automated
+browser checks already run on the page (axe-core WCAG audit + a mobile
+inspect_page with rendered text and a DOM/accessibility summary), and a NUMBERED
+checklist of criteria to judge.
+
+Evaluate EACH checklist item against the page, grounded ONLY in the rendered
+text/DOM summary and the results provided — never invent page content. Return
+ONLY a JSON array with exactly one object per item, in the same order:
+{"n": <item number>, "verdict": "pass"|"fail"|"na",
+ "evidence": "<what you actually observed>",
+ "severity": "critical"|"high"|"medium"|"low", "fix": "<how to fix, only if fail>"}
+
+Use "pass" when the criterion is satisfied, "fail" when it is not, and "na" ONLY
+when the page genuinely lacks the element the item refers to. Do not add, skip or
+reorder items."""
+
+
+def ensure_checklist_agent(client) -> str:
+    """Provision the dedicated checklist-evaluator agent (idempotent) and keep its
+    prompt in sync. Separate from the free-form usability agent so its system
+    prompt matches the per-item verdict schema (a mismatched prompt makes the
+    model return findings instead of verdicts)."""
+    try:
+        existing = {a.get("id") for a in client.list_remote_agents()}
+    except Exception:
+        existing = set()
+    if CHECKLIST_AGENT_ID not in existing:
+        client.create_agent(
+            agent_id=CHECKLIST_AGENT_ID,
+            display_name="Usability Checklist Auditor",
+            prompt=_CHECKLIST_AGENT_PROMPT,
+            description="Evaluates a user-supplied usability checklist item-by-item against a live page.",
+        )
+    try:
+        client.request("PATCH", f"/agents/{CHECKLIST_AGENT_ID}",
+                       json={"prompt": _CHECKLIST_AGENT_PROMPT,
+                             "manifest": {"skills": [], "tools_native": [], "mcp": []}})
+    except Exception:
+        pass
+    return CHECKLIST_AGENT_ID
+
+
 def call_browser_mcp(tool: str, args: dict, tries: int = 4) -> dict:
     """Call a browser-devtools MCP tool directly (the deterministic path).
     Returns the tool's JSON dict, or ``{'error': ...}``. Retries transient
